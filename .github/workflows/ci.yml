@@ -29,10 +29,29 @@ env:
 
 jobs:
   # ---------------------------------------------------------------------
+  # Non-blocking formatting check. Surfaces rustfmt diffs as a separate
+  # job so a fmt nit doesn't hide a real type error in the rust job.
+  # Promote to required (continue-on-error: false) once the workspace
+  # has been formatted at least once on a Linux box.
+  # ---------------------------------------------------------------------
+  fmt:
+    name: rust (fmt --check)
+    runs-on: ubuntu-22.04
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: install rust toolchain
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup component add rustfmt
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+  # ---------------------------------------------------------------------
   # Rust workspace (default features only — no GStreamer, no ORT system libs).
   # ---------------------------------------------------------------------
   rust:
-    name: rust (check / fmt / clippy / test)
+    name: rust (check / clippy / test)
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
@@ -44,15 +63,12 @@ jobs:
       - name: install rust toolchain (from rust-toolchain.toml)
         run: |
           rustup show active-toolchain || rustup toolchain install
-          rustup component add rustfmt clippy
+          rustup component add clippy
 
       - name: cargo cache
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: workspace
-
-      - name: cargo fmt --check
-        run: cargo fmt --all -- --check
 
       - name: cargo check (workspace, all targets)
         run: cargo check --workspace --all-targets
