@@ -25,11 +25,11 @@ RUN cd ui && npm run build
 FROM rust:1.82-slim-bookworm AS rust-build
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        pkg-config build-essential cmake git ca-certificates curl \
-        libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
-        gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
-        gstreamer1.0-libav \
-        libssl-dev \
+    pkg-config build-essential cmake git ca-certificates curl \
+    libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+    gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
+    gstreamer1.0-libav \
+    libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Pin ORT version. M0 ships without ORT linkage; M1 enables `--features ep-cpu`
@@ -59,18 +59,18 @@ COPY crates crates
 
 # Build the binaries. Add `--features gstreamer` when M1 is wired.
 RUN cargo build --release \
-        --bin nexus-engine \
-        --bin nexus-probe
+    --bin nexus-engine \
+    --bin nexus-probe
 
 # ----------------------- stage 3: runtime --------------------------
 FROM debian:bookworm-slim AS runtime
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates tini \
-        libgstreamer1.0-0 libgstreamer-plugins-base1.0-0 \
-        gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
-        gstreamer1.0-libav gstreamer1.0-tools \
-        libssl3 \
+    ca-certificates tini \
+    libgstreamer1.0-0 libgstreamer-plugins-base1.0-0 \
+    gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
+    gstreamer1.0-libav gstreamer1.0-tools \
+    libssl3 \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --uid 1000 --create-home --shell /usr/sbin/nologin nexus
 

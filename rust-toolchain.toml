@@ -1,6 +1,8 @@
 [toolchain]
-# 1.85 is the minimum that can parse edition-2024 dependency manifests
-# (getrandom 0.4.2, etc). Bumped from 1.82 after the first CI run failed.
-channel = "1.85"
+# TODO(M1): repin to a specific minor version once the workspace builds
+# clean once on Linux. Tried 1.82 → needs 1.85 (edition 2024 transitives);
+# tried 1.85 → needs 1.88 (image@0.25.10). Using `stable` as an interim
+# unblock so dependency-rustc-floor games stop blocking M0 verification.
+channel = "stable"
 components = ["rustfmt", "clippy"]
 profile = "minimal"
