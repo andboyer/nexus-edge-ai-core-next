@@ -91,7 +91,7 @@ impl Tracker for IouNaiveTracker {
                     continue;
                 }
                 let iou = t.bbox.iou(&d.bbox);
-                if iou >= self.iou_threshold && best.map_or(true, |(_, b)| iou > b) {
+                if iou >= self.iou_threshold && best.is_none_or(|(_, b)| iou > b) {
                     best = Some((*id, iou));
                 }
             }
