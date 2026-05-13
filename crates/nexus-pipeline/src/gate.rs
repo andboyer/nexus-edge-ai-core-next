@@ -34,7 +34,7 @@ impl MotionGate {
         // Periodic keyframe pass-through.
         let mut s = self.state.lock().unwrap();
         *s = s.wrapping_add(1);
-        if *s % self.keyframe_every == 0 {
+        if (*s).is_multiple_of(self.keyframe_every) {
             // Still update prev_y so the next frame has a baseline.
             let y = downsample_y(frame);
             *self.prev_y.lock().unwrap() = Some(y);

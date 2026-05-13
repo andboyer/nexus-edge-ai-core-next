@@ -54,12 +54,10 @@ impl FrameSource for VirtualSource {
                 trace_id: Uuid::now_v7().to_string(),
             };
             // try_send so the source never blocks on a slow consumer; the gate
-            // / pool decide what to drop, not the source.
-            if tx.try_send(f).is_err() {
-                tokio::time::sleep(Duration::from_millis(interval_ms)).await;
-            } else {
-                tokio::time::sleep(Duration::from_millis(interval_ms)).await;
-            }
+            // / pool decide what to drop, not the source. Either branch sleeps
+            // for the same interval, so just drop the result and sleep.
+            let _ = tx.try_send(f);
+            tokio::time::sleep(Duration::from_millis(interval_ms)).await;
         }
     }
 }
