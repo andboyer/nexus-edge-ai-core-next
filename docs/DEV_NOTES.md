@@ -79,6 +79,33 @@ future automated agents who need to skip the same potholes we already hit.
   ```
   in a single sync command instead of starting an async terminal.
 
+## YOLO model + smoke test
+
+The real ORT detector lives in
+[`crates/nexus-inference/src/yolo.rs`](../crates/nexus-inference/src/yolo.rs)
+and is gated by the `ort` cargo feature. The smoke test
+`yolo_smoke_runs_on_synthetic_frame` only runs when both:
+
+- the binary is built with `--features ort,ep-cpu` (so the `ort` symbols
+  link), and
+- the env var `NEXUS_TEST_YOLO_MODEL` points at an existing
+  `yolo26n_dynamic.onnx` on disk.
+
+The `models/` directory is in `.gitignore`. Stage it locally:
+
+```bash
+mkdir -p models
+cp ../nexus-edge-ai-core/models/yolo26n_dynamic.onnx models/
+cp ../nexus-edge-ai-core/models/models-manifest.json   models/
+ORT_DYLIB_PATH=/opt/homebrew/lib/libonnxruntime.dylib \
+NEXUS_TEST_YOLO_MODEL=$PWD/models/yolo26n_dynamic.onnx \
+  cargo test --locked -p nexus-inference --features ort,ep-cpu \
+  yolo_smoke -- --nocapture
+```
+
+The worker binary picks up the same model with
+`NEXUS_WORKER_MODEL_KIND=yolo` + `NEXUS_WORKER_MODEL_PATH=$PWD/models/yolo26n_dynamic.onnx`.
+
 ## See also
 
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) — trait + pool + fail-soft pattern,

@@ -478,6 +478,14 @@ impl WorkerProcessBackend {
             inner,
         })
     }
+
+    /// PID of the spawned worker, or `None` if the child has already been
+    /// reaped by Drop. Exposed primarily so chaos tests can `kill -9` the
+    /// child and exercise the fail-soft path; the engine itself never
+    /// uses this.
+    pub fn child_pid(&self) -> Option<u32> {
+        self.inner.child.lock().as_ref().and_then(|c| c.id())
+    }
 }
 
 async fn run_reader(

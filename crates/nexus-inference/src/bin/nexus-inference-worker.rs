@@ -15,8 +15,13 @@
 //!
 //! ## Configuration
 //! Picks the model kind from `$NEXUS_WORKER_MODEL_KIND` (default `mock`).
-//! For M2/M3 the worker will also honor a `$NEXUS_WORKER_MODEL_PATH` for
-//! a real ORT session — the wiring shape on this binary is stable.
+//! For the `yolo` family the worker also reads `$NEXUS_WORKER_MODEL_PATH`
+//! (full path to `yolo26n_dynamic.onnx`), `$NEXUS_WORKER_INPUT_W` /
+//! `$NEXUS_WORKER_INPUT_H` (default 640), and
+//! `$NEXUS_WORKER_SCORE_THRESHOLD` (default 0.30) and lights up the real
+//! ORT session when the binary was built with `--features ort,ep-cpu`.
+//! Without those features the worker silently falls back to the
+//! MockDetector — same shape as `build_detector` in the library.
 
 use std::env;
 use std::process::ExitCode;
@@ -31,10 +36,8 @@ async fn main() -> ExitCode {
     // Worker logs go to stderr; the parent treats this as opaque
     // diagnostic output. Plain eprintln keeps the binary cheap to build.
     let model_kind = env::var("NEXUS_WORKER_MODEL_KIND").unwrap_or_else(|_| "mock".to_string());
-    // M2 will branch on `model_kind` here to build a real ORT-backed
-    // Detector. For now every kind degrades to MockDetector — same
-    // behavior as `build_detector` in the library for unknown kinds.
-    let detector: Arc<dyn Detector> = Arc::new(MockDetector::new());
+
+    let detector: Arc<dyn Detector> = build_worker_detector(&model_kind);
 
     eprintln!(
         "[nexus-inference-worker] ready pid={} model_kind={model_kind}",
@@ -81,4 +84,58 @@ async fn main() -> ExitCode {
             }
         }
     }
+}
+
+/// Build the detector requested by `$NEXUS_WORKER_MODEL_KIND`. Mirrors
+/// `build_detector` in the library: yolo* → real ORT YoloOrtDetector when
+/// the cargo feature is on, otherwise MockDetector with a stderr warning.
+fn build_worker_detector(kind: &str) -> Arc<dyn Detector> {
+    match kind {
+        "yolo" | "yolo26n" | "closed_vocab" => build_yolo_detector(),
+        _ => Arc::new(MockDetector::new()),
+    }
+}
+
+#[cfg(feature = "ort")]
+fn build_yolo_detector() -> Arc<dyn Detector> {
+    use std::path::PathBuf;
+    let path = match env::var("NEXUS_WORKER_MODEL_PATH").map(PathBuf::from) {
+        Ok(p) if p.exists() => p,
+        Ok(p) => {
+            eprintln!(
+                "[nexus-inference-worker] $NEXUS_WORKER_MODEL_PATH={} not found, using mock",
+                p.display()
+            );
+            return Arc::new(MockDetector::new());
+        }
+        Err(_) => {
+            eprintln!("[nexus-inference-worker] $NEXUS_WORKER_MODEL_PATH unset, using mock");
+            return Arc::new(MockDetector::new());
+        }
+    };
+    let input_w: u32 = env::var("NEXUS_WORKER_INPUT_W")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(640);
+    let input_h: u32 = env::var("NEXUS_WORKER_INPUT_H")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(640);
+    let score: f32 = env::var("NEXUS_WORKER_SCORE_THRESHOLD")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.30);
+    match nexus_inference::yolo::YoloOrtDetector::open(&path, input_w, input_h, score) {
+        Ok(d) => Arc::new(d),
+        Err(e) => {
+            eprintln!("[nexus-inference-worker] yolo open failed: {e}, using mock");
+            Arc::new(MockDetector::new())
+        }
+    }
+}
+
+#[cfg(not(feature = "ort"))]
+fn build_yolo_detector() -> Arc<dyn Detector> {
+    eprintln!("[nexus-inference-worker] ort feature not compiled in, using mock");
+    Arc::new(MockDetector::new())
 }

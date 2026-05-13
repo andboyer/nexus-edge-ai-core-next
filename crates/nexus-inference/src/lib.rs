@@ -11,12 +11,17 @@
 //!    routes work round-robin, fails soft to the fallback, and fan-pushes
 //!    config updates to every slot. This is the W-DETECT D6/D7/D9c pattern.
 
-#![forbid(unsafe_code)]
+// `deny` not `forbid` so the optional `yolo` module can opt in to the
+// `unsafe` blocks emitted by `ort::inputs!` macro expansions; everything
+// outside that one module is still unsafe-free.
+#![deny(unsafe_code)]
 
 pub mod backends;
 pub mod detectors;
 pub mod pool;
 pub mod worker_proto;
+#[cfg(feature = "ort")]
+pub mod yolo;
 
 pub use backends::{
     BackendState, DetectorBackend, InProcessBackend, ThreadIsolatedBackend, WorkerProcessBackend,
@@ -25,6 +30,8 @@ pub use detectors::{
     ClassifierEnsembleDetector, Detector, InferenceError, MockDetector, OpenVocabDetector,
 };
 pub use pool::{BackendStatus, DetectorPool};
+#[cfg(feature = "ort")]
+pub use yolo::YoloOrtDetector;
 
 use std::sync::Arc;
 
@@ -95,9 +102,29 @@ fn build_detector(cfg: &InferenceConfig) -> Result<Arc<dyn Detector>, InferenceE
     match cfg.model.kind.as_str() {
         // Closed-vocab YOLOv26-nano shipped as the default — matches v1's
         // `models/yolo26n_dynamic.onnx` driven by the model-pack manifest's
-        // 320 / 640 / 1280 presets. M0 stubs to MockDetector; M1 swaps in
-        // the real ORT session.
-        "yolo" | "yolo26n" | "closed_vocab" => Ok(Arc::new(MockDetector::new())),
+        // 320 / 640 / 1280 presets. Real ORT path lights up when the `ort`
+        // cargo feature is on AND inference.model.pack_path is set; without
+        // either we keep the MockDetector so the engine still boots on a
+        // bare dev box.
+        "yolo" | "yolo26n" | "closed_vocab" => {
+            // Two cfg arms with mutually-exclusive bodies — the explicit
+            // `return` in the `ort` arm keeps the function single-exit
+            // and avoids a type mismatch when the feature is off and the
+            // mock fallback runs instead.
+            #[cfg(feature = "ort")]
+            #[allow(clippy::needless_return)]
+            {
+                return crate::yolo::build_detector_for_yolo(cfg);
+            }
+            #[cfg(not(feature = "ort"))]
+            {
+                warn!(
+                    kind = %cfg.model.kind,
+                    "ort feature not compiled in; using mock for closed-vocab kind"
+                );
+                Ok(Arc::new(MockDetector::new()))
+            }
+        }
         // Open-vocab path (YOLO-World style) — separate Detector impl,
         // explicit opt-in via config.
         "open_vocab" | "yolo_world" => Ok(Arc::new(OpenVocabDetector::new(cfg)?)),
