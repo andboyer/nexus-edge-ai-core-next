@@ -106,6 +106,55 @@ NEXUS_TEST_YOLO_MODEL=$PWD/models/yolo26n_dynamic.onnx \
 The worker binary picks up the same model with
 `NEXUS_WORKER_MODEL_KIND=yolo` + `NEXUS_WORKER_MODEL_PATH=$PWD/models/yolo26n_dynamic.onnx`.
 
+## YOLO-World (open-vocab) model + smoke test
+
+M3 ships an open-vocab detector — `YoloWorldDetector` in
+[`crates/nexus-inference/src/yolo_world.rs`](../crates/nexus-inference/src/yolo_world.rs).
+The model is regenerated from a tracked prompt vocabulary, not copied
+from v1.
+
+```bash
+# One-time: model-gen venv (Python 3.11 — torch wheels exist for it).
+/opt/homebrew/opt/python@3.11/bin/python3.11 -m venv .venv-modelgen
+source .venv-modelgen/bin/activate
+pip install -r tools/models/requirements.txt
+
+# Pre-download the YOLO-World checkpoint to a known path
+# (ultralytics' built-in downloader sometimes fails behind picky network
+#  stacks; curl is reliable):
+mkdir -p models/.cache
+curl -sL --fail \
+  -o models/.cache/yolov8s-worldv2.pt \
+  https://github.com/ultralytics/assets/releases/download/v8.4.0/yolov8s-worldv2.pt
+
+# Generate models/yolo_world_v2_s.onnx (~48 MB) with the default
+# vocabulary baked in. The script also upserts the entry into
+# models/models-manifest.json with sha256 + prompts[]:
+python tools/models/gen_yolo_world.py \
+  --base-model models/.cache/yolov8s-worldv2.pt
+```
+
+Then the smoke test:
+
+```bash
+ORT_DYLIB_PATH=/opt/homebrew/lib/libonnxruntime.dylib \
+NEXUS_TEST_YOLO_WORLD_MODEL=$PWD/models/yolo_world_v2_s.onnx \
+NEXUS_TEST_YOLO_WORLD_MANIFEST=$PWD/models/models-manifest.json \
+  cargo test --locked -p nexus-inference --features ort,ep-cpu \
+  yolo_world_smoke -- --nocapture
+```
+
+To change the prompt vocabulary, edit
+[`tools/models/yolo_world_default_prompts.txt`](../tools/models/yolo_world_default_prompts.txt)
+and re-run `gen_yolo_world.py`. The manifest sha256 will refresh and the
+engine's loader will catch the diff.
+
+The worker binary picks up the open-vocab model with
+`NEXUS_WORKER_MODEL_KIND=yolo_world` +
+`NEXUS_WORKER_MODEL_PATH=$PWD/models/yolo_world_v2_s.onnx` +
+`NEXUS_WORKER_MODEL_PACK=$PWD/models` (so it can find the manifest +
+load the baked vocab).
+
 ## See also
 
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) — trait + pool + fail-soft pattern,

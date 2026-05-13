@@ -22,6 +22,8 @@ pub mod pool;
 pub mod worker_proto;
 #[cfg(feature = "ort")]
 pub mod yolo;
+#[cfg(feature = "ort")]
+pub mod yolo_world;
 
 pub use backends::{
     BackendState, DetectorBackend, InProcessBackend, ThreadIsolatedBackend, WorkerProcessBackend,
@@ -32,6 +34,8 @@ pub use detectors::{
 pub use pool::{BackendStatus, DetectorPool};
 #[cfg(feature = "ort")]
 pub use yolo::YoloOrtDetector;
+#[cfg(feature = "ort")]
+pub use yolo_world::YoloWorldDetector;
 
 use std::sync::Arc;
 
@@ -125,9 +129,25 @@ fn build_detector(cfg: &InferenceConfig) -> Result<Arc<dyn Detector>, InferenceE
                 Ok(Arc::new(MockDetector::new()))
             }
         }
-        // Open-vocab path (YOLO-World style) — separate Detector impl,
-        // explicit opt-in via config.
-        "open_vocab" | "yolo_world" => Ok(Arc::new(OpenVocabDetector::new(cfg)?)),
+        // Open-vocab path (YOLO-World) — real ORT impl when the feature is
+        // on AND inference.model.pack_path is set. Same fallback shape as
+        // the closed-vocab arm above: keep MockDetector if either is
+        // missing so the engine still boots on a bare dev box.
+        "open_vocab" | "yolo_world" => {
+            #[cfg(feature = "ort")]
+            #[allow(clippy::needless_return)]
+            {
+                return crate::yolo_world::build_detector_for_yolo_world(cfg);
+            }
+            #[cfg(not(feature = "ort"))]
+            {
+                warn!(
+                    kind = %cfg.model.kind,
+                    "ort feature not compiled in; using OpenVocabDetector mock body"
+                );
+                Ok(Arc::new(OpenVocabDetector::new(cfg)?))
+            }
+        }
         // PPE-style attribute heads (`ppe_v1.onnx` is the v1 ship).
         "classifier_ensemble" | "ppe" => Ok(Arc::new(ClassifierEnsembleDetector::new(cfg)?)),
         "mock" => Ok(Arc::new(MockDetector::new())),

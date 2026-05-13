@@ -89,9 +89,13 @@ async fn main() -> ExitCode {
 /// Build the detector requested by `$NEXUS_WORKER_MODEL_KIND`. Mirrors
 /// `build_detector` in the library: yolo* → real ORT YoloOrtDetector when
 /// the cargo feature is on, otherwise MockDetector with a stderr warning.
+/// `yolo_world` / `open_vocab` route through `build_yolo_world_detector`
+/// instead, which also reads the prompt vocab from
+/// `$NEXUS_WORKER_MODEL_PACK / models-manifest.json`.
 fn build_worker_detector(kind: &str) -> Arc<dyn Detector> {
     match kind {
         "yolo" | "yolo26n" | "closed_vocab" => build_yolo_detector(),
+        "yolo_world" | "open_vocab" => build_yolo_world_detector(),
         _ => Arc::new(MockDetector::new()),
     }
 }
@@ -137,5 +141,86 @@ fn build_yolo_detector() -> Arc<dyn Detector> {
 #[cfg(not(feature = "ort"))]
 fn build_yolo_detector() -> Arc<dyn Detector> {
     eprintln!("[nexus-inference-worker] ort feature not compiled in, using mock");
+    Arc::new(MockDetector::new())
+}
+
+#[cfg(feature = "ort")]
+fn build_yolo_world_detector() -> Arc<dyn Detector> {
+    use std::path::{Path, PathBuf};
+    let onnx = match env::var("NEXUS_WORKER_MODEL_PATH").map(PathBuf::from) {
+        Ok(p) if p.exists() => p,
+        Ok(p) => {
+            eprintln!(
+                "[nexus-inference-worker] yolo_world $NEXUS_WORKER_MODEL_PATH={} \
+                 not found, using mock",
+                p.display()
+            );
+            return Arc::new(MockDetector::new());
+        }
+        Err(_) => {
+            eprintln!(
+                "[nexus-inference-worker] yolo_world $NEXUS_WORKER_MODEL_PATH unset, \
+                 using mock"
+            );
+            return Arc::new(MockDetector::new());
+        }
+    };
+    // Manifest sits alongside the ONNX by convention. Operator can override
+    // by setting NEXUS_WORKER_MODEL_PACK to the directory.
+    let manifest = match env::var("NEXUS_WORKER_MODEL_PACK").map(PathBuf::from) {
+        Ok(p) => p.join("models-manifest.json"),
+        Err(_) => onnx
+            .parent()
+            .map(|p| p.join("models-manifest.json"))
+            .unwrap_or_else(|| Path::new("models-manifest.json").to_path_buf()),
+    };
+    if !manifest.exists() {
+        eprintln!(
+            "[nexus-inference-worker] yolo_world manifest {} not found, using mock",
+            manifest.display()
+        );
+        return Arc::new(MockDetector::new());
+    }
+    let input_w: u32 = env::var("NEXUS_WORKER_INPUT_W")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(640);
+    let input_h: u32 = env::var("NEXUS_WORKER_INPUT_H")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(640);
+    let score: f32 = env::var("NEXUS_WORKER_SCORE_THRESHOLD")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.10);
+    let nms_iou: f32 = env::var("NEXUS_WORKER_NMS_IOU")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.50);
+    let model_id =
+        env::var("NEXUS_WORKER_MODEL_ID").unwrap_or_else(|_| "yolo_world_v2_s".to_string());
+    // Read vocab via the same helper the library uses.
+    let vocab =
+        match nexus_inference::yolo_world::load_vocab_from_manifest_public(&manifest, &model_id) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("[nexus-inference-worker] yolo_world vocab load failed: {e}, using mock");
+                return Arc::new(MockDetector::new());
+            }
+        };
+    match nexus_inference::yolo_world::YoloWorldDetector::open(
+        &onnx, input_w, input_h, score, nms_iou, vocab,
+    ) {
+        Ok(d) => Arc::new(d),
+        Err(e) => {
+            eprintln!("[nexus-inference-worker] yolo_world open failed: {e}, using mock");
+            Arc::new(MockDetector::new())
+        }
+    }
+}
+
+#[cfg(not(feature = "ort"))]
+fn build_yolo_world_detector() -> Arc<dyn Detector> {
+    eprintln!("[nexus-inference-worker] ort feature not compiled in, yolo_world using mock");
     Arc::new(MockDetector::new())
 }

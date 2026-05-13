@@ -1,0 +1,51 @@
+# Default open-vocab prompt vocabulary baked into the YOLO-World ONNX.
+#
+# The YOLO-World pipeline takes prompts at *export* time (not inference
+# time) and bakes them as fixed text-embedding inputs into the graph,
+# producing a YOLOv8-style detector with one class per line below.
+# Per-camera config picks a *subset* of these prompts; the Rust detector
+# filters detections to the requested subset before emitting them.
+#
+# When a customer needs a prompt that isn't here, regenerate this file +
+# rerun `tools/models/gen_yolo_world.py` — the model artifact is
+# reproducible and the manifest sha256 will refresh automatically.
+#
+# Order matters (the export bakes class indices in this order). Prefer
+# *appending* new prompts so existing per-camera configs keep their
+# class-id semantics.
+
+person
+vehicle
+car
+truck
+bus
+motorcycle
+bicycle
+forklift
+trailer
+backpack
+handbag
+suitcase
+package
+delivery box
+shopping cart
+dog
+cat
+bird
+deer
+firearm
+rifle
+handgun
+knife
+hardhat
+helmet
+high-visibility vest
+safety glasses
+gloves
+ladder
+scissor lift
+trash bag
+spray paint can
+crowbar
+hammer
+shovel

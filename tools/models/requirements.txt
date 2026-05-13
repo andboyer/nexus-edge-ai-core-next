@@ -1,0 +1,15 @@
+# Model-gen dependencies for nexus-edge-ai-core-next.
+# Install into .venv-modelgen (Python 3.11 — torch wheels exist for it):
+#
+#   /opt/homebrew/opt/python@3.11/bin/python3.11 -m venv .venv-modelgen
+#   source .venv-modelgen/bin/activate
+#   pip install -r tools/models/requirements.txt
+#
+# These are NOT runtime deps. The engine itself is pure Rust + ORT.
+
+ultralytics>=8.3,<9      # YOLO + YOLO-World export pipeline
+torch>=2.4,<3            # ultralytics backend
+torchvision>=0.19        # transforms used by YOLO-World text encoder
+onnx>=1.16               # graph manipulation + sha256 we write into manifest
+onnxruntime>=1.18        # smoke-load test inside the export script
+onnxslim                 # final graph optimisation pass (drops ~5–10% size)
