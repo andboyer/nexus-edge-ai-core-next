@@ -74,6 +74,7 @@ enum ProgramRepr {
 // ---------------------------------------------------------------------------
 
 #[derive(Default)]
+#[derive(Default)]
 pub struct CelEngine;
 
 impl CelEngine {
