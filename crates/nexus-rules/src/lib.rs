@@ -160,8 +160,38 @@ fn now_to_cel() -> CelValue {
 }
 
 fn json_to_cel(v: &JsonValue) -> CelValue {
-    // cel-interpreter has a From<serde_json::Value> impl in 0.10 — use it directly.
-    CelValue::from(v.clone())
+    // cel-interpreter 0.10 does not implement `From<serde_json::Value>` for
+    // `Value`, so walk the tree manually. Mapping is straightforward: numbers
+    // become Int/UInt/Float depending on shape, objects become Maps keyed by
+    // string. Anything we can't represent (e.g. JSON `null`) becomes
+    // `CelValue::Null`.
+    match v {
+        JsonValue::Null => CelValue::Null,
+        JsonValue::Bool(b) => CelValue::Bool(*b),
+        JsonValue::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                CelValue::Int(i)
+            } else if let Some(u) = n.as_u64() {
+                CelValue::UInt(u)
+            } else if let Some(f) = n.as_f64() {
+                CelValue::Float(f)
+            } else {
+                CelValue::Null
+            }
+        }
+        JsonValue::String(s) => CelValue::String(std::sync::Arc::new(s.clone())),
+        JsonValue::Array(items) => {
+            let converted: Vec<CelValue> = items.iter().map(json_to_cel).collect();
+            CelValue::from(converted)
+        }
+        JsonValue::Object(map) => {
+            let entries: std::collections::HashMap<String, CelValue> = map
+                .iter()
+                .map(|(k, val)| (k.clone(), json_to_cel(val)))
+                .collect();
+            CelValue::from(entries)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
