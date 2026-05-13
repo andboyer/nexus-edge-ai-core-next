@@ -33,7 +33,11 @@ pub type TraceId = String;
 
 /// Axis-aligned bounding box in image pixels (top-left origin).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts", derive(TS), ts(export, export_to = "../ui/src/api/types/"))]
+#[cfg_attr(
+    feature = "ts",
+    derive(TS),
+    ts(export, export_to = "../ui/src/api/types/")
+)]
 pub struct BBox {
     pub x1: f32,
     pub y1: f32,
@@ -80,7 +84,11 @@ impl BBox {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts", derive(TS), ts(export, export_to = "../ui/src/api/types/"))]
+#[cfg_attr(
+    feature = "ts",
+    derive(TS),
+    ts(export, export_to = "../ui/src/api/types/")
+)]
 #[serde(rename_all = "snake_case")]
 pub enum PixelFormat {
     Rgb24,
@@ -114,7 +122,11 @@ impl Frame {
 
 /// Lightweight frame summary for the bus and the UI. Never carries pixels.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts", derive(TS), ts(export, export_to = "../ui/src/api/types/"))]
+#[cfg_attr(
+    feature = "ts",
+    derive(TS),
+    ts(export, export_to = "../ui/src/api/types/")
+)]
 pub struct FrameMetadata {
     pub camera_id: CameraId,
     pub frame_id: FrameId,
@@ -130,7 +142,11 @@ pub struct FrameMetadata {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts", derive(TS), ts(export, export_to = "../ui/src/api/types/"))]
+#[cfg_attr(
+    feature = "ts",
+    derive(TS),
+    ts(export, export_to = "../ui/src/api/types/")
+)]
 pub struct Detection {
     pub label: String,
     pub confidence: f32,
@@ -144,7 +160,11 @@ pub struct Detection {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts", derive(TS), ts(export, export_to = "../ui/src/api/types/"))]
+#[cfg_attr(
+    feature = "ts",
+    derive(TS),
+    ts(export, export_to = "../ui/src/api/types/")
+)]
 pub struct TrackedObject {
     pub track_id: TrackId,
     pub label: String,
@@ -165,7 +185,11 @@ pub struct TrackedObject {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts", derive(TS), ts(export, export_to = "../ui/src/api/types/"))]
+#[cfg_attr(
+    feature = "ts",
+    derive(TS),
+    ts(export, export_to = "../ui/src/api/types/")
+)]
 #[serde(rename_all = "lowercase")]
 pub enum Severity {
     Low,
@@ -175,7 +199,11 @@ pub enum Severity {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts", derive(TS), ts(export, export_to = "../ui/src/api/types/"))]
+#[cfg_attr(
+    feature = "ts",
+    derive(TS),
+    ts(export, export_to = "../ui/src/api/types/")
+)]
 pub struct Artifacts {
     /// Path (or URL) of an annotated snapshot at the moment of the alert.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -189,7 +217,11 @@ pub struct Artifacts {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts", derive(TS), ts(export, export_to = "../ui/src/api/types/"))]
+#[cfg_attr(
+    feature = "ts",
+    derive(TS),
+    ts(export, export_to = "../ui/src/api/types/")
+)]
 pub struct AlertEvent {
     pub event_id: EventId,
     pub camera_id: CameraId,
@@ -213,7 +245,11 @@ pub struct AlertEvent {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts", derive(TS), ts(export, export_to = "../ui/src/api/types/"))]
+#[cfg_attr(
+    feature = "ts",
+    derive(TS),
+    ts(export, export_to = "../ui/src/api/types/")
+)]
 pub struct PipelineStatus {
     pub camera_id: CameraId,
     pub state: PipelineState,
@@ -224,7 +260,11 @@ pub struct PipelineStatus {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts", derive(TS), ts(export, export_to = "../ui/src/api/types/"))]
+#[cfg_attr(
+    feature = "ts",
+    derive(TS),
+    ts(export, export_to = "../ui/src/api/types/")
+)]
 #[serde(rename_all = "snake_case")]
 pub enum PipelineState {
     Initializing,
@@ -252,20 +292,40 @@ mod tests {
 
     #[test]
     fn iou_perfect_overlap() {
-        let a = BBox { x1: 0.0, y1: 0.0, x2: 10.0, y2: 10.0 };
+        let a = BBox {
+            x1: 0.0,
+            y1: 0.0,
+            x2: 10.0,
+            y2: 10.0,
+        };
         assert!((a.iou(&a) - 1.0).abs() < 1e-6);
     }
 
     #[test]
     fn iou_no_overlap() {
-        let a = BBox { x1: 0.0, y1: 0.0, x2: 10.0, y2: 10.0 };
-        let b = BBox { x1: 20.0, y1: 20.0, x2: 30.0, y2: 30.0 };
+        let a = BBox {
+            x1: 0.0,
+            y1: 0.0,
+            x2: 10.0,
+            y2: 10.0,
+        };
+        let b = BBox {
+            x1: 20.0,
+            y1: 20.0,
+            x2: 30.0,
+            y2: 30.0,
+        };
         assert_eq!(a.iou(&b), 0.0);
     }
 
     #[test]
     fn bbox_center_and_area() {
-        let a = BBox { x1: 0.0, y1: 0.0, x2: 4.0, y2: 6.0 };
+        let a = BBox {
+            x1: 0.0,
+            y1: 0.0,
+            x2: 4.0,
+            y2: 6.0,
+        };
         assert_eq!(a.area(), 24.0);
         assert_eq!(a.center(), (2.0, 3.0));
     }

@@ -54,7 +54,11 @@ pub fn build(cfg: &InferenceConfig) -> Result<InferenceLayer, InferenceError> {
             let mut backends: Vec<Arc<dyn DetectorBackend>> = Vec::with_capacity(n);
             for slot in 0..n {
                 let det = build_detector(cfg)?;
-                backends.push(Arc::new(ThreadIsolatedBackend::start(slot as i32, det, cfg)?));
+                backends.push(Arc::new(ThreadIsolatedBackend::start(
+                    slot as i32,
+                    det,
+                    cfg,
+                )?));
             }
             let fallback = if cfg.fail_soft {
                 let det = build_detector(cfg)?;

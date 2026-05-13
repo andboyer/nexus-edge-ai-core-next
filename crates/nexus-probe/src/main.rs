@@ -13,7 +13,11 @@ use clap::Parser;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Parser)]
-#[command(name = "nexus-probe", version, about = "Enumerate this host's hardware + runtimes")]
+#[command(
+    name = "nexus-probe",
+    version,
+    about = "Enumerate this host's hardware + runtimes"
+)]
 struct Cli {
     /// Where to write the manifest. `-` writes to stdout.
     #[arg(long, default_value = "data/device-manifest.json")]
@@ -141,7 +145,11 @@ fn probe_cpu() -> CpuInfo {
 
 fn probe_memory() -> MemoryInfo {
     let total = read_first_field("/proc/meminfo", "MemTotal")
-        .and_then(|s| s.split_whitespace().next().and_then(|x| x.parse::<u64>().ok()))
+        .and_then(|s| {
+            s.split_whitespace()
+                .next()
+                .and_then(|x| x.parse::<u64>().ok())
+        })
         .unwrap_or(0);
     MemoryInfo { total_kib: total }
 }
@@ -152,7 +160,9 @@ fn probe_accelerators() -> Accelerators {
     let accel_nodes = list_dir_starts_with("/dev/accel", "");
     Accelerators {
         intel_igpu: lspci.contains("intel") && lspci.contains("graphics"),
-        intel_arc_140v: lspci.contains("arc") || lspci.contains("battlemage") || lspci.contains("lunar lake"),
+        intel_arc_140v: lspci.contains("arc")
+            || lspci.contains("battlemage")
+            || lspci.contains("lunar lake"),
         intel_npu: !accel_nodes.is_empty() || lspci.contains("npu"),
         nvidia_gpu: lspci.contains("nvidia"),
         apple_silicon: cfg!(all(target_os = "macos", target_arch = "aarch64")),
@@ -171,7 +181,10 @@ fn probe_runtimes() -> Runtimes {
 }
 
 fn detect_onnxruntime() -> Option<String> {
-    for p in ["/usr/local/lib/libonnxruntime.so", "/opt/onnxruntime/lib/libonnxruntime.so"] {
+    for p in [
+        "/usr/local/lib/libonnxruntime.so",
+        "/opt/onnxruntime/lib/libonnxruntime.so",
+    ] {
         if std::path::Path::new(p).exists() {
             return Some(p.into());
         }
@@ -202,7 +215,11 @@ fn recommend_tier(cpu: &CpuInfo, acc: &Accelerators) -> (&'static str, &'static 
     if model.contains("i7-12700h") || model.contains("iris xe") || model.contains("96 eu") {
         return ("T24", "config/tiers/t24.toml");
     }
-    if model.contains("n100") || model.contains("n150") || model.contains("n200") || model.contains("n305") {
+    if model.contains("n100")
+        || model.contains("n150")
+        || model.contains("n200")
+        || model.contains("n305")
+    {
         return ("T10", "config/tiers/t10.toml");
     }
     if acc.apple_silicon {

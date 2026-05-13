@@ -88,11 +88,10 @@ impl Store {
     /// Seed cameras + rules from the TOML config — exactly once. The flag
     /// lives in `engine_state.seeded_from_toml`.
     pub async fn seed_from_config_if_empty(&self, cfg: &Config) -> Result<(), StoreError> {
-        let row: Option<(String,)> =
-            sqlx::query_as("SELECT value FROM engine_state WHERE key = ?")
-                .bind(SEEDED_KEY)
-                .fetch_optional(&self.pool)
-                .await?;
+        let row: Option<(String,)> = sqlx::query_as("SELECT value FROM engine_state WHERE key = ?")
+            .bind(SEEDED_KEY)
+            .fetch_optional(&self.pool)
+            .await?;
 
         if row.is_some() {
             return Ok(());
@@ -130,7 +129,11 @@ impl Store {
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
-        info!(cameras = cfg.cameras.len(), rules = cfg.rules.inline.len(), "store seeded");
+        info!(
+            cameras = cfg.cameras.len(),
+            rules = cfg.rules.inline.len(),
+            "store seeded"
+        );
         Ok(())
     }
 

@@ -29,15 +29,12 @@ env:
 
 jobs:
   # ---------------------------------------------------------------------
-  # Non-blocking formatting check. Surfaces rustfmt diffs as a separate
-  # job so a fmt nit doesn't hide a real type error in the rust job.
-  # Promote to required (continue-on-error: false) once the workspace
-  # has been formatted at least once on a Linux box.
+  # Blocking formatting check. Required since 2026-05-13 once a local
+  # rustfmt sweep was applied (commit on the same push as Cargo.lock).
   # ---------------------------------------------------------------------
   fmt:
     name: rust (fmt --check)
     runs-on: ubuntu-22.04
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - name: install rust toolchain
@@ -71,13 +68,13 @@ jobs:
           shared-key: workspace
 
       - name: cargo check (workspace, all targets)
-        run: cargo check --workspace --all-targets
+        run: cargo check --locked --workspace --all-targets
 
       - name: cargo clippy (deny warnings)
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
       - name: cargo test (workspace)
-        run: cargo test --workspace --no-fail-fast
+        run: cargo test --locked --workspace --no-fail-fast
 
   # ---------------------------------------------------------------------
   # ts-rs roundtrip — when nexus-types `ts` feature is wired (M1 task), the
@@ -95,7 +92,7 @@ jobs:
         with:
           shared-key: workspace
       - name: cargo check -p nexus-types --features ts
-        run: cargo check -p nexus-types --features ts
+        run: cargo check --locked -p nexus-types --features ts
 
   # ---------------------------------------------------------------------
   # UI — TypeScript typecheck + production build. Uploads dist/ so the
@@ -208,6 +205,6 @@ jobs:
 
       - name: cargo check (gstreamer + ort)
         run: |
-          cargo check -p nexus-pipeline  --features gstreamer
-          cargo check -p nexus-inference --features ort,ep-cpu
-          cargo check -p nexus-engine    --features gstreamer
+          cargo check --locked -p nexus-pipeline  --features gstreamer
+          cargo check --locked -p nexus-inference --features ort,ep-cpu
+          cargo check --locked -p nexus-engine    --features gstreamer

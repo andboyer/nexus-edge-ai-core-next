@@ -22,7 +22,12 @@ mod api;
 )]
 struct Cli {
     /// Path to the TOML config file.
-    #[arg(short, long, env = "NEXUS_CONFIG", default_value = "config/single-camera.toml")]
+    #[arg(
+        short,
+        long,
+        env = "NEXUS_CONFIG",
+        default_value = "config/single-camera.toml"
+    )]
     config: PathBuf,
 
     /// Override `inference.backend` from the config (mock|in_process|pool).
@@ -37,9 +42,8 @@ struct Cli {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let mut cfg = Config::load(&cli.config).with_context(|| {
-        format!("loading config {:?}", cli.config)
-    })?;
+    let mut cfg =
+        Config::load(&cli.config).with_context(|| format!("loading config {:?}", cli.config))?;
     if cli.mock_detector {
         cfg.inference.model.kind = "mock".into();
     }

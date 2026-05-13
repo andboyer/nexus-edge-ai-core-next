@@ -62,7 +62,9 @@ impl Default for MockDetector {
 
 impl MockDetector {
     pub fn new() -> Self {
-        Self { counter: parking_lot::Mutex::new(0) }
+        Self {
+            counter: parking_lot::Mutex::new(0),
+        }
     }
 }
 
@@ -142,7 +144,10 @@ impl Detector for OpenVocabDetector {
     }
 
     async fn push_camera_config(&self, update: &nexus_config::CameraConfigUpdate) {
-        debug!(camera = update.camera_id, "open-vocab cfg push (gen={})", update.generation);
+        debug!(
+            camera = update.camera_id,
+            "open-vocab cfg push (gen={})", update.generation
+        );
     }
 
     fn name(&self) -> &'static str {
@@ -163,7 +168,9 @@ pub struct ClassifierEnsembleDetector {
 
 impl ClassifierEnsembleDetector {
     pub fn new(_cfg: &InferenceConfig) -> Result<Self, InferenceError> {
-        Ok(Self { fallback: Arc::new(MockDetector::new()) })
+        Ok(Self {
+            fallback: Arc::new(MockDetector::new()),
+        })
     }
 }
 

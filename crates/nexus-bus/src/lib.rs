@@ -79,9 +79,8 @@ pub trait BusExt: Bus {
         T: DeserializeOwned + Send + 'static,
     {
         let raw = self.subscribe_raw(topic).await?;
-        let mapped = raw.map(|r| {
-            r.and_then(|v| serde_json::from_value::<T>(v).map_err(BusError::Serialize))
-        });
+        let mapped = raw
+            .map(|r| r.and_then(|v| serde_json::from_value::<T>(v).map_err(BusError::Serialize)));
         Ok(Box::pin(mapped))
     }
 }
@@ -148,10 +147,14 @@ pub struct NatsBus {
 #[async_trait]
 impl Bus for NatsBus {
     async fn publish_raw(&self, _topic: &str, _payload: serde_json::Value) -> Result<(), BusError> {
-        Err(BusError::BackendUnavailable("nats backend not yet implemented (M2)"))
+        Err(BusError::BackendUnavailable(
+            "nats backend not yet implemented (M2)",
+        ))
     }
     async fn subscribe_raw(&self, _topic: &str) -> Result<DynStream, BusError> {
-        Err(BusError::BackendUnavailable("nats backend not yet implemented (M2)"))
+        Err(BusError::BackendUnavailable(
+            "nats backend not yet implemented (M2)",
+        ))
     }
 }
 
@@ -163,7 +166,9 @@ pub fn build_bus(cfg: &nexus_config::BusConfig) -> Arc<dyn Bus> {
     match cfg.backend {
         nexus_config::BusBackendKind::Broadcast => Arc::new(BroadcastBus::new(cfg.capacity)),
         nexus_config::BusBackendKind::Nats => {
-            tracing::warn!("nats backend selected but feature not enabled; falling back to broadcast");
+            tracing::warn!(
+                "nats backend selected but feature not enabled; falling back to broadcast"
+            );
             Arc::new(BroadcastBus::new(cfg.capacity))
         }
     }

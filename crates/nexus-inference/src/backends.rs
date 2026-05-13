@@ -112,7 +112,11 @@ impl InProcessBackend {
     pub fn new(slot: i32, detector: Arc<dyn Detector>) -> Self {
         let common = BackendCommon::new();
         common.set_state(BackendState::Ready);
-        Self { slot, common, detector }
+        Self {
+            slot,
+            common,
+            detector,
+        }
     }
 }
 
@@ -194,7 +198,13 @@ impl ThreadIsolatedBackend {
         std::thread::Builder::new()
             .name(format!("nexus-detector-{}", slot))
             .spawn(move || {
-                Self::run_worker(slot, common_for_thread, factory_for_thread, rx, restart_backoff);
+                Self::run_worker(
+                    slot,
+                    common_for_thread,
+                    factory_for_thread,
+                    rx,
+                    restart_backoff,
+                );
             })
             .map_err(InferenceError::Io)?;
 
@@ -239,12 +249,20 @@ impl ThreadIsolatedBackend {
             };
             common.bump_generation();
             common.set_state(BackendState::Ready);
-            info!(slot, generation = common.generation.load(Ordering::Acquire), "detector worker ready");
+            info!(
+                slot,
+                generation = common.generation.load(Ordering::Acquire),
+                "detector worker ready"
+            );
 
             // Drain commands until shutdown or hard failure.
             while let Ok(cmd) = rx.recv() {
                 match cmd {
-                    WorkerCmd::Detect { frame, prompts, reply } => {
+                    WorkerCmd::Detect {
+                        frame,
+                        prompts,
+                        reply,
+                    } => {
                         let res = rt.block_on(detector.detect(&frame, &prompts));
                         let _ = reply.send(res);
                     }
@@ -280,7 +298,9 @@ impl DetectorBackend for ThreadIsolatedBackend {
         // Hold the lock briefly to send.
         if let Err(e) = self.cmd_tx.lock().send(cmd) {
             self.common.set_state(BackendState::Failed);
-            return Err(InferenceError::Failed(format!("worker channel closed: {e}")));
+            return Err(InferenceError::Failed(format!(
+                "worker channel closed: {e}"
+            )));
         }
         // Wait off-runtime for the worker to reply.
         let res = tokio::task::spawn_blocking(move || reply_rx.recv())
@@ -288,7 +308,10 @@ impl DetectorBackend for ThreadIsolatedBackend {
             .map_err(|e| InferenceError::Failed(format!("join: {e}")))?
             .map_err(|e| InferenceError::Failed(format!("worker reply: {e}")))?;
         if res.is_err() {
-            warn!(slot = self.slot, "worker returned error; not yet restarting");
+            warn!(
+                slot = self.slot,
+                "worker returned error; not yet restarting"
+            );
         }
         res
     }
@@ -336,7 +359,10 @@ impl WorkerProcessBackend {
     pub fn start(slot: i32) -> Self {
         let common = Arc::new(BackendCommon::new());
         common.set_state(BackendState::Failed); // never enters the rotation in M0
-        warn!(slot, "WorkerProcessBackend selected but not yet implemented (M2)");
+        warn!(
+            slot,
+            "WorkerProcessBackend selected but not yet implemented (M2)"
+        );
         Self { slot, common }
     }
 }

@@ -62,7 +62,9 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
-        if self.inference.workers == 0 && matches!(self.inference.backend, InferenceBackendKind::Pool) {
+        if self.inference.workers == 0
+            && matches!(self.inference.backend, InferenceBackendKind::Pool)
+        {
             return Err(ConfigError::Validation(
                 "inference.backend = 'pool' requires inference.workers >= 1".into(),
             ));
@@ -359,7 +361,12 @@ fn default_true() -> bool {
 /// T64 leads with "tensorrt"). `coreml` is dev-only and excluded from
 /// production defaults — opt in explicitly in your config if you need it.
 fn default_ep_priority() -> Vec<String> {
-    vec!["openvino".into(), "tensorrt".into(), "cuda".into(), "cpu".into()]
+    vec![
+        "openvino".into(),
+        "tensorrt".into(),
+        "cuda".into(),
+        "cpu".into(),
+    ]
 }
 fn default_model_kind() -> String {
     "yolo".into()

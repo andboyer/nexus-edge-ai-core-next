@@ -1,8 +1,8 @@
 [toolchain]
-# TODO(M1): repin to a specific minor version once the workspace builds
-# clean once on Linux. Tried 1.82 → needs 1.85 (edition 2024 transitives);
-# tried 1.85 → needs 1.88 (image@0.25.10). Using `stable` as an interim
-# unblock so dependency-rustc-floor games stop blocking M0 verification.
+# Pinned to `stable` (currently 1.95). Don't pin a specific minor version
+# without bumping `rust-version` in workspace.package — image@0.25.10 needs
+# 1.88+ and that floor moves with the dep tree. Verified locally against
+# stable 1.95 on aarch64-apple-darwin and on ubuntu-22.04 in CI.
 channel = "stable"
 components = ["rustfmt", "clippy"]
 profile = "minimal"

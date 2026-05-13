@@ -20,9 +20,7 @@ use async_trait::async_trait;
 use cel_interpreter::{Context, Program, Value as CelValue};
 use chrono::Utc;
 use nexus_config::{RuleConfig, RulesBackendKind, RulesConfig};
-use nexus_types::{
-    AlertEvent, Artifacts, CameraId, FrameId, Severity, TrackedObject, TraceId,
-};
+use nexus_types::{AlertEvent, Artifacts, CameraId, FrameId, Severity, TraceId, TrackedObject};
 use parking_lot::Mutex;
 use serde_json::Value as JsonValue;
 use thiserror::Error;
@@ -120,7 +118,10 @@ impl RuleEngine for CelEngine {
                 compiled.config.id.clone(),
                 format!("rule did not return Bool, got {:?}", other),
             )),
-            Err(e) => Err(RulesError::Evaluate(compiled.config.id.clone(), e.to_string())),
+            Err(e) => Err(RulesError::Evaluate(
+                compiled.config.id.clone(),
+                e.to_string(),
+            )),
         }
     }
 
@@ -249,7 +250,9 @@ impl RuleEngine for LegacyJsonEngine {
 }
 
 fn eval_legacy(node: &JsonValue, o: &TrackedObject) -> Result<bool, String> {
-    let obj = node.as_object().ok_or_else(|| "node is not an object".to_string())?;
+    let obj = node
+        .as_object()
+        .ok_or_else(|| "node is not an object".to_string())?;
     if let Some(arr) = obj.get("and").and_then(|v| v.as_array()) {
         for n in arr {
             if !eval_legacy(n, o)? {
@@ -279,7 +282,10 @@ fn eval_legacy(node: &JsonValue, o: &TrackedObject) -> Result<bool, String> {
         return Ok(o.age_ms >= t);
     }
     if let Some(a) = obj.get("attribute").and_then(|v| v.as_object()) {
-        let key = a.get("key").and_then(|v| v.as_str()).ok_or("attribute.key missing")?;
+        let key = a
+            .get("key")
+            .and_then(|v| v.as_str())
+            .ok_or("attribute.key missing")?;
         let want = a.get("eq").ok_or("attribute.eq missing")?;
         let got = o.attributes.get(key);
         return Ok(got.is_some_and(|g| g == want));
@@ -439,7 +445,12 @@ mod tests {
             track_id: 1,
             label: label.into(),
             confidence: conf,
-            bbox: BBox { x1: 0.0, y1: 0.0, x2: 10.0, y2: 10.0 },
+            bbox: BBox {
+                x1: 0.0,
+                y1: 0.0,
+                x2: 10.0,
+                y2: 10.0,
+            },
             age_frames: 5,
             age_ms,
             attributes: Default::default(),
@@ -461,7 +472,9 @@ mod tests {
         };
         let eng = CelEngine::new();
         let compiled = eng.compile(&cfg).unwrap();
-        assert!(eng.matches(&compiled, &obj("person", 0.9, 1000), 1).unwrap());
+        assert!(eng
+            .matches(&compiled, &obj("person", 0.9, 1000), 1)
+            .unwrap());
         assert!(!eng.matches(&compiled, &obj("dog", 0.9, 1000), 1).unwrap());
     }
 
@@ -480,7 +493,11 @@ mod tests {
         };
         let eng = LegacyJsonEngine::new();
         let compiled = eng.compile(&cfg).unwrap();
-        assert!(eng.matches(&compiled, &obj("person", 0.7, 1000), 1).unwrap());
-        assert!(!eng.matches(&compiled, &obj("person", 0.3, 1000), 1).unwrap());
+        assert!(eng
+            .matches(&compiled, &obj("person", 0.7, 1000), 1)
+            .unwrap());
+        assert!(!eng
+            .matches(&compiled, &obj("person", 0.3, 1000), 1)
+            .unwrap());
     }
 }

@@ -39,7 +39,9 @@ pub fn spawn_camera(
     cache: Arc<LatestFrameCache>,
 ) -> CameraHandle {
     let camera_id = cfg.id;
-    let task = tokio::spawn(run_camera(cfg, detector, tracker, evaluator, store, bus, cache));
+    let task = tokio::spawn(run_camera(
+        cfg, detector, tracker, evaluator, store, bus, cache,
+    ));
     CameraHandle { camera_id, task }
 }
 

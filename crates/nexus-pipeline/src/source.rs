@@ -38,7 +38,11 @@ pub struct VirtualSource {
 #[async_trait]
 impl FrameSource for VirtualSource {
     async fn run(self: Box<Self>, tx: mpsc::Sender<Frame>) -> Result<(), FrameSourceError> {
-        let interval_ms = if self.fps == 0 { 200 } else { 1000 / self.fps as u64 };
+        let interval_ms = if self.fps == 0 {
+            200
+        } else {
+            1000 / self.fps as u64
+        };
         let mut frame_id: u64 = 0;
         let buf = Arc::new(vec![0u8; (self.width * self.height * 3) as usize]);
         loop {

@@ -56,10 +56,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/health", get(health))
         .route("/cameras", get(list_cameras))
         .route("/cameras/:id", put(upsert_camera).delete(delete_camera))
-        .route(
-            "/cameras/:id/frames/latest",
-            get(get_latest_frame_jpeg),
-        )
+        .route("/cameras/:id/frames/latest", get(get_latest_frame_jpeg))
         .route(
             "/cameras/:id/frames/latest.json",
             get(get_latest_frame_meta),
@@ -72,8 +69,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/stream/events", get(stream_events))
         .route("/backends", get(get_backends));
 
-    let static_dir = ServeDir::new(state.ui_root.clone())
-        .append_index_html_on_directories(true);
+    let static_dir = ServeDir::new(state.ui_root.clone()).append_index_html_on_directories(true);
 
     Router::new()
         .nest("/api", api)
@@ -113,9 +109,7 @@ async fn health() -> Json<serde_json::Value> {
     }))
 }
 
-async fn list_cameras(
-    State(s): State<ApiState>,
-) -> Result<Json<Vec<CameraConfig>>, ApiError> {
+async fn list_cameras(State(s): State<ApiState>) -> Result<Json<Vec<CameraConfig>>, ApiError> {
     Ok(Json(s.store.list_cameras().await?))
 }
 
@@ -127,11 +121,19 @@ async fn upsert_camera(
     cam.id = id;
     s.store.upsert_camera(&cam).await?;
     s.store
-        .write_audit("api", "upsert", &format!("camera/{id}"), &serde_json::to_value(&cam).unwrap_or(serde_json::Value::Null))
+        .write_audit(
+            "api",
+            "upsert",
+            &format!("camera/{id}"),
+            &serde_json::to_value(&cam).unwrap_or(serde_json::Value::Null),
+        )
         .await?;
     let _ = s
         .bus
-        .publish(topic::CONFIG_CHANGED, &serde_json::json!({ "camera_id": id }))
+        .publish(
+            topic::CONFIG_CHANGED,
+            &serde_json::json!({ "camera_id": id }),
+        )
         .await;
     Ok(Json(cam))
 }
@@ -142,7 +144,12 @@ async fn delete_camera(
 ) -> Result<StatusCode, ApiError> {
     s.store.delete_camera(id).await?;
     s.store
-        .write_audit("api", "delete", &format!("camera/{id}"), &serde_json::json!({}))
+        .write_audit(
+            "api",
+            "delete",
+            &format!("camera/{id}"),
+            &serde_json::json!({}),
+        )
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -159,7 +166,12 @@ async fn upsert_rule(
     rule.id = id.clone();
     s.store.upsert_rule(&rule).await?;
     s.store
-        .write_audit("api", "upsert", &format!("rule/{id}"), &serde_json::to_value(&rule).unwrap_or(serde_json::Value::Null))
+        .write_audit(
+            "api",
+            "upsert",
+            &format!("rule/{id}"),
+            &serde_json::to_value(&rule).unwrap_or(serde_json::Value::Null),
+        )
         .await?;
     Ok(Json(rule))
 }
@@ -170,7 +182,12 @@ async fn delete_rule(
 ) -> Result<StatusCode, ApiError> {
     s.store.delete_rule(&id).await?;
     s.store
-        .write_audit("api", "delete", &format!("rule/{id}"), &serde_json::json!({}))
+        .write_audit(
+            "api",
+            "delete",
+            &format!("rule/{id}"),
+            &serde_json::json!({}),
+        )
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -233,7 +250,12 @@ async fn get_latest_frame_jpeg(
 
     let mut out = Vec::with_capacity(rgb.len() / 4);
     image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 80)
-        .write_image(&rgb, frame.width, frame.height, image::ExtendedColorType::Rgb8)
+        .write_image(
+            &rgb,
+            frame.width,
+            frame.height,
+            image::ExtendedColorType::Rgb8,
+        )
         .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok((

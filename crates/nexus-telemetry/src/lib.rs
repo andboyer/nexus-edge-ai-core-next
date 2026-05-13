@@ -29,8 +29,8 @@ impl Drop for TelemetryGuard {
 
 /// Set up the tracing subscriber. Returns a guard that flushes OTLP on drop.
 pub fn init(cfg: &TelemetryConfig) -> Result<TelemetryGuard> {
-    let env_filter = EnvFilter::try_new(&cfg.log_level)
-        .unwrap_or_else(|_| EnvFilter::new("info,nexus=debug"));
+    let env_filter =
+        EnvFilter::try_new(&cfg.log_level).unwrap_or_else(|_| EnvFilter::new("info,nexus=debug"));
 
     let registry = tracing_subscriber::registry().with(env_filter);
 
@@ -55,7 +55,9 @@ pub fn init(cfg: &TelemetryConfig) -> Result<TelemetryGuard> {
         let resource = Resource::new(vec![
             opentelemetry::KeyValue::new(
                 "service.name",
-                otlp.service_name.clone().unwrap_or_else(|| "nexus-engine".into()),
+                otlp.service_name
+                    .clone()
+                    .unwrap_or_else(|| "nexus-engine".into()),
             ),
             opentelemetry::KeyValue::new("service.version", env!("CARGO_PKG_VERSION")),
         ]);

@@ -76,7 +76,9 @@ impl Tracker for IouNaiveTracker {
         let mut state = self.inner.lock();
 
         // Drop stale tracks.
-        state.active.retain(|_, t| now.duration_since(t.last_seen) < self.ttl);
+        state
+            .active
+            .retain(|_, t| now.duration_since(t.last_seen) < self.ttl);
 
         let mut matched_track_ids: Vec<TrackId> = Vec::with_capacity(detections.len());
         let mut consumed: std::collections::HashSet<TrackId> = Default::default();
@@ -197,7 +199,12 @@ mod tests {
         Detection {
             label: label.into(),
             confidence: 0.9,
-            bbox: BBox { x1: x, y1: 0.0, x2: x + 10.0, y2: 10.0 },
+            bbox: BBox {
+                x1: x,
+                y1: 0.0,
+                x2: x + 10.0,
+                y2: 10.0,
+            },
             attributes: Default::default(),
         }
     }

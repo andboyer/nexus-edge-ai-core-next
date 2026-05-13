@@ -102,7 +102,10 @@ impl DetectorPool {
 
     fn clear_degraded_if_recovered(&self) {
         if self.degraded.load(Ordering::Acquire)
-            && self.workers.iter().any(|w| w.state() == BackendState::Ready)
+            && self
+                .workers
+                .iter()
+                .any(|w| w.state() == BackendState::Ready)
             && self.degraded.swap(false, Ordering::AcqRel)
         {
             info!("DetectorPool recovered: at least one Ready worker.");
