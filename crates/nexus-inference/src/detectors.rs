@@ -54,6 +54,12 @@ pub struct MockDetector {
     counter: parking_lot::Mutex<u64>,
 }
 
+impl Default for MockDetector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MockDetector {
     pub fn new() -> Self {
         Self { counter: parking_lot::Mutex::new(0) }
