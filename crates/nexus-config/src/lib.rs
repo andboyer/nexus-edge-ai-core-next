@@ -381,7 +381,7 @@ fn default_score_threshold() -> f32 {
 // Tracker
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TrackerConfig {
     #[serde(default)]
@@ -390,6 +390,24 @@ pub struct TrackerConfig {
     pub track_ttl_ms: u64,
     #[serde(default = "default_iou_threshold")]
     pub iou_threshold: f32,
+}
+
+// Hand-written so `Default` agrees with the `#[serde(default = "...")]`
+// fallbacks above. The derive would zero everything (track_ttl_ms = 0,
+// iou_threshold = 0.0), which silently breaks the IoU tracker because every
+// active track expires immediately on the next update.
+//
+// TODO(M1): the same mismatch exists on most other Config structs in this
+// file. Sweep them once we have a Linux-side `cargo test` baseline so the
+// fix can be validated end-to-end instead of one struct at a time.
+impl Default for TrackerConfig {
+    fn default() -> Self {
+        Self {
+            backend: TrackerBackendKind::default(),
+            track_ttl_ms: default_track_ttl_ms(),
+            iou_threshold: default_iou_threshold(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
