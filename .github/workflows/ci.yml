@@ -159,15 +159,30 @@ jobs:
 
   # ---------------------------------------------------------------------
   # Optional: build with the heavy `gstreamer` + `ort` features enabled.
-  # Costs ~3 min extra on first run (apt install gstreamer dev libs +
-  # download onnxruntime tarball). Triggered by adding the `system-libs`
-  # label to a PR, or any push to main. Failures here block release but
-  # not normal PR iteration.
+  # Runs on every push to main and on PRs labeled `system-libs`. Failures
+  # block release but not normal PR iteration.
+  #
+  # Apt cache (~200 MB of .debs) is persisted across runs via
+  # `cache-apt-pkgs-action` — first run is ~20 s on the dev box of the
+  # week, subsequent runs ~3 s. Before this caching the apt step was
+  # 10–20 min of wall clock because Azure's apt mirrors are sometimes
+  # painfully slow; everything past `apt install` only takes ~10 s.
+  #
+  # Package list is intentionally MINIMAL — dev headers only:
+  #   * pkg-config: gstreamer-rs invokes pkg-config at build time.
+  #   * libgstreamer1.0-dev, libgstreamer-plugins-base1.0-dev: gstreamer
+  #     core + base .pc files & headers. These transitively pull every
+  #     library gstreamer-rs links to (gstreamer-1.0, gstreamer-base-1.0,
+  #     glib-2.0, gobject-2.0).
+  # NOT installed (would be runtime-only / not exercised by `cargo check`):
+  #   * gstreamer1.0-plugins-good / -bad / -libav  (runtime plugins).
+  #   * libssl-dev (workspace uses rustls everywhere; Cargo.lock has no
+  #     openssl / openssl-sys / native-tls — re-verify if that changes).
+  #   * libunwind-dev (was needed only on ubuntu-22.04; 24.04 resolves
+  #     libgstreamer1.0-dev's transitives clean).
   # ---------------------------------------------------------------------
   system-libs:
     name: rust (gstreamer + ort features)
-    # ubuntu-24.04: cleaner gstreamer packaging; ubuntu-22.04 hits a
-    # libunwind-dev resolver conflict on libgstreamer1.0-dev install.
     runs-on: ubuntu-24.04
     if: |
       github.event_name == 'push' ||
@@ -181,27 +196,33 @@ jobs:
         with:
           shared-key: workspace-system-libs
 
-      - name: install gstreamer + ssl dev libs
-        run: |
-          sudo apt-get update
-          # libunwind-dev installed explicitly so libgstreamer1.0-dev's
-          # transitive dep resolves on minimal images.
-          sudo apt-get install -y --no-install-recommends \
-            pkg-config \
-            libunwind-dev \
-            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
-            gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
-            gstreamer1.0-libav \
-            libssl-dev
+      - name: install gstreamer dev headers (cached)
+        uses: awalsh128/cache-apt-pkgs-action@v1
+        with:
+          # Keyed by package list; bumping a package version invalidates.
+          packages: pkg-config libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
+          version: 1
+
+      - name: cache onnxruntime tarball
+        id: ort-cache
+        uses: actions/cache@v4
+        with:
+          path: /opt/onnxruntime
+          # ort 2.0.0-rc.10 binds to onnxruntime 1.20.x ABI; bump together.
+          key: onnxruntime-linux-x64-1.20.0-v1
 
       - name: download onnxruntime shared lib
+        if: steps.ort-cache.outputs.cache-hit != 'true'
         run: |
           ORT_VERSION=1.20.0
           curl -fsSL "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-linux-x64-${ORT_VERSION}.tgz" \
             | sudo tar -xz -C /opt
           sudo mv /opt/onnxruntime-linux-x64-${ORT_VERSION} /opt/onnxruntime
+
+      - name: export onnxruntime paths
+        run: |
           echo "LD_LIBRARY_PATH=/opt/onnxruntime/lib:${LD_LIBRARY_PATH}" >> $GITHUB_ENV
-          echo "ORT_DYLIB_PATH=/opt/onnxruntime/lib/libonnxruntime.so" >> $GITHUB_ENV
+          echo "ORT_DYLIB_PATH=/opt/onnxruntime/lib/libonnxruntime.so"   >> $GITHUB_ENV
 
       - name: cargo check (gstreamer + ort)
         run: |
