@@ -100,6 +100,7 @@ async fn cel_rule_emits_alert_for_virtual_person() {
         cam,
         detector,
         tracker,
+        tracker_cfg.annotator.clone(),
         evaluator,
         store.clone(),
         bus.clone(),

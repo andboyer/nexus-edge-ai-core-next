@@ -1,12 +1,17 @@
-//! Object trackers behind a single trait.
+//! Object trackers behind a single trait, plus a per-camera
+//! [`TrackAnnotator`] that stamps motion / dwell / zone / group
+//! attributes onto each track post-update.
 //!
 //! * [`IouNaiveTracker`] — nearest-IoU + TTL. Cheapest, used as a
 //!   fallback / smoke-test path.
 //! * [`ByteTrackTracker`] — full ByteTrack (real impl in
 //!   [`bytetrack`]). Default backend at v1 parity from M4 onward.
+//! * [`TrackAnnotator`] — real annotator (real impl in [`annotator`]).
 //!
 //! Trackers are per-camera (one instance per pipeline). All state is owned
-//! inside the implementation; the pipeline only calls `update`.
+//! inside the implementation; the pipeline only calls `update`. The
+//! annotator is also per-camera and owned by the supervisor task; it
+//! mutates the post-tracker [`TrackedObject`] list in place.
 
 #![forbid(unsafe_code)]
 
@@ -17,7 +22,9 @@ use nexus_config::TrackerConfig;
 use nexus_types::{BBox, Detection, TrackId, TrackedObject};
 use parking_lot::Mutex;
 
+pub mod annotator;
 pub mod bytetrack;
+pub use annotator::TrackAnnotator;
 pub use bytetrack::ByteTrackTracker;
 
 // ---------------------------------------------------------------------------
@@ -156,25 +163,10 @@ impl Tracker for IouNaiveTracker {
 }
 
 // ---------------------------------------------------------------------------
-// Annotator — stamps motion / dwell attrs onto tracked objects post-update.
-// Hooked here (vs. inside the tracker) so it works for every Tracker impl.
+// The annotator surface lives in [`annotator`]. It's a struct (per-camera
+// state) rather than a free function so dwell, EMA-smoothed speed, and
+// the per-zone entering/exiting FSM can persist across frames.
 // ---------------------------------------------------------------------------
-
-pub fn annotate_motion_attributes(objects: &mut [TrackedObject]) {
-    for o in objects.iter_mut() {
-        let class = if o.age_ms < 500 {
-            "stationary"
-        } else if o.bbox.area() > 10_000.0 {
-            "near"
-        } else {
-            "far"
-        };
-        o.attributes.insert(
-            "motion.speed_class".into(),
-            serde_json::Value::String(class.into()),
-        );
-    }
-}
 
 #[cfg(test)]
 mod tests {

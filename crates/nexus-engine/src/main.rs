@@ -106,6 +106,7 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
             cam,
             detector,
             tracker.clone(),
+            cfg.tracker.annotator.clone(),
             evaluator.clone(),
             store.clone() as Arc<dyn EventStore>,
             bus.clone(),

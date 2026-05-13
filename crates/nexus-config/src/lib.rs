@@ -440,6 +440,10 @@ pub struct TrackerConfig {
     /// without further keys.
     #[serde(default)]
     pub bytetrack: ByteTrackConfig,
+    /// Track annotator tuning (motion/dwell/zone/group attributes).
+    /// All fields default to v1 (`track_annotator.hpp`) values.
+    #[serde(default)]
+    pub annotator: AnnotatorConfig,
 }
 
 // Hand-written so `Default` agrees with the `#[serde(default = "...")]`
@@ -459,6 +463,7 @@ impl Default for TrackerConfig {
             track_ttl_ms: default_track_ttl_ms(),
             iou_threshold: default_iou_threshold(),
             bytetrack: ByteTrackConfig::default(),
+            annotator: AnnotatorConfig::default(),
         }
     }
 }
@@ -545,6 +550,101 @@ fn default_bytetrack_tentative_max_missed_frames() -> u32 {
 }
 fn default_bytetrack_display_smoothing_alpha() -> f32 {
     0.6
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AnnotatorConfig {
+    /// Speed (px/sec) at or above which a non-vehicle track is classified
+    /// `walking`. Below = `stationary`. v1 default: 30.0.
+    #[serde(default = "default_annotator_speed_walking_px_per_sec")]
+    pub speed_walking_px_per_sec: f32,
+    /// Speed (px/sec) at or above which a non-vehicle track becomes
+    /// `running`. v1 default: 120.0.
+    #[serde(default = "default_annotator_speed_running_px_per_sec")]
+    pub speed_running_px_per_sec: f32,
+    /// Speed (px/sec) at or above which a `vehicle.*` label becomes
+    /// `vehicle_speed`. v1 default: 250.0.
+    #[serde(default = "default_annotator_speed_vehicle_px_per_sec")]
+    pub speed_vehicle_px_per_sec: f32,
+    /// Px/frame EMA threshold below which a vehicle track accumulates
+    /// "parked" frames. v1 default: 1.5.
+    #[serde(default = "default_annotator_parked_ema_threshold_px")]
+    pub parked_ema_threshold_px: f32,
+    /// Frames a vehicle track must stay below `parked_ema_threshold_px`
+    /// before `motion.parked_vehicle = "yes"`. v1 default: 30 (~1 s @ 30 fps).
+    #[serde(default = "default_annotator_parked_min_frames_to_flag")]
+    pub parked_min_frames_to_flag: u32,
+    /// Direction (px/sec EMA magnitude) below which `motion.direction`
+    /// is reported as `"none"`. v1 default: 8.0.
+    #[serde(default = "default_annotator_direction_min_px_per_sec")]
+    pub direction_min_px_per_sec: f32,
+    /// EMA factor for the per-track movement signal (px/frame). Higher
+    /// = more reactive, lower = more smoothing. v1 default: 0.30.
+    #[serde(default = "default_annotator_movement_ema_alpha")]
+    pub movement_ema_alpha: f32,
+    /// EMA factor for the per-track direction (dx, dy) signal. v1
+    /// default: 0.50 (more reactive than the speed EMA).
+    #[serde(default = "default_annotator_direction_ema_alpha")]
+    pub direction_ema_alpha: f32,
+    /// Group-size search radius as a multiple of this track's bbox
+    /// half-perimeter. Same-label tracks within the radius are counted.
+    /// v1 default: 2.5.
+    #[serde(default = "default_annotator_group_radius_box_multiplier")]
+    pub group_radius_box_multiplier: f32,
+    /// Frames an annotator may keep stale per-track state after the
+    /// track was last observed. Generous on purpose so it outlives
+    /// lost-track recovery. v1 default: 600 (~20 s @ 30 fps).
+    #[serde(default = "default_annotator_stale_state_frames")]
+    pub stale_state_frames: u32,
+}
+
+impl Default for AnnotatorConfig {
+    fn default() -> Self {
+        Self {
+            speed_walking_px_per_sec: default_annotator_speed_walking_px_per_sec(),
+            speed_running_px_per_sec: default_annotator_speed_running_px_per_sec(),
+            speed_vehicle_px_per_sec: default_annotator_speed_vehicle_px_per_sec(),
+            parked_ema_threshold_px: default_annotator_parked_ema_threshold_px(),
+            parked_min_frames_to_flag: default_annotator_parked_min_frames_to_flag(),
+            direction_min_px_per_sec: default_annotator_direction_min_px_per_sec(),
+            movement_ema_alpha: default_annotator_movement_ema_alpha(),
+            direction_ema_alpha: default_annotator_direction_ema_alpha(),
+            group_radius_box_multiplier: default_annotator_group_radius_box_multiplier(),
+            stale_state_frames: default_annotator_stale_state_frames(),
+        }
+    }
+}
+
+fn default_annotator_speed_walking_px_per_sec() -> f32 {
+    30.0
+}
+fn default_annotator_speed_running_px_per_sec() -> f32 {
+    120.0
+}
+fn default_annotator_speed_vehicle_px_per_sec() -> f32 {
+    250.0
+}
+fn default_annotator_parked_ema_threshold_px() -> f32 {
+    1.5
+}
+fn default_annotator_parked_min_frames_to_flag() -> u32 {
+    30
+}
+fn default_annotator_direction_min_px_per_sec() -> f32 {
+    8.0
+}
+fn default_annotator_movement_ema_alpha() -> f32 {
+    0.30
+}
+fn default_annotator_direction_ema_alpha() -> f32 {
+    0.50
+}
+fn default_annotator_group_radius_box_multiplier() -> f32 {
+    2.5
+}
+fn default_annotator_stale_state_frames() -> u32 {
+    600
 }
 
 // ---------------------------------------------------------------------------

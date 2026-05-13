@@ -8,11 +8,11 @@
 use std::sync::Arc;
 
 use nexus_bus::{topic, Bus, BusExt};
-use nexus_config::CameraConfig;
+use nexus_config::{AnnotatorConfig, CameraConfig};
 use nexus_inference::Detector;
 use nexus_rules::RuleEvaluator;
 use nexus_store::EventStore;
-use nexus_tracker::{annotate_motion_attributes, Tracker};
+use nexus_tracker::{TrackAnnotator, Tracker};
 use nexus_types::{CameraId, Frame, FrameMetadata, PipelineState, PipelineStatus};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -29,10 +29,12 @@ pub struct CameraHandle {
 
 /// Build and launch one camera pipeline. Returns a join handle. If the source
 /// fails, the supervisor logs and exits — the engine owns restart policy.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_camera(
     cfg: CameraConfig,
     detector: Arc<dyn Detector>,
     tracker: Arc<dyn Tracker>,
+    annotator_cfg: AnnotatorConfig,
     evaluator: Arc<RuleEvaluator>,
     store: Arc<dyn EventStore>,
     bus: Arc<dyn Bus>,
@@ -40,15 +42,24 @@ pub fn spawn_camera(
 ) -> CameraHandle {
     let camera_id = cfg.id;
     let task = tokio::spawn(run_camera(
-        cfg, detector, tracker, evaluator, store, bus, cache,
+        cfg,
+        detector,
+        tracker,
+        annotator_cfg,
+        evaluator,
+        store,
+        bus,
+        cache,
     ));
     CameraHandle { camera_id, task }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_camera(
     cfg: CameraConfig,
     detector: Arc<dyn Detector>,
     tracker: Arc<dyn Tracker>,
+    annotator_cfg: AnnotatorConfig,
     evaluator: Arc<RuleEvaluator>,
     store: Arc<dyn EventStore>,
     bus: Arc<dyn Bus>,
@@ -88,6 +99,8 @@ async fn run_camera(
         let mut decoded: u64 = 0;
         let mut detected: u64 = 0;
         let prompts = cfg.prompts.clone();
+        let zones = cfg.zones.clone();
+        let mut annotator = TrackAnnotator::new(annotator_cfg);
 
         info!(camera_id = cfg.id, "pipeline running");
 
@@ -129,7 +142,10 @@ async fn run_camera(
                 let _g = info_span!("frame.track", tracker = tracker.name()).entered();
                 tracker.update(detections)
             };
-            annotate_motion_attributes(&mut tracked);
+            {
+                let _g = info_span!("frame.annotate", annotator = annotator.name()).entered();
+                annotator.annotate(&frame, &zones, &mut tracked);
+            }
             let tracked_arc = Arc::new(tracked.clone());
 
             // L7 cache update — see ARCHITECTURE.md.
