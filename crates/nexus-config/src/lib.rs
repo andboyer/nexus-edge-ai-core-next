@@ -28,7 +28,7 @@ pub enum ConfigError {
 // Top-level config
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default)]
@@ -575,22 +575,5 @@ mod tests {
         cfg.inference.backend = InferenceBackendKind::Pool;
         cfg.inference.workers = 0;
         assert!(cfg.validate().is_err());
-    }
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            runtime: RuntimeConfig::default(),
-            server: ServerConfig::default(),
-            store: StoreConfig::default(),
-            telemetry: TelemetryConfig::default(),
-            auth: AuthConfig::default(),
-            inference: InferenceConfig::default(),
-            tracker: TrackerConfig::default(),
-            rules: RulesConfig::default(),
-            bus: BusConfig::default(),
-            cameras: Vec::new(),
-        }
     }
 }

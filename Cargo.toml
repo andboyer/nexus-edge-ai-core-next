@@ -70,7 +70,11 @@ sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-r
 cel-interpreter = "0.10"
 
 # Inference + image
-ort = { version = "2.0.0-rc.10", default-features = false, features = ["std", "load-dynamic", "ndarray"] }
+# Pinned to =2.0.0-rc.10 because rc.11 / rc.12 reference an OrtApi field
+# (`SessionOptionsAppendExecutionProvider_VitisAI`) that doesn't exist in the
+# corresponding `ort-sys` build, even when no Vitis feature is selected.
+# Revisit once upstream ships a working post-rc.10 release.
+ort = { version = "=2.0.0-rc.10", default-features = false, features = ["std", "load-dynamic", "ndarray"] }
 ndarray = "0.16"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 

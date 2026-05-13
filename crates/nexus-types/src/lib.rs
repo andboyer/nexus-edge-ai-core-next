@@ -139,6 +139,7 @@ pub struct Detection {
     /// auxiliary scores). Kept opaque so backends can extend without
     /// schema migrations.
     #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    #[cfg_attr(feature = "ts", ts(type = "Record<string, unknown>"))]
     pub attributes: serde_json::Map<String, serde_json::Value>,
 }
 
@@ -155,6 +156,7 @@ pub struct TrackedObject {
     pub age_ms: u64,
     /// Tracker + annotator outputs (motion.speed_class, dwell.zone_state, …).
     #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    #[cfg_attr(feature = "ts", ts(type = "Record<string, unknown>"))]
     pub attributes: serde_json::Map<String, serde_json::Value>,
 }
 
@@ -202,6 +204,7 @@ pub struct AlertEvent {
     #[serde(default)]
     pub artifacts: Artifacts,
     #[serde(default)]
+    #[cfg_attr(feature = "ts", ts(type = "Record<string, unknown>"))]
     pub context: serde_json::Map<String, serde_json::Value>,
 }
 
