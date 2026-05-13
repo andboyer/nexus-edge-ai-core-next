@@ -32,6 +32,18 @@ arc-swap = { workspace = true }
 crossbeam-channel = { workspace = true }
 once_cell = { workspace = true }
 chrono = { workspace = true }
+rmp-serde = { workspace = true }
 
 ort = { workspace = true, optional = true }
 ndarray = { workspace = true, optional = true }
+
+# nexus-inference-worker: out-of-process detector worker. Spawned by
+# WorkerProcessBackend and driven over stdio with length-prefixed bincode.
+# Kept in this crate (not nexus-engine) so the worker stays a thin shim
+# over the Detector + worker_proto module that ships with the library.
+[[bin]]
+name = "nexus-inference-worker"
+path = "src/bin/nexus-inference-worker.rs"
+
+[dev-dependencies]
+tokio = { workspace = true }

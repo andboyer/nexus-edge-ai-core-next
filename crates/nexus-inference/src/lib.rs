@@ -16,6 +16,7 @@
 pub mod backends;
 pub mod detectors;
 pub mod pool;
+pub mod worker_proto;
 
 pub use backends::{
     BackendState, DetectorBackend, InProcessBackend, ThreadIsolatedBackend, WorkerProcessBackend,
@@ -27,7 +28,7 @@ pub use pool::{BackendStatus, DetectorPool};
 
 use std::sync::Arc;
 
-use nexus_config::{InferenceBackendKind, InferenceConfig};
+use nexus_config::{InferenceBackendKind, InferenceConfig, PoolWorkerKind};
 use tracing::{info, warn};
 
 /// Result of [`build`] — the pipeline-facing detector plus an optional
@@ -50,15 +51,30 @@ pub fn build(cfg: &InferenceConfig) -> Result<InferenceLayer, InferenceError> {
         }
         InferenceBackendKind::Pool => {
             let n = cfg.workers.max(1);
-            info!(workers = n, model = %cfg.model.kind, "building DetectorPool");
+            info!(
+                workers = n,
+                model = %cfg.model.kind,
+                worker_kind = ?cfg.pool_worker_kind,
+                "building DetectorPool"
+            );
             let mut backends: Vec<Arc<dyn DetectorBackend>> = Vec::with_capacity(n);
             for slot in 0..n {
-                let det = build_detector(cfg)?;
-                backends.push(Arc::new(ThreadIsolatedBackend::start(
-                    slot as i32,
-                    det,
-                    cfg,
-                )?));
+                let backend: Arc<dyn DetectorBackend> = match cfg.pool_worker_kind {
+                    PoolWorkerKind::Thread => {
+                        let det = build_detector(cfg)?;
+                        Arc::new(ThreadIsolatedBackend::start(slot as i32, det, cfg)?)
+                    }
+                    PoolWorkerKind::Process => {
+                        // The worker binary builds its own Detector from
+                        // env (NEXUS_WORKER_MODEL_KIND). No detector built
+                        // in this process for the slot.
+                        Arc::new(WorkerProcessBackend::start(
+                            slot as i32,
+                            cfg.model.kind.as_str(),
+                        )?)
+                    }
+                };
+                backends.push(backend);
             }
             let fallback = if cfg.fail_soft {
                 let det = build_detector(cfg)?;

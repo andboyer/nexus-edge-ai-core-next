@@ -2,7 +2,19 @@
 //!
 //! Every type in this crate is on the public boundary: it crosses the bus,
 //! the database, the HTTP API, and the TypeScript UI. The `ts` feature
-//! generates `ui/src/api/types.ts` from these definitions via `ts-rs`.
+//! regenerates one `*.ts` file per exported type under `ui/src/api/types/`
+//! via `ts-rs`. CI runs `cargo test -p nexus-types --features ts` then
+//! `git diff --exit-code ui/src/api/types/` so any Rust-side schema drift
+//! must be re-committed alongside the source change.
+//!
+//! The hand-curated `ui/src/api/types.ts` is the UI's *import entry point*
+//! (the per-type generated files use `bigint` for `i64`/`u64`, while the UI
+//! stays on `number`; the hand-written file is the explicit shim).
+//!
+//! The `export_to` paths look like `../../../ui/src/api/types/` because
+//! ts-rs joins them onto `${CARGO_MANIFEST_DIR}/bindings/` (the default
+//! `TS_RS_EXPORT_DIR`). From `crates/nexus-types/bindings/`, three `..`
+//! hops reach the workspace root.
 
 #![forbid(unsafe_code)]
 
@@ -36,7 +48,7 @@ pub type TraceId = String;
 #[cfg_attr(
     feature = "ts",
     derive(TS),
-    ts(export, export_to = "../ui/src/api/types/")
+    ts(export, export_to = "../../../ui/src/api/types/")
 )]
 pub struct BBox {
     pub x1: f32,
@@ -87,7 +99,7 @@ impl BBox {
 #[cfg_attr(
     feature = "ts",
     derive(TS),
-    ts(export, export_to = "../ui/src/api/types/")
+    ts(export, export_to = "../../../ui/src/api/types/")
 )]
 #[serde(rename_all = "snake_case")]
 pub enum PixelFormat {
@@ -125,7 +137,7 @@ impl Frame {
 #[cfg_attr(
     feature = "ts",
     derive(TS),
-    ts(export, export_to = "../ui/src/api/types/")
+    ts(export, export_to = "../../../ui/src/api/types/")
 )]
 pub struct FrameMetadata {
     pub camera_id: CameraId,
@@ -145,7 +157,7 @@ pub struct FrameMetadata {
 #[cfg_attr(
     feature = "ts",
     derive(TS),
-    ts(export, export_to = "../ui/src/api/types/")
+    ts(export, export_to = "../../../ui/src/api/types/")
 )]
 pub struct Detection {
     pub label: String,
@@ -163,7 +175,7 @@ pub struct Detection {
 #[cfg_attr(
     feature = "ts",
     derive(TS),
-    ts(export, export_to = "../ui/src/api/types/")
+    ts(export, export_to = "../../../ui/src/api/types/")
 )]
 pub struct TrackedObject {
     pub track_id: TrackId,
@@ -188,7 +200,7 @@ pub struct TrackedObject {
 #[cfg_attr(
     feature = "ts",
     derive(TS),
-    ts(export, export_to = "../ui/src/api/types/")
+    ts(export, export_to = "../../../ui/src/api/types/")
 )]
 #[serde(rename_all = "lowercase")]
 pub enum Severity {
@@ -202,7 +214,7 @@ pub enum Severity {
 #[cfg_attr(
     feature = "ts",
     derive(TS),
-    ts(export, export_to = "../ui/src/api/types/")
+    ts(export, export_to = "../../../ui/src/api/types/")
 )]
 pub struct Artifacts {
     /// Path (or URL) of an annotated snapshot at the moment of the alert.
@@ -220,7 +232,7 @@ pub struct Artifacts {
 #[cfg_attr(
     feature = "ts",
     derive(TS),
-    ts(export, export_to = "../ui/src/api/types/")
+    ts(export, export_to = "../../../ui/src/api/types/")
 )]
 pub struct AlertEvent {
     pub event_id: EventId,
@@ -248,7 +260,7 @@ pub struct AlertEvent {
 #[cfg_attr(
     feature = "ts",
     derive(TS),
-    ts(export, export_to = "../ui/src/api/types/")
+    ts(export, export_to = "../../../ui/src/api/types/")
 )]
 pub struct PipelineStatus {
     pub camera_id: CameraId,
@@ -263,7 +275,7 @@ pub struct PipelineStatus {
 #[cfg_attr(
     feature = "ts",
     derive(TS),
-    ts(export, export_to = "../ui/src/api/types/")
+    ts(export, export_to = "../../../ui/src/api/types/")
 )]
 #[serde(rename_all = "snake_case")]
 pub enum PipelineState {

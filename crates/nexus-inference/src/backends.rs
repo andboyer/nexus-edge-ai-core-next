@@ -344,40 +344,253 @@ impl Drop for ThreadIsolatedBackend {
 }
 
 // ---------------------------------------------------------------------------
-// WorkerProcessBackend — fork+IPC. Real implementation lives behind shared-
-// memory rings + an `interprocess` control socket; that work lands in M2.
-// The trait shape and pool-side routing are already complete here, so the
-// engine compiles and operates today against the thread-isolated backend.
+// WorkerProcessBackend — out-of-process detector worker driven over a stdio
+// pipe with length-prefixed bincode messages.
+//
+// The wire protocol + worker binary live in `worker_proto.rs` and
+// `bin/nexus-inference-worker.rs`. The parent here owns:
+//
+//   1. Spawning the child via `tokio::process::Command`.
+//   2. A reader task that pulls `WorkerResponse`s off the child stdout
+//      and dispatches them to per-request `oneshot` reply channels.
+//   3. A writer side (held under a mutex on the stdin handle) that
+//      length-prefixes each request and flushes.
+//   4. A monotonic `req_id` so multiple concurrent `detect` calls can
+//      multiplex over one child pipe.
+//   5. Mark `Failed` on child death so the pool routes around us. M2 will
+//      add an in-place restart supervisor; today the pool fail-soft path
+//      covers the brief gap.
+//
+// Shared-memory rings + an `interprocess` control socket are the M3 evolution
+// for zero-copy frames — the trait surface is intentionally identical.
 // ---------------------------------------------------------------------------
 
 pub struct WorkerProcessBackend {
     slot: i32,
     common: Arc<BackendCommon>,
+    inner: Arc<WorkerProcessInner>,
+}
+
+type DetectReply = tokio::sync::oneshot::Sender<Result<Vec<Detection>, InferenceError>>;
+
+struct WorkerProcessInner {
+    /// `req_id -> oneshot reply`. The reader task drains this on every
+    /// inbound `WorkerResponse`.
+    pending: parking_lot::Mutex<std::collections::HashMap<u64, DetectReply>>,
+    /// Monotonic request identifier.
+    next_id: std::sync::atomic::AtomicU64,
+    /// Child stdin held behind a mutex so writes never interleave on the
+    /// length prefix. Wrapped in Option so we can take it during Drop.
+    stdin: tokio::sync::Mutex<Option<tokio::process::ChildStdin>>,
+    /// The child process itself, kept alive for Drop.
+    child: parking_lot::Mutex<Option<tokio::process::Child>>,
 }
 
 impl WorkerProcessBackend {
-    pub fn start(slot: i32) -> Self {
-        let common = Arc::new(BackendCommon::new());
-        common.set_state(BackendState::Failed); // never enters the rotation in M0
-        warn!(
-            slot,
-            "WorkerProcessBackend selected but not yet implemented (M2)"
-        );
-        Self { slot, common }
+    /// Spawn the worker child located at `$NEXUS_INFERENCE_WORKER_BIN`, or
+    /// (when unset) a sibling of the current executable named
+    /// `nexus-inference-worker`. The model kind is forwarded via the
+    /// `NEXUS_WORKER_MODEL_KIND` env var.
+    pub fn start(slot: i32, model_kind: &str) -> Result<Self, InferenceError> {
+        let program = resolve_worker_program()?;
+        Self::start_with_program(slot, &program, model_kind)
     }
+
+    /// Like [`start`](Self::start) but with an explicit binary path. The
+    /// integration tests use this with `CARGO_BIN_EXE_nexus-inference-worker`
+    /// so they don't depend on the worker living next to the test runner.
+    pub fn start_with_program(
+        slot: i32,
+        program: &std::path::Path,
+        model_kind: &str,
+    ) -> Result<Self, InferenceError> {
+        use std::process::Stdio;
+        use tokio::process::Command;
+
+        let common = Arc::new(BackendCommon::new());
+
+        let mut cmd = Command::new(program);
+        cmd.env("NEXUS_WORKER_MODEL_KIND", model_kind)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| InferenceError::Failed(format!("spawn {}: {e}", program.display())))?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| InferenceError::Failed("child stdin missing".into()))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| InferenceError::Failed("child stdout missing".into()))?;
+        let stderr = child.stderr.take();
+
+        let inner = Arc::new(WorkerProcessInner {
+            pending: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            next_id: std::sync::atomic::AtomicU64::new(1),
+            stdin: tokio::sync::Mutex::new(Some(stdin)),
+            child: parking_lot::Mutex::new(Some(child)),
+        });
+
+        // Reader task — drains responses and dispatches them. Owns
+        // `stdout` for the lifetime of the worker.
+        let reader_common = common.clone();
+        let reader_inner = inner.clone();
+        let slot_for_reader = slot;
+        tokio::spawn(async move {
+            run_reader(slot_for_reader, stdout, reader_common, reader_inner).await;
+        });
+
+        // Stderr forwarder — pumps worker diagnostics onto our tracing
+        // subscriber under the worker slot. We also re-emit on the
+        // parent's own stderr at debug volume so test runs without a
+        // subscriber still surface a crashing worker.
+        if let Some(stderr) = stderr {
+            let slot_for_err = slot;
+            tokio::spawn(async move {
+                use tokio::io::{AsyncBufReadExt, BufReader};
+                let mut lines = BufReader::new(stderr).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    info!(target: "worker_process_stderr", slot = slot_for_err, "{}", line);
+                    if std::env::var("NEXUS_WORKER_LOG_STDERR").is_ok() {
+                        eprintln!("[worker slot={slot_for_err}] {line}");
+                    }
+                }
+            });
+        }
+
+        common.bump_generation();
+        common.set_state(BackendState::Ready);
+        info!(
+            slot,
+            program = %program.display(),
+            model_kind,
+            "WorkerProcessBackend spawned"
+        );
+
+        Ok(Self {
+            slot,
+            common,
+            inner,
+        })
+    }
+}
+
+async fn run_reader(
+    slot: i32,
+    stdout: tokio::process::ChildStdout,
+    common: Arc<BackendCommon>,
+    inner: Arc<WorkerProcessInner>,
+) {
+    let mut stdout = stdout;
+    loop {
+        let msg: crate::worker_proto::WorkerResponse =
+            match crate::worker_proto::read_msg(&mut stdout).await {
+                Ok(m) => m,
+                Err(e) => {
+                    warn!(slot, "worker stdout closed: {e}");
+                    break;
+                }
+            };
+        let req_id = msg.req_id();
+        let reply = inner.pending.lock().remove(&req_id);
+        match (msg, reply) {
+            (crate::worker_proto::WorkerResponse::DetectOk { detections, .. }, Some(tx)) => {
+                let _ = tx.send(Ok(detections));
+            }
+            (crate::worker_proto::WorkerResponse::DetectErr { message, .. }, Some(tx)) => {
+                let _ = tx.send(Err(InferenceError::Failed(message)));
+            }
+            (m, None) => {
+                warn!(slot, "worker response for unknown req_id={}", m.req_id());
+            }
+        }
+    }
+    // Worker is gone. Fail every outstanding request and mark the backend
+    // unhealthy so the pool routes around us.
+    common.set_state(BackendState::Failed);
+    let mut pending = inner.pending.lock();
+    for (_, tx) in pending.drain() {
+        let _ = tx.send(Err(InferenceError::Failed(
+            "worker process exited before reply".into(),
+        )));
+    }
+}
+
+fn resolve_worker_program() -> Result<std::path::PathBuf, InferenceError> {
+    if let Ok(p) = std::env::var("NEXUS_INFERENCE_WORKER_BIN") {
+        return Ok(std::path::PathBuf::from(p));
+    }
+    // Default: sibling of the current executable. That covers the
+    // standard cargo layout (`target/{debug,release}/nexus-engine` and
+    // `.../nexus-inference-worker`) and the Docker image, which copies
+    // both binaries into the same dir.
+    let me = std::env::current_exe().map_err(InferenceError::Io)?;
+    let dir = me
+        .parent()
+        .ok_or_else(|| InferenceError::Failed("current_exe has no parent dir".into()))?;
+    let name = if cfg!(windows) {
+        "nexus-inference-worker.exe"
+    } else {
+        "nexus-inference-worker"
+    };
+    Ok(dir.join(name))
 }
 
 #[async_trait]
 impl DetectorBackend for WorkerProcessBackend {
     async fn detect(
         &self,
-        _frame: &Frame,
-        _prompts: &[String],
+        frame: &Frame,
+        prompts: &[String],
     ) -> Result<Vec<Detection>, InferenceError> {
-        Err(InferenceError::Failed(
-            "WorkerProcessBackend not yet implemented (M2)".into(),
-        ))
+        if self.common.state() == BackendState::Failed {
+            return Err(InferenceError::Failed(
+                "worker_process backend is Failed".into(),
+            ));
+        }
+
+        let req_id = self
+            .inner
+            .next_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.inner.pending.lock().insert(req_id, reply_tx);
+
+        let req = crate::worker_proto::WorkerRequest::Detect {
+            req_id,
+            frame: crate::worker_proto::WireFrame::from_frame(frame),
+            prompts: prompts.to_vec(),
+        };
+
+        {
+            let mut guard = self.inner.stdin.lock().await;
+            let stdin = guard.as_mut().ok_or_else(|| {
+                self.common.set_state(BackendState::Failed);
+                InferenceError::Failed("worker stdin gone".into())
+            })?;
+            if let Err(e) = crate::worker_proto::write_msg(stdin, &req).await {
+                self.common.set_state(BackendState::Failed);
+                self.inner.pending.lock().remove(&req_id);
+                return Err(InferenceError::Failed(format!("write_msg: {e}")));
+            }
+        }
+
+        match reply_rx.await {
+            Ok(res) => res,
+            Err(_) => {
+                self.common.set_state(BackendState::Failed);
+                Err(InferenceError::Failed(
+                    "worker reply channel dropped".into(),
+                ))
+            }
+        }
     }
+
     fn slot(&self) -> i32 {
         self.slot
     }
@@ -387,8 +600,30 @@ impl DetectorBackend for WorkerProcessBackend {
     fn generation(&self) -> u64 {
         self.common.generation.load(Ordering::Acquire)
     }
-    async fn push_camera_config(&self, _u: &CameraConfigUpdate) {}
+    async fn push_camera_config(&self, _u: &CameraConfigUpdate) {
+        // M2: forward over the wire as a `WorkerRequest::PushConfig`. For
+        // M1 the worker is stateless w.r.t. per-camera config (MockDetector
+        // doesn't use it), so we just no-op rather than thrash the protocol.
+    }
     fn name(&self) -> &'static str {
         "worker_process"
+    }
+}
+
+impl Drop for WorkerProcessBackend {
+    fn drop(&mut self) {
+        // Best-effort soft shutdown then hard kill via kill_on_drop.
+        let stdin = self.inner.stdin.try_lock();
+        if let Ok(mut g) = stdin {
+            if let Some(mut s) = g.take() {
+                // Fire-and-forget — we can't await in Drop. The pipe close
+                // alone will tip the worker into a clean EOF exit.
+                let _ = (&mut s,);
+                drop(s);
+            }
+        }
+        if let Some(mut child) = self.inner.child.lock().take() {
+            let _ = child.start_kill();
+        }
     }
 }

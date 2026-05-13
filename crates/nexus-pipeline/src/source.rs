@@ -67,8 +67,26 @@ impl FrameSource for VirtualSource {
 }
 
 // ---------------------------------------------------------------------------
-// RtspSource — real GStreamer RTSP source. Wired for M1.
-// Behind the `gstreamer` feature so the workspace builds bare on dev boxes.
+// RtspSource — real GStreamer RTSP source. Behind the `gstreamer` feature so
+// the workspace builds bare on dev boxes.
+//
+// Pipeline:
+//   rtspsrc location=URL latency=200 protocols=tcp+udp
+//   ! decodebin ! videoconvert ! videorate
+//   ! video/x-raw,format=RGB,framerate=N/1
+//   ! appsink name=sink emit-signals=false sync=false drop=true max-buffers=4
+//
+// `parse::launch` handles the dynamic pad-added linking on rtspsrc and
+// decodebin for us. The appsink callback fires on a gstreamer streaming
+// thread; we `try_send` so a slow downstream consumer drops frames at the
+// edge instead of stalling the camera. The pool / gate decide what to drop,
+// not the source.
+//
+// Bus is pumped on a `spawn_blocking` task because gst-rs's `iter_timed`
+// blocks the calling thread. EOS / Error end the session; the outer
+// `run_with_backoff` then sleeps with exponential backoff (1s → 30s) and
+// rebuilds the pipeline from scratch. Net: a flapping camera burns ≤30 s
+// of wall clock between attempts and never wedges the engine.
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "gstreamer")]
@@ -79,22 +97,149 @@ pub struct RtspSource {
 }
 
 #[cfg(feature = "gstreamer")]
+mod gst_init {
+    use super::FrameSourceError;
+    use std::sync::OnceLock;
+
+    static GST_INIT: OnceLock<Result<(), String>> = OnceLock::new();
+
+    pub fn ensure() -> Result<(), FrameSourceError> {
+        let res = GST_INIT.get_or_init(|| gstreamer::init().map_err(|e| e.to_string()));
+        match res {
+            Ok(()) => Ok(()),
+            Err(e) => Err(FrameSourceError::Backend(format!("gst::init: {e}"))),
+        }
+    }
+}
+
+#[cfg(feature = "gstreamer")]
 #[async_trait]
 impl FrameSource for RtspSource {
-    async fn run(self: Box<Self>, _tx: mpsc::Sender<Frame>) -> Result<(), FrameSourceError> {
-        // M1 implementation:
-        //   gst::init();
-        //   pipeline:
-        //     rtspsrc location=URL latency=200 protocols=tcp+udp
-        //     ! rtph264depay ! decodebin ! videoconvert
-        //     ! video/x-raw,format=RGB
-        //     ! appsink name=sink emit-signals=true sync=false drop=true max-buffers=4
-        //   appsink.set_callbacks → for each sample, build Frame, tx.try_send().
-        //
-        // Backoff supervisor: on EOS / error, re-create the pipeline with
-        // exponential backoff (1s → 30s).
-        Err(FrameSourceError::Backend(
-            "gstreamer RtspSource is wired in M1 — virtual source is the M0 default".into(),
-        ))
+    async fn run(self: Box<Self>, tx: mpsc::Sender<Frame>) -> Result<(), FrameSourceError> {
+        gst_init::ensure()?;
+        let mut backoff_ms: u64 = 1_000;
+        loop {
+            if tx.is_closed() {
+                return Err(FrameSourceError::Closed);
+            }
+            match self.run_session(&tx).await {
+                Ok(()) => {
+                    tracing::info!(camera_id = self.camera_id, "rtsp session EOS");
+                }
+                Err(e) => {
+                    tracing::warn!(camera_id = self.camera_id, "rtsp session failed: {e}");
+                }
+            }
+            if tx.is_closed() {
+                return Err(FrameSourceError::Closed);
+            }
+            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+            backoff_ms = (backoff_ms.saturating_mul(2)).min(30_000);
+        }
+    }
+}
+
+#[cfg(feature = "gstreamer")]
+impl RtspSource {
+    async fn run_session(&self, tx: &mpsc::Sender<Frame>) -> Result<(), FrameSourceError> {
+        use gstreamer as gst;
+        use gstreamer::prelude::*;
+        use gstreamer_app::{AppSink, AppSinkCallbacks};
+        use gstreamer_video::VideoInfo;
+
+        // The URL is operator-supplied via config; we drop embedded `"` to
+        // keep `parse::launch` parsing safe but otherwise pass through (RFC
+        // 3986 forbids unescaped quotes anyway).
+        let url_safe = self.url.replace('"', "");
+        let fr = if self.max_fps == 0 { 15 } else { self.max_fps };
+        let desc = format!(
+            "rtspsrc location=\"{url_safe}\" latency=200 protocols=tcp+udp \
+             ! decodebin ! videoconvert ! videorate \
+             ! video/x-raw,format=RGB,framerate={fr}/1 \
+             ! appsink name=sink emit-signals=false sync=false drop=true max-buffers=4"
+        );
+
+        let pipeline = gst::parse::launch(&desc)
+            .map_err(|e| FrameSourceError::Backend(format!("parse::launch: {e}")))?
+            .downcast::<gst::Pipeline>()
+            .map_err(|_| FrameSourceError::Backend("downcast Pipeline".into()))?;
+
+        let sink = pipeline
+            .by_name("sink")
+            .ok_or_else(|| FrameSourceError::Backend("appsink 'sink' not found".into()))?
+            .downcast::<AppSink>()
+            .map_err(|_| FrameSourceError::Backend("downcast AppSink".into()))?;
+
+        let camera_id = self.camera_id;
+        let counter = Arc::new(parking_lot::Mutex::new(0u64));
+        let tx_cb = tx.clone();
+        let counter_cb = counter.clone();
+
+        sink.set_callbacks(
+            AppSinkCallbacks::builder()
+                .new_sample(move |sink| {
+                    let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
+                    let buffer = sample.buffer().ok_or(gst::FlowError::Error)?;
+                    let caps = sample.caps().ok_or(gst::FlowError::Error)?;
+                    let info = VideoInfo::from_caps(caps).map_err(|_| gst::FlowError::Error)?;
+                    let map = buffer.map_readable().map_err(|_| gst::FlowError::Error)?;
+                    let frame_id = {
+                        let mut g = counter_cb.lock();
+                        *g = g.saturating_add(1);
+                        *g
+                    };
+                    let frame = Frame {
+                        camera_id,
+                        frame_id,
+                        captured_at: Utc::now(),
+                        width: info.width(),
+                        height: info.height(),
+                        format: PixelFormat::Rgb24,
+                        data: Arc::new(map.as_slice().to_vec()),
+                        trace_id: Uuid::now_v7().to_string(),
+                    };
+                    // Never block streaming threads — the gate/pool drop policy
+                    // is upstream of us.
+                    let _ = tx_cb.try_send(frame);
+                    Ok(gst::FlowSuccess::Ok)
+                })
+                .build(),
+        );
+
+        pipeline
+            .set_state(gst::State::Playing)
+            .map_err(|e| FrameSourceError::Backend(format!("set Playing: {e}")))?;
+
+        let bus = pipeline
+            .bus()
+            .ok_or_else(|| FrameSourceError::Backend("pipeline bus missing".into()))?;
+        let pipeline_for_bus = pipeline.clone();
+        let bus_result = tokio::task::spawn_blocking(move || -> Result<(), String> {
+            use gst::MessageView;
+            for msg in bus.iter_timed(gst::ClockTime::NONE) {
+                match msg.view() {
+                    MessageView::Eos(..) => {
+                        return Ok(());
+                    }
+                    MessageView::Error(e) => {
+                        // Keep pipeline alive past the iterator drop so the
+                        // outer caller can null it explicitly.
+                        let _ = &pipeline_for_bus;
+                        return Err(format!(
+                            "{}: {}",
+                            e.error(),
+                            e.debug().unwrap_or_else(|| "<no debug>".into())
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| FrameSourceError::Backend(format!("bus join: {e}")))?;
+
+        let _ = pipeline.set_state(gst::State::Null);
+        bus_result.map_err(FrameSourceError::Backend)
     }
 }

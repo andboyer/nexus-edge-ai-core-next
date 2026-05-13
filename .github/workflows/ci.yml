@@ -77,9 +77,12 @@ jobs:
         run: cargo test --locked --workspace --no-fail-fast
 
   # ---------------------------------------------------------------------
-  # ts-rs roundtrip — when nexus-types `ts` feature is wired (M1 task), the
-  # generated bindings under ui/src/api/types/ must match what's checked in.
-  # Today this just verifies the `ts` feature compiles.
+  # ts-rs roundtrip — running `cargo test -p nexus-types --features ts`
+  # regenerates one `*.ts` file per `#[derive(TS)]` type into
+  # `ui/src/api/types/`. `git diff --exit-code` then fails if Rust-side
+  # schema changes weren't accompanied by a re-committed binding. The
+  # hand-curated `ui/src/api/types.ts` is the UI's import surface and is
+  # NOT generated — it's hand-mirrored once per intentional shape change.
   # ---------------------------------------------------------------------
   rust-ts-feature:
     name: rust (nexus-types ts feature)
@@ -91,8 +94,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: workspace
-      - name: cargo check -p nexus-types --features ts
-        run: cargo check --locked -p nexus-types --features ts
+      - name: cargo test -p nexus-types --features ts (regenerates ui/src/api/types/)
+        run: cargo test --locked -p nexus-types --features ts
+      - name: verify no drift in generated bindings
+        run: |
+          if ! git diff --exit-code -- ui/src/api/types/; then
+            echo "::error::ts-rs bindings drifted from Rust derives in nexus-types."
+            echo "Run: cargo test -p nexus-types --features ts && git add ui/src/api/types/"
+            exit 1
+          fi
 
   # ---------------------------------------------------------------------
   # UI — TypeScript typecheck + production build. Uploads dist/ so the

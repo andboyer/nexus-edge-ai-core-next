@@ -280,6 +280,9 @@ pub struct InferenceConfig {
     /// Single-process or pool of N workers.
     #[serde(default)]
     pub backend: InferenceBackendKind,
+    /// Pool-worker isolation strategy. Ignored when `backend != pool`.
+    #[serde(default)]
+    pub pool_worker_kind: PoolWorkerKind,
     #[serde(default = "default_workers")]
     pub workers: usize,
     #[serde(default = "default_restart_backoff_ms")]
@@ -299,6 +302,7 @@ impl Default for InferenceConfig {
     fn default() -> Self {
         Self {
             backend: InferenceBackendKind::default(),
+            pool_worker_kind: PoolWorkerKind::default(),
             workers: default_workers(),
             restart_backoff_ms: default_restart_backoff_ms(),
             fail_soft: true,
@@ -316,6 +320,25 @@ pub enum InferenceBackendKind {
     InProcess,
     /// `DetectorPool` of N backends + fail-soft fallback.
     Pool,
+}
+
+/// Isolation strategy for backends inside a `DetectorPool`.
+///
+/// `Thread` is the dev / single-host default: each worker is an OS thread
+/// with its own current-thread tokio runtime. Cheap to spin up, shares
+/// address space with the engine.
+///
+/// `Process` spawns the `nexus-inference-worker` binary as a child and
+/// drives it over a length-prefixed bincode pipe. This is the production
+/// stance — a panicking model or driver bug only takes the child down,
+/// the engine + pool route around the dead slot, and the fail-soft
+/// fallback keeps the pipeline live until M2's in-place restart lands.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PoolWorkerKind {
+    #[default]
+    Thread,
+    Process,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
