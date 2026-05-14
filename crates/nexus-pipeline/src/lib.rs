@@ -15,6 +15,7 @@
 
 pub mod cache;
 pub mod gate;
+pub mod post_roll;
 pub mod recorder;
 pub mod source;
 pub mod supervisor;

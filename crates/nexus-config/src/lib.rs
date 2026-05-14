@@ -187,6 +187,14 @@ pub struct ClipsConfig {
     /// How often the watermark sampler runs.
     #[serde(default = "default_watermark_sample_interval_secs")]
     pub watermark_sample_interval_secs: u32,
+    /// How long the supervisor waits after the last live track
+    /// disappears before closing the open clip. A new motion event
+    /// arriving inside the grace window cancels the pending close,
+    /// so a single clip spans the brief gap between two intermittent
+    /// tracks. 0 disables post-roll entirely (the clip closes the
+    /// moment `live_track_count` hits zero, matching pre-B3 behaviour).
+    #[serde(default = "default_post_roll_secs")]
+    pub post_roll_secs: u32,
 }
 
 impl Default for ClipsConfig {
@@ -199,6 +207,7 @@ impl Default for ClipsConfig {
             low_watermark_pct: default_low_watermark_pct(),
             panic_watermark_pct: default_panic_watermark_pct(),
             watermark_sample_interval_secs: default_watermark_sample_interval_secs(),
+            post_roll_secs: default_post_roll_secs(),
         }
     }
 }
@@ -225,6 +234,10 @@ fn default_panic_watermark_pct() -> u8 {
 
 fn default_watermark_sample_interval_secs() -> u32 {
     30
+}
+
+fn default_post_roll_secs() -> u32 {
+    10
 }
 
 // ---------------------------------------------------------------------------

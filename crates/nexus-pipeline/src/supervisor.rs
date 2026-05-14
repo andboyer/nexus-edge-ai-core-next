@@ -23,6 +23,7 @@ use tracing::{debug, error, info, info_span, warn, Instrument};
 
 use crate::cache::LatestFrameCache;
 use crate::gate::MotionGate;
+use crate::post_roll::{PostRoll, PostRollAction};
 use crate::recorder::{ClipFinal, ClipHandle, ClipRecorder, OpenClip, RecorderError};
 use crate::source::{FrameSource, VirtualSource};
 
@@ -141,6 +142,7 @@ async fn run_camera(
         // motion_events row before insert (schema invariant).
         let mut emitter = MotionEventEmitter::new(clips_cfg.motion_events_sample_hz);
         let mut current_clip: Option<ClipHandle> = None;
+        let mut post_roll = PostRoll::new(clips_cfg.post_roll_secs);
 
         info!(camera_id = cfg.id, "pipeline running");
 
@@ -296,11 +298,16 @@ async fn run_camera(
                 }
             }
 
-            // Close the clip the moment all live tracks have
-            // gone away. (Stage A keeps this simple: no post-roll
-            // grace; that lands with the real GStreamer recorder
-            // in Stage B.)
-            if emitter.live_track_count(cfg.id) == 0 {
+            // Close the clip when the post-roll grace window
+            // elapses without motion returning. Pre-B3 this fired
+            // immediately on `live_track_count == 0`; B3 wraps that
+            // condition in a deferred-close timer so two short
+            // motion bursts inside `clips_cfg.post_roll_secs`
+            // produce a single clip rather than two adjacent
+            // micro-clips. Pre-roll is intentionally a separate PR.
+            let has_live_motion = emitter.live_track_count(cfg.id) > 0;
+            let action = post_roll.tick(frame.captured_at, has_live_motion);
+            if matches!(action, PostRollAction::CloseNow) {
                 if let Some(handle) = current_clip.take() {
                     if let Err(e) = recorder
                         .close(
@@ -319,6 +326,7 @@ async fn run_camera(
 
         // Pipeline ended — close any clip still open so its row
         // doesn't sit forever with NULL ended_at.
+        post_roll.reset();
         if let Some(handle) = current_clip.take() {
             let now = chrono::Utc::now();
             if let Err(e) = recorder.close(handle, ClipFinal { ended_at: now }).await {
