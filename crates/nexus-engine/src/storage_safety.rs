@@ -471,4 +471,185 @@ mod tests {
             "free pct should be in 0..=100, got {pct}"
         );
     }
+
+    // --- End-to-end: panic -> evict -> recover ---
+
+    use nexus_bus::BroadcastBus;
+    use nexus_config::{CameraConfig, StoreConfig};
+    use nexus_pipeline::{ClipRecorder, StubClipRecorder};
+    use nexus_store::NewClip;
+    use parking_lot::Mutex;
+    use std::collections::VecDeque;
+    use url::Url;
+
+    /// Returns the next pre-programmed value each call. When the
+    /// queue runs dry, repeats the last value forever — keeps the
+    /// loop deterministic without panicking.
+    struct MockProbe(Mutex<VecDeque<f32>>, Mutex<f32>);
+
+    impl MockProbe {
+        fn new(values: Vec<f32>) -> Self {
+            let last = *values.last().unwrap_or(&50.0);
+            Self(Mutex::new(values.into()), Mutex::new(last))
+        }
+    }
+
+    #[async_trait]
+    impl FreeSpaceProbe for MockProbe {
+        async fn free_pct(&self) -> Result<f32, ProbeError> {
+            let mut q = self.0.lock();
+            if let Some(v) = q.pop_front() {
+                *self.1.lock() = v;
+                Ok(v)
+            } else {
+                Ok(*self.1.lock())
+            }
+        }
+    }
+
+    async fn build_store_with_camera() -> (Arc<Store>, tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("nexus.db");
+        let store = Arc::new(
+            Store::open(&StoreConfig {
+                url: format!("sqlite:{}?mode=rwc", db_path.display()),
+                seed_from_config: false,
+                duckdb_attach: false,
+                duckdb_path: PathBuf::from("/tmp/unused.duckdb"),
+            })
+            .await
+            .unwrap(),
+        );
+        store
+            .upsert_camera(&CameraConfig {
+                id: 1,
+                name: "front".into(),
+                url: Url::parse("rtsp://127.0.0.1/stream").unwrap(),
+                enabled: true,
+                prompts: vec![],
+                model_override: None,
+                zones: vec![],
+                max_fps: 0,
+                parking_lot_mode: false,
+            })
+            .await
+            .unwrap();
+        let clips_dir = dir.path().join("clips");
+        tokio::fs::create_dir_all(&clips_dir).await.unwrap();
+        (store, dir, clips_dir)
+    }
+
+    /// Drives the full FSM: starts at 50% (Ok), drops to 2% (Panic
+    /// + evict), recovers to 80% (back to Ok). Verifies recorder
+    /// panic flag flips at each transition AND that an oldest clip
+    /// got evicted in the panic tick.
+    #[tokio::test]
+    async fn watermark_panic_evict_recover_cycle() {
+        let (store, _dir, clips_dir) = build_store_with_camera().await;
+        let recorder: Arc<dyn ClipRecorder> =
+            Arc::new(StubClipRecorder::new(store.clone(), clips_dir.clone()));
+        let bus: Arc<dyn Bus> = Arc::new(BroadcastBus::new(64));
+
+        // Seed two clips so eviction has something to chew on.
+        let _id1 = store
+            .open_clip(&NewClip {
+                camera_id: 1,
+                started_at: chrono::Utc::now() - chrono::Duration::minutes(10),
+                path: "cam1/oldest.mp4".into(),
+                codec: "stub".into(),
+                container: "mp4".into(),
+                backend_id: "local".into(),
+            })
+            .await
+            .unwrap();
+        let _id2 = store
+            .open_clip(&NewClip {
+                camera_id: 1,
+                started_at: chrono::Utc::now() - chrono::Duration::minutes(5),
+                path: "cam1/newer.mp4".into(),
+                codec: "stub".into(),
+                container: "mp4".into(),
+                backend_id: "local".into(),
+            })
+            .await
+            .unwrap();
+        // Materialise the on-disk files so the eviction's
+        // remove_file actually has a target.
+        tokio::fs::create_dir_all(clips_dir.join("cam1"))
+            .await
+            .unwrap();
+        tokio::fs::write(clips_dir.join("cam1/oldest.mp4"), b"x")
+            .await
+            .unwrap();
+        tokio::fs::write(clips_dir.join("cam1/newer.mp4"), b"x")
+            .await
+            .unwrap();
+
+        let cfg = StorageSafetyConfig {
+            clips_dir: clips_dir.clone(),
+            low_watermark_pct: 15,
+            panic_watermark_pct: 5,
+            sample_interval: Duration::from_millis(20),
+        };
+        // Tick 1: 50% -> Ok. Tick 2: 2% -> Panic + evict.
+        // Tick 3: 80% -> Ok (clears panic). The MockProbe will
+        // repeat 80.0 forever after that, so the loop stays Ok.
+        let probe = Arc::new(MockProbe::new(vec![50.0, 2.0, 80.0])) as Arc<dyn FreeSpaceProbe>;
+
+        let recorder_for_loop = recorder.clone();
+        let store_for_loop = store.clone();
+        let bus_for_loop = bus.clone();
+        let handle = tokio::spawn(async move {
+            let _ = run_storage_safety(cfg, probe, recorder_for_loop, store_for_loop, bus_for_loop)
+                .await;
+        });
+
+        // Wait for at least the panic tick to land. Recorder panic
+        // flag goes true, then false again.
+        let mut saw_panic = false;
+        for _ in 0..200 {
+            if recorder.is_panic() {
+                saw_panic = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            saw_panic,
+            "recorder.is_panic should have flipped true on the 2% tick"
+        );
+
+        // Then it should clear once the 80% tick lands.
+        let mut saw_recover = false;
+        for _ in 0..200 {
+            if !recorder.is_panic() {
+                saw_recover = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            saw_recover,
+            "recorder.is_panic should have cleared on the 80% tick"
+        );
+
+        // Oldest clip must be gone (file + row). The newer clip
+        // may or may not be — depends on timing; we only assert
+        // the deterministic invariant.
+        // Wait briefly for the eviction's DB delete to commit.
+        let mut evicted = false;
+        for _ in 0..200 {
+            if !clips_dir.join("cam1/oldest.mp4").exists() {
+                evicted = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            evicted,
+            "oldest clip file should have been evicted in the panic tick"
+        );
+
+        handle.abort();
+    }
 }

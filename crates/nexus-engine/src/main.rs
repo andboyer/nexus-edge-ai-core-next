@@ -13,6 +13,7 @@ use nexus_tracker::build_tracker;
 use tracing::{info, warn};
 
 mod api;
+mod retention;
 mod storage_safety;
 
 #[derive(Debug, Parser)]
@@ -161,6 +162,26 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
         })
     };
 
+    // Retention sweeper + orphan-file scan. Runs daily in production
+    // (24h interval); shares the same shutdown channel as the
+    // safety task so a Ctrl-C between sweep ticks doesn't have to
+    // wait the full interval.
+    let (retention_shutdown_tx, retention_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let retention_cfg = retention::RetentionConfig {
+        clips_dir: clips_dir.clone(),
+        retention_days: cfg.runtime.clips.motion_clips_retention_days,
+        interval: std::time::Duration::from_secs(24 * 60 * 60),
+    };
+    let retention_handle = {
+        let store = store.clone();
+        tokio::spawn(async move {
+            retention::run_retention(retention_cfg, store, async {
+                let _ = retention_shutdown_rx.await;
+            })
+            .await;
+        })
+    };
+
     let api_state = api::ApiState {
         store: store.clone(),
         bus: bus.clone(),
@@ -189,6 +210,8 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
     }
 
     safety_handle.abort();
+    let _ = retention_shutdown_tx.send(());
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), retention_handle).await;
     for h in handles {
         h.task.abort();
     }

@@ -208,6 +208,17 @@ impl Store {
         Ok(rows.into_iter().map(|r| r.get::<i64, _>(0)).collect())
     }
 
+    /// Every `motion_clips.path` currently in the DB. Used by the
+    /// orphan-file scanner to compute "files on disk that have no
+    /// matching row" by set difference. Paths are stored relative
+    /// to the recorder's `clips_dir`.
+    pub async fn known_clip_paths(&self) -> Result<Vec<String>, StoreError> {
+        let rows = sqlx::query("SELECT path FROM motion_clips")
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.into_iter().map(|r| r.get::<String, _>(0)).collect())
+    }
+
     /// Single-DELETE eviction. With the `ON DELETE CASCADE` FKs in
     /// `0002_motion_clips.sql`, this also removes every linked
     /// `motion_events` row and NULL-outs `events.clip_id`.
