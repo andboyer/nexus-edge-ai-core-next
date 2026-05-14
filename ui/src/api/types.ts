@@ -143,3 +143,42 @@ export interface BackendsResponse {
   mode: "in_process" | "pool";
   slots: BackendStatus[];
 }
+
+// ---------------------------------------------------------------------------
+// M2.1 Stage B (B5) — motion timeline + on-disk clip storage.
+// Wire shapes mirror crates/nexus-engine/src/api.rs and
+// crates/nexus-store/src/motion.rs verbatim. Keep additive-only on the
+// engine side so the UI can survive a partial rollout.
+// ---------------------------------------------------------------------------
+
+export type ClipId = number;
+export type MotionEventId = number;
+
+export type MotionEventKind = "born" | "updated" | "died";
+
+export interface StorageLocalResponse {
+  /// `stub` when the engine ships the placeholder recorder, `gstreamer`
+  /// once the real GstClipRecorder is wired in. Drives the recorder
+  /// label and gates clip playback in the UI.
+  recorder_kind: string;
+  /// True iff the watermark sampler has the recorder paused.
+  panic: boolean;
+  /// 0..=100 free percentage on the clips_dir filesystem. None on
+  /// non-unix builds.
+  free_pct: number | null;
+  clips_dir: string;
+}
+
+export interface MotionEventRow {
+  id: MotionEventId;
+  camera_id: CameraId;
+  clip_id: ClipId;
+  track_id: TrackId;
+  kind: MotionEventKind;
+  captured_at: string;
+  bbox: BBox;
+  label: string;
+  confidence: number;
+  attributes_json: string;
+}
+

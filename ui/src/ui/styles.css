@@ -261,3 +261,195 @@ textarea {
 .state-pill.state-initializing { background: rgba(255, 209, 102, 0.18); color: var(--warn); }
 .state-pill.state-restarting   { background: rgba(255, 159, 28, 0.18); color: var(--warn); }
 .state-pill.state-failed       { background: rgba(239, 71, 111, 0.18); color: var(--crit); }
+
+/* M2.1 B5 — Storage tab. */
+.storage-strip {
+  margin-bottom: 16px;
+}
+
+.storage-card {
+  background: var(--bg-elev);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--ok);
+  border-radius: 4px;
+  padding: 10px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.storage-card.warn {
+  border-left-color: var(--warn);
+}
+
+.storage-card.panic {
+  border-left-color: var(--crit);
+  background: rgba(239, 71, 111, 0.06);
+}
+
+.storage-card-head {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+}
+
+.storage-card-line {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 18px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.storage-card-line .metric {
+  display: inline-flex;
+  gap: 6px;
+}
+
+.storage-card-line .metric .k {
+  color: var(--text-dim);
+}
+
+.storage-card-line .metric span:not(.k),
+.storage-card-line .metric code {
+  color: var(--text);
+}
+
+.panic-pill {
+  margin-left: 6px;
+  padding: 1px 6px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  background: var(--crit);
+  color: #fff;
+  border-radius: 3px;
+}
+
+.storage-cameras {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.storage-camera {
+  background: var(--bg-elev);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 12px;
+}
+
+.storage-camera-head {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.storage-camera-head h3 {
+  margin: 0;
+  font-size: 14px;
+  color: var(--text);
+}
+
+.muted {
+  color: var(--text-dim);
+}
+
+.mono {
+  font-family: ui-monospace, "JetBrains Mono", "Fira Code", monospace;
+  font-size: 12px;
+}
+
+.clip-strip {
+  /* host for the per-camera clip grid */
+}
+
+.clip-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  gap: 8px;
+}
+
+.clip-tile {
+  position: relative;
+  aspect-ratio: 16 / 9;
+  background: var(--bg-elev-2);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  overflow: hidden;
+  cursor: pointer;
+  padding: 0;
+  font: inherit;
+  color: inherit;
+}
+
+.clip-tile:hover {
+  border-color: var(--accent);
+}
+
+.clip-tile img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.clip-tile .clip-ts {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  padding: 2px 6px;
+  font-size: 10px;
+  background: rgba(0, 0, 0, 0.55);
+  color: #fff;
+  text-align: center;
+  letter-spacing: 0.02em;
+}
+
+.clip-modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.78);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 9000;
+}
+
+.clip-modal-card {
+  background: var(--bg-elev);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 12px;
+  max-width: min(960px, 92vw);
+  max-height: 92vh;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  box-shadow: var(--shadow);
+}
+
+.clip-modal-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.clip-modal-video {
+  max-width: 100%;
+  max-height: 70vh;
+  background: #000;
+  border-radius: 3px;
+}
+
+.clip-modal-error {
+  padding: 16px;
+  background: var(--bg-elev-2);
+  color: var(--crit);
+  border-radius: 3px;
+  font-size: 13px;
+  text-align: center;
+}

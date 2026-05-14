@@ -7,8 +7,11 @@ import type {
   BackendsResponse,
   CameraConfig,
   CameraId,
+  ClipId,
+  MotionEventRow,
   RuleConfig,
   RuleId,
+  StorageLocalResponse,
   FrameMetadata,
 } from "./types.js";
 
@@ -67,4 +70,37 @@ export const api = {
   },
 
   backends: () => request<BackendsResponse>("/backends"),
+
+  // M2.1 Stage B (B5) — motion timeline + on-disk clip storage.
+  // Binary endpoints return URLs the caller embeds in <video>/<img>;
+  // the engine streams them with HTTP Range support so seeking works.
+  storage: {
+    local: () => request<StorageLocalResponse>("/v1/storage/local"),
+  },
+
+  motion: {
+    /// Camera-scoped motion event window. `from` / `to` accept
+    /// RFC3339 timestamps; the engine clamps `limit` to [1, 5000]
+    /// and defaults the window to the last hour.
+    listForCamera: (
+      cameraId: CameraId,
+      opts: { from?: string; to?: string; limit?: number } = {},
+    ) => {
+      const q = new URLSearchParams();
+      if (opts.from) q.set("from", opts.from);
+      if (opts.to) q.set("to", opts.to);
+      if (opts.limit != null) q.set("limit", String(opts.limit));
+      const qs = q.toString();
+      const suffix = qs ? `?${qs}` : "";
+      return request<MotionEventRow[]>(
+        `/v1/cameras/${cameraId}/motion${suffix}`,
+      );
+    },
+  },
+
+  clips: {
+    streamUrl: (clipId: ClipId) => `${BASE}/v1/clips/${clipId}`,
+    thumbnailUrl: (clipId: ClipId) =>
+      `${BASE}/v1/clips/${clipId}/thumbnail`,
+  },
 };
