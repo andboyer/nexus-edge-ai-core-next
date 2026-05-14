@@ -15,11 +15,15 @@
 
 pub mod cache;
 pub mod gate;
+pub mod recorder;
 pub mod source;
 pub mod supervisor;
 
 pub use cache::{LatestEntry, LatestFrameCache};
 pub use gate::MotionGate;
+pub use recorder::{
+    ClipFinal, ClipHandle, ClipMeta, ClipRecorder, OpenClip, RecorderError, StubClipRecorder,
+};
 pub use source::{FrameSource, FrameSourceError, VirtualSource};
 pub use supervisor::{spawn_camera, CameraHandle};
 

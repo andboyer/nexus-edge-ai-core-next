@@ -13,6 +13,24 @@
 worker_threads = 0
 blocking_threads = 8
 
+[runtime.clips]
+# Where the recorder writes mp4 files. Created on demand.
+clips_dir = "/var/lib/nexus/clips"
+# Daily retention sweeper deletes clips older than this. The watermark
+# sampler can evict sooner if disk pressure rises.
+motion_clips_retention_days = 30
+# Cap on `track.updated` motion-event row writes per active track per
+# second. `track.born` and `track.died` are always emitted.
+motion_events_sample_hz = 1.0
+# Below this percentage of free space on the clips_dir filesystem, the
+# watermark sampler starts evicting one round per check.
+low_watermark_pct = 15
+# Below this percentage the recorder refuses to open new clips and
+# eviction runs hard until free space recovers to low + 5pct.
+panic_watermark_pct = 5
+# How often the watermark sampler runs.
+watermark_sample_interval_secs = 30
+
 [server]
 api_bind = "0.0.0.0:8089"
 # In the container the UI is at /usr/share/nexus/ui. Locally use ui/dist.

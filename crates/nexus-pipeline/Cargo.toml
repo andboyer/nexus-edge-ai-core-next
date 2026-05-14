@@ -37,3 +37,6 @@ futures = { workspace = true }
 gstreamer = { workspace = true, optional = true }
 gstreamer-app = { workspace = true, optional = true }
 gstreamer-video = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

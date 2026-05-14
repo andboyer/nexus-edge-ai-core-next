@@ -108,6 +108,9 @@ pub struct RuntimeConfig {
     /// (static-object registries, etc.). Created on demand.
     #[serde(default = "default_state_dir")]
     pub state_dir: PathBuf,
+    /// M2.1 motion-clip recording + safety-floor configuration.
+    #[serde(default)]
+    pub clips: ClipsConfig,
 }
 
 impl Default for RuntimeConfig {
@@ -116,6 +119,7 @@ impl Default for RuntimeConfig {
             worker_threads: 0,
             blocking_threads: default_blocking_threads(),
             state_dir: default_state_dir(),
+            clips: ClipsConfig::default(),
         }
     }
 }
@@ -126,6 +130,84 @@ fn default_blocking_threads() -> usize {
 
 fn default_state_dir() -> PathBuf {
     PathBuf::from("/var/lib/nexus/state")
+}
+
+// ---------------------------------------------------------------------------
+// Clips (M2.1 motion timeline + clip recording + safety floor)
+// ---------------------------------------------------------------------------
+
+/// Recording, retention, and disk-safety knobs for the motion timeline.
+///
+/// **Hand-written `impl Default`.** The codebase rule (see DEV_NOTES.md
+/// "Cargo / Rust") is: never combine `#[derive(Default)]` with
+/// `#[serde(default = "fn")]`. The serde defaults below fire for
+/// missing keys during deserialise; this `impl Default` keeps
+/// `T::default()` callers (tests, builders) producing the same values.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClipsConfig {
+    /// Where the recorder writes mp4 files. Created on demand.
+    #[serde(default = "default_clips_dir")]
+    pub clips_dir: PathBuf,
+    /// How long an unevicted clip lives before the daily retention
+    /// sweeper deletes it. The watermark sampler can evict sooner if
+    /// disk is tight.
+    #[serde(default = "default_motion_clips_retention_days")]
+    pub motion_clips_retention_days: u32,
+    /// Cap on `track.updated` motion-event row writes per active track
+    /// per second. `track.born` and `track.died` are always emitted.
+    /// Default 1.0 ≈ one row per track per second.
+    #[serde(default = "default_motion_events_sample_hz")]
+    pub motion_events_sample_hz: f32,
+    /// Below this percentage of free space on `clips_dir`'s filesystem
+    /// the watermark sampler starts evicting one round per check.
+    #[serde(default = "default_low_watermark_pct")]
+    pub low_watermark_pct: u8,
+    /// Below this percentage the recorder refuses to open new clips
+    /// and the eviction loop runs hard until free space recovers to
+    /// `low_watermark_pct + 5`.
+    #[serde(default = "default_panic_watermark_pct")]
+    pub panic_watermark_pct: u8,
+    /// How often the watermark sampler runs.
+    #[serde(default = "default_watermark_sample_interval_secs")]
+    pub watermark_sample_interval_secs: u32,
+}
+
+impl Default for ClipsConfig {
+    fn default() -> Self {
+        Self {
+            clips_dir: default_clips_dir(),
+            motion_clips_retention_days: default_motion_clips_retention_days(),
+            motion_events_sample_hz: default_motion_events_sample_hz(),
+            low_watermark_pct: default_low_watermark_pct(),
+            panic_watermark_pct: default_panic_watermark_pct(),
+            watermark_sample_interval_secs: default_watermark_sample_interval_secs(),
+        }
+    }
+}
+
+fn default_clips_dir() -> PathBuf {
+    PathBuf::from("/var/lib/nexus/clips")
+}
+
+fn default_motion_clips_retention_days() -> u32 {
+    30
+}
+
+fn default_motion_events_sample_hz() -> f32 {
+    1.0
+}
+
+fn default_low_watermark_pct() -> u8 {
+    15
+}
+
+fn default_panic_watermark_pct() -> u8 {
+    5
+}
+
+fn default_watermark_sample_interval_secs() -> u32 {
+    30
 }
 
 // ---------------------------------------------------------------------------
