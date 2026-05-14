@@ -25,6 +25,7 @@ Thumbs.db
 # UI
 node_modules
 ui/dist
+ui/*.tsbuildinfo
 
 # Tooling caches
 .venv

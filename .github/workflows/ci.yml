@@ -119,10 +119,11 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-          # No package-lock.json yet — switch to "npm" once it's checked in.
+          cache: "npm"
+          cache-dependency-path: ui/package-lock.json
 
-      - name: npm install
-        run: npm install --no-audit --no-fund
+      - name: npm ci
+        run: npm ci --no-audit --no-fund
 
       - name: typecheck
         run: npm run typecheck
