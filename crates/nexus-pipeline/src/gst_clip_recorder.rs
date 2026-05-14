@@ -425,4 +425,89 @@ mod tests {
         let rec = GstClipRecorder::new(store, &clips_dir, HashMap::new()).unwrap();
         assert_eq!(rec.kind(), "gstreamer");
     }
+
+    // -----------------------------------------------------------
+    // Live RTSP acceptance test — drives the recorder against a
+    // real camera. Skipped by default; opt in by setting
+    // NEXUS_RTSP_TEST_URL=rtsp://user:pass@host/path. Asserts:
+    //
+    //   1. open() succeeds (pipeline reaches Playing).
+    //   2. After ~5s of recording, close() returns ClipMeta with
+    //      size_bytes > 0 and duration_ms ~5000ms.
+    //   3. The on-disk file is a non-empty mp4 whose header bytes
+    //      look like ISO BMFF ('ftyp' at offset 4..8).
+    //
+    // Run:
+    //   NEXUS_RTSP_TEST_URL='rtsp://admin:Testing1928!@192.168.1.66/stream1' \
+    //     cargo test -p nexus-pipeline --features gstreamer -- --ignored \
+    //       live_rtsp_smoke --nocapture
+    // -----------------------------------------------------------
+
+    #[tokio::test]
+    #[ignore = "requires NEXUS_RTSP_TEST_URL pointing at a live RTSP camera"]
+    async fn live_rtsp_smoke() {
+        let Ok(url) = std::env::var("NEXUS_RTSP_TEST_URL") else {
+            eprintln!(
+                "skip: set NEXUS_RTSP_TEST_URL=rtsp://user:pass@host/path to run this acceptance test"
+            );
+            return;
+        };
+        let (store, _dir, clips_dir) = fixture().await;
+        let mut urls = HashMap::new();
+        urls.insert(1, url);
+        let rec = GstClipRecorder::new(store.clone(), &clips_dir, urls).unwrap();
+
+        let started_at = Utc::now();
+        let handle = rec
+            .open(OpenClip {
+                camera_id: 1,
+                started_at,
+            })
+            .await
+            .expect("open() should succeed against a reachable camera");
+
+        // Let the pipeline pull frames for ~5s. mp4mux fragments
+        // every 5000ms so this guarantees at least one finalised
+        // moof/mdat pair lands in the file.
+        tokio::time::sleep(Duration::from_secs(5)).await;
+
+        let ended_at = Utc::now();
+        let meta = rec
+            .close(handle, ClipFinal { ended_at })
+            .await
+            .expect("close() should return ClipMeta after EOS drain");
+
+        assert!(
+            meta.size_bytes > 0,
+            "live RTSP clip is empty (0 bytes); pipeline drained nothing"
+        );
+        assert!(
+            meta.duration_ms >= 4500 && meta.duration_ms <= 6000,
+            "duration_ms {} outside expected ~5000ms window",
+            meta.duration_ms
+        );
+        assert_eq!(meta.codec, "h264");
+        assert_eq!(meta.container, "mp4");
+
+        let bytes = tokio::fs::read(&meta.path).await.expect("clip readable");
+        assert!(
+            bytes.len() >= 8,
+            "clip file too short: {} bytes",
+            bytes.len()
+        );
+        // ISO BMFF: bytes 4..8 are the 'ftyp' atom marker.
+        assert_eq!(
+            &bytes[4..8],
+            b"ftyp",
+            "clip is not an ISO BMFF mp4 (missing ftyp marker); first 16 bytes = {:02x?}",
+            &bytes[..16.min(bytes.len())]
+        );
+
+        eprintln!(
+            "live RTSP smoke OK: {} bytes, {} ms, path = {}",
+            meta.size_bytes,
+            meta.duration_ms,
+            meta.path.display()
+        );
+    }
 }
