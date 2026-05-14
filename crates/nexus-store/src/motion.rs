@@ -334,6 +334,22 @@ impl Store {
         }
         Ok(())
     }
+
+    /// Read back the clip_id stamped on an event row. Returns
+    /// `Ok(None)` if the row exists but has no clip cross-reference,
+    /// and `Err(NotFound)` if the row itself is missing. Used by the
+    /// alert detail UI to deep-link into the surrounding clip and by
+    /// the supervisor's end-to-end test to verify the link wired up.
+    pub async fn get_event_clip_id(&self, event_id: &str) -> Result<Option<ClipId>, StoreError> {
+        let row = sqlx::query("SELECT clip_id FROM events WHERE event_id = ?")
+            .bind(event_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        match row {
+            None => Err(StoreError::NotFound(format!("event_id={event_id}"))),
+            Some(r) => Ok(r.try_get::<Option<i64>, _>(0).ok().flatten()),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

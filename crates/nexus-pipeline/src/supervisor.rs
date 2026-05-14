@@ -211,9 +211,19 @@ async fn run_camera(
                 let _g = info_span!("frame.rules").entered();
                 evaluator.evaluate(cfg.id, frame_id, &trace_id, &tracked)
             };
+            // Record + publish the events now so the row exists.
+            // We defer the events.clip_id stamp until AFTER the
+            // motion lifecycle has run for this frame, because a
+            // new alert + first Born in the same frame must link
+            // to the clip that gets opened on this frame, not the
+            // previous one.
+            let mut events_to_link: Vec<String> = Vec::new();
             for ev in events {
+                let event_id = ev.event_id.to_string();
                 if let Err(e) = store.record_event(&ev).await {
                     warn!(event = %ev.event_id, "store.record_event failed: {e}");
+                } else {
+                    events_to_link.push(event_id);
                 }
                 let _ = bus.publish(topic::ALERT_EVENT, &ev).await;
             }
@@ -264,6 +274,25 @@ async fn run_camera(
                 };
                 if let Err(e) = insert_motion_decision(&store, handle, d).await {
                     warn!(camera_id = cfg.id, "insert_motion_event failed: {e}");
+                }
+            }
+
+            // Stamp events.clip_id for any alerts that fired this
+            // frame, now that the motion lifecycle has had a chance
+            // to open a clip. Alerts on frames with no open clip
+            // simply stay unlinked (clip_id NULL) — the timeline UI
+            // shows them as "no surrounding video".
+            if !events_to_link.is_empty() {
+                if let Some(handle) = current_clip {
+                    for event_id in &events_to_link {
+                        if let Err(e) = store.link_event_to_clip(event_id, handle.clip_id).await {
+                            warn!(
+                                event = %event_id,
+                                clip_id = handle.clip_id,
+                                "link_event_to_clip failed: {e}"
+                            );
+                        }
+                    }
                 }
             }
 

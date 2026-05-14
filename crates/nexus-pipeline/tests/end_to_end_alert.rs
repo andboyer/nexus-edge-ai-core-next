@@ -146,6 +146,37 @@ async fn cel_rule_emits_alert_for_virtual_person() {
         "store must contain the same event"
     );
 
+    // 5b. The supervisor opens a motion clip on the same frame the
+    //     person track is born, then stamps events.clip_id for any
+    //     alert raised on that frame. Give the supervisor a brief
+    //     window to drain the deferred link write — the alert and
+    //     the link land in the same loop iteration but the test
+    //     observes through a separate sqlite connection.
+    let mut linked: Option<i64> = None;
+    for _ in 0..50 {
+        match store
+            .get_event_clip_id(&event.event_id.to_string())
+            .await
+            .expect("get_event_clip_id must succeed")
+        {
+            Some(cid) => {
+                linked = Some(cid);
+                break;
+            }
+            None => tokio::time::sleep(Duration::from_millis(20)).await,
+        }
+    }
+    let clip_id = linked.expect("events.clip_id must be stamped within 1s of the alert");
+    let clip = store
+        .get_clip(clip_id)
+        .await
+        .expect("get_clip must succeed")
+        .expect("linked clip must exist");
+    assert_eq!(
+        clip.camera_id, event.camera_id,
+        "clip must belong to the alert camera"
+    );
+
     // 6. Tear down the supervisor task. abort() is best-effort; the test
     //    runtime is dropped immediately after this returns either way.
     handle.task.abort();
