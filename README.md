@@ -13,7 +13,7 @@ level instead of being defaults nobody can change.
 
 ## The single architectural commitment
 
-```
+```text
                        trait + N backends + scale-factor knob
                        ────────────────────────────────────────
    FrameSource           rtsp / file / virtual                  pool: per-camera
@@ -54,7 +54,7 @@ table + Lunar Lake driver caveats: [`docs/HARDWARE_TIERS.md`](docs/HARDWARE_TIER
 
 ## Workspace layout
 
-```
+```text
 crates/
 ├── nexus-types/        Wire types — Frame, Detection, TrackedObject, AlertEvent
 ├── nexus-config/       TOML schema + validation. Scale knobs per layer.
