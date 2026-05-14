@@ -59,6 +59,11 @@ pub struct ApiState {
     /// Used by /api/v1/storage/local for the StatvfsProbe + by
     /// /api/v1/clips/:id to compute the absolute path.
     pub clips_dir: PathBuf,
+    /// Configured watermark thresholds — surfaced verbatim by
+    /// /api/v1/storage/local so the UI can render the same gauge
+    /// the engine is using.
+    pub low_watermark_pct: u8,
+    pub panic_watermark_pct: u8,
 }
 
 pub fn router(state: ApiState) -> Router {
@@ -368,52 +373,144 @@ async fn get_backends(State(s): State<ApiState>) -> Json<BackendsResponse> {
 // M2.1 Stage A — storage / motion / clips endpoints
 // ---------------------------------------------------------------------------
 
+/// Spec'd response shape for `GET /api/v1/storage/local` per
+/// `docs/M2_STORAGE.md`. The UI's Storage tab renders the global gauge
+/// + per-camera occupancy strip directly off this body.
 #[derive(serde::Serialize)]
 struct StorageLocalResponse {
     /// `stub` until the GStreamer recorder lands in Stage B.
     recorder_kind: &'static str,
     /// True iff the watermark sampler has the recorder paused. UI
     /// uses this to render the "evicting / no new clips" banner.
+    /// Aliases `watermark_state == "panic"`; kept for backwards
+    /// compatibility with early Stage A consumers.
     panic: bool,
-    /// Free-pct under clips_dir, 0..=100. None on platforms without
-    /// statvfs (windows; will be wired in Stage B).
-    free_pct: Option<f32>,
     clips_dir: PathBuf,
+
+    // --- filesystem ---
+    /// Total bytes on `clips_dir`'s mount, per `statvfs`. None on
+    /// platforms without `statvfs` (currently: windows in Stage A).
+    fs_total_bytes: Option<u64>,
+    /// Bytes in use on `clips_dir`'s mount (`total - free`).
+    fs_used_bytes: Option<u64>,
+    /// User-available free bytes on `clips_dir`'s mount
+    /// (`bavail * frsize`, NOT raw `bfree` — matches what the
+    /// watermark sampler observes).
+    fs_free_bytes: Option<u64>,
+    /// Free-pct under clips_dir, 0..=100.
+    free_pct: Option<f32>,
+
+    // --- watermark FSM snapshot ---
+    /// Current watermark level: `"ok" | "low" | "panic"`. Derived
+    /// from `recorder.is_panic()` + the latest `free_pct` against
+    /// the configured thresholds. May briefly disagree with the
+    /// FSM during a sample-interval window because the FSM has
+    /// hysteresis and this snapshot does not — UI badges should
+    /// poll once per second and treat the value as advisory.
+    watermark_state: &'static str,
+    watermark_low_pct: u8,
+    watermark_panic_pct: u8,
+
+    // --- per-camera occupancy strip ---
+    /// One entry per camera that currently owns at least one clip.
+    /// Cameras with zero clips are omitted; the UI may render them
+    /// as zero-rows on its own. Sorted by `camera_id`.
+    per_camera: Vec<nexus_store::PerCameraClipStats>,
 }
 
 async fn get_storage_local(
     State(s): State<ApiState>,
 ) -> Result<Json<StorageLocalResponse>, ApiError> {
-    let free_pct = compute_free_pct(&s.clips_dir).await;
+    let stats = compute_fs_stats(&s.clips_dir).await;
+    let panic = s.recorder.is_panic();
+    let watermark_state = derive_watermark_state(
+        panic,
+        stats.free_pct,
+        s.low_watermark_pct,
+        s.panic_watermark_pct,
+    );
+    let per_camera = s.store.per_camera_clip_stats().await?;
     Ok(Json(StorageLocalResponse {
         recorder_kind: s.recorder.kind(),
-        panic: s.recorder.is_panic(),
-        free_pct,
+        panic,
         clips_dir: s.clips_dir.clone(),
+        fs_total_bytes: stats.total_bytes,
+        fs_used_bytes: stats.used_bytes,
+        fs_free_bytes: stats.free_bytes,
+        free_pct: stats.free_pct,
+        watermark_state,
+        watermark_low_pct: s.low_watermark_pct,
+        watermark_panic_pct: s.panic_watermark_pct,
+        per_camera,
     }))
 }
 
+/// Filesystem stats snapshot consumed by `get_storage_local`.
+/// All fields are `None` on platforms without `statvfs`.
+#[derive(Default)]
+struct FsStats {
+    total_bytes: Option<u64>,
+    used_bytes: Option<u64>,
+    free_bytes: Option<u64>,
+    free_pct: Option<f32>,
+}
+
 #[cfg(unix)]
-async fn compute_free_pct(path: &std::path::Path) -> Option<f32> {
+async fn compute_fs_stats(path: &std::path::Path) -> FsStats {
     let path = path.to_path_buf();
     let r = tokio::task::spawn_blocking(move || nix::sys::statvfs::statvfs(path.as_path())).await;
     match r {
         Ok(Ok(stat)) => {
-            let blocks = stat.blocks() as f64;
-            let avail = stat.blocks_available() as f64;
-            if blocks <= 0.0 {
+            // `fragment_size` is already `u64` on every platform we
+            // support; `blocks`/`blocks_available` may be either
+            // `u32` (older glibc) or `u64` (macOS/musl), so the
+            // explicit casts are still needed there.
+            let frag = stat.fragment_size();
+            let blocks = stat.blocks() as u64;
+            let avail = stat.blocks_available() as u64;
+            let total_bytes = blocks.saturating_mul(frag);
+            let free_bytes = avail.saturating_mul(frag);
+            let used_bytes = total_bytes.saturating_sub(free_bytes);
+            let free_pct = if blocks == 0 {
                 Some(0.0)
             } else {
-                Some(((avail / blocks) * 100.0) as f32)
+                Some(((avail as f64 / blocks as f64) * 100.0) as f32)
+            };
+            FsStats {
+                total_bytes: Some(total_bytes),
+                used_bytes: Some(used_bytes),
+                free_bytes: Some(free_bytes),
+                free_pct,
             }
         }
-        _ => None,
+        _ => FsStats::default(),
     }
 }
 
 #[cfg(not(unix))]
-async fn compute_free_pct(_path: &std::path::Path) -> Option<f32> {
-    None
+async fn compute_fs_stats(_path: &std::path::Path) -> FsStats {
+    FsStats::default()
+}
+
+/// Derive a watermark-state label from the recorder panic flag + a
+/// fresh `free_pct` reading. Mirrors the order
+/// [`nexus_engine::storage_safety::WatermarkController`] uses, minus
+/// the hysteresis (which only the FSM owns).
+fn derive_watermark_state(
+    panic: bool,
+    free_pct: Option<f32>,
+    low_pct: u8,
+    panic_pct: u8,
+) -> &'static str {
+    if panic {
+        return "panic";
+    }
+    match free_pct {
+        Some(pct) if pct <= panic_pct as f32 => "panic",
+        Some(pct) if pct <= low_pct as f32 => "low",
+        Some(_) => "ok",
+        None => "unknown",
+    }
 }
 
 #[derive(serde::Deserialize)]

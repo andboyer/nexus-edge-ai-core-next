@@ -144,23 +144,35 @@ impl GstClipRecorder {
         })
     }
 
-    /// Path the recorder will write for `(camera_id, started_at)`.
-    /// Same shape as `StubClipRecorder::clip_path` so the rest of the
-    /// system (eviction loop, retention sweeper, orphan-file scan)
-    /// works against either recorder unchanged.
+    /// In-flight path the recorder will write for `(camera_id,
+    /// started_at)`. Per M2.1 spec layout — see
+    /// [`crate::recorder::inflight_clip_path`]. The file is renamed
+    /// to its final `{start_ms}_{duration_ms}.mp4` shape on close.
     pub fn clip_path(&self, camera_id: CameraId, started_at: DateTime<Utc>) -> PathBuf {
-        let ts = started_at.format("%Y%m%dT%H%M%S");
-        let ms = started_at.timestamp_subsec_millis();
-        self.clips_dir
-            .join(format!("cam{camera_id}"))
-            .join(format!("{ts}_{ms:03}.mp4"))
+        crate::recorder::inflight_clip_path(&self.clips_dir, camera_id, started_at)
+    }
+
+    /// Returns the parse-launch description of the recorder
+    /// pipeline. Extracted so tests can assert the M2.1 spec
+    /// invariant that the recorder is a strict codec passthrough
+    /// (no encoder, no raw-video conversion). Keep this aligned
+    /// with [`Self::build_pipeline`].
+    fn pipeline_desc(location: &Path) -> String {
+        let location_safe = location.to_string_lossy().replace('"', "");
+        format!(
+            "appsrc name=src is-live=false format=time do-timestamp=false \
+                     stream-type=stream max-bytes=16777216 block=true \
+             ! h264parse config-interval=-1 \
+             ! video/x-h264,stream-format=avc,alignment=au \
+             ! mp4mux fragment-duration=5000 streamable=true faststart=true \
+             ! filesink location=\"{location_safe}\" sync=false"
+        )
     }
 
     fn build_pipeline(location: &Path) -> Result<(gst::Pipeline, AppSrc), RecorderError> {
         // location came from clips_dir + a deterministic timestamp
         // template; strip embedded `"` before splicing into launch
         // string so a pathological path can't break the parser.
-        let location_safe = location.to_string_lossy().replace('"', "");
         // appsrc properties:
         //   is-live=false  : we're bulk-feeding from an external
         //                    source, NOT driving the pipeline clock.
@@ -181,14 +193,7 @@ impl GstClipRecorder {
         //                     pump shouldn't ever hit this in normal
         //                     operation but it bounds memory if
         //                     filesink is slow (full disk).
-        let desc = format!(
-            "appsrc name=src is-live=false format=time do-timestamp=false \
-                     stream-type=stream max-bytes=16777216 block=true \
-             ! h264parse config-interval=-1 \
-             ! video/x-h264,stream-format=avc,alignment=au \
-             ! mp4mux fragment-duration=5000 streamable=true faststart=true \
-             ! filesink location=\"{location_safe}\" sync=false"
-        );
+        let desc = Self::pipeline_desc(location);
         let pipeline = gst::parse::launch(&desc)
             .map_err(|e| RecorderError::Io(std::io::Error::other(format!("parse::launch: {e}"))))?
             .downcast::<gst::Pipeline>()
@@ -305,10 +310,7 @@ impl ClipRecorder for GstClipRecorder {
         };
         let last_pushed_pts: Option<Duration> = snapshot_tail_pts;
 
-        let rel = path
-            .strip_prefix(&self.clips_dir)
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|_| path.to_string_lossy().into_owned());
+        let rel = crate::recorder::clip_rel_path(&self.clips_dir, &path);
         let new = NewClip {
             camera_id: args.camera_id,
             started_at: args.started_at,
@@ -435,12 +437,71 @@ impl ClipRecorder for GstClipRecorder {
         let _ = pipeline.set_state(gst::State::Null);
 
         let duration_ms = (args.ended_at - state.started_at).num_milliseconds().max(0);
-        let size_bytes = match fs::metadata(&state.path).await {
+
+        // M2.1 spec: discard sub-3s clips. The pipeline + filesink
+        // are already torn down so we can safely unlink the file.
+        if duration_ms < crate::recorder::MIN_CLIP_DURATION_MS {
+            warn!(
+                camera_id = state.camera_id,
+                clip_id = handle.clip_id,
+                duration_ms,
+                min_ms = crate::recorder::MIN_CLIP_DURATION_MS,
+                "gst recorder: clip too short -- discarding (delete file + cascade-delete metadata)"
+            );
+            if let Err(e) = fs::remove_file(&state.path).await {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    warn!(
+                        clip_id = handle.clip_id,
+                        path = %state.path.display(),
+                        error = %e,
+                        "gst recorder: failed to unlink discarded short clip"
+                    );
+                }
+            }
+            self.store
+                .cascade_delete_clip_metadata(handle.clip_id)
+                .await?;
+            return Ok(ClipMeta {
+                clip_id: handle.clip_id,
+                camera_id: state.camera_id,
+                path: state.path,
+                duration_ms,
+                size_bytes: 0,
+                codec: CODEC.into(),
+                container: CONTAINER.into(),
+                discarded: true,
+            });
+        }
+
+        // Normal close path: rename in-flight file to spec layout
+        // `{start_ms}_{duration_ms}.mp4`, stat for size, stamp the row.
+        let final_abs = crate::recorder::final_clip_path(
+            &self.clips_dir,
+            state.camera_id,
+            state.started_at,
+            duration_ms,
+        );
+        if let Err(e) = fs::rename(&state.path, &final_abs).await {
+            warn!(
+                clip_id = handle.clip_id,
+                from = %state.path.display(),
+                to   = %final_abs.display(),
+                error = %e,
+                "gst recorder: rename to final path failed; row will keep in-flight path"
+            );
+        }
+        let final_used = if final_abs.exists() {
+            final_abs
+        } else {
+            state.path.clone()
+        };
+        let rel = crate::recorder::clip_rel_path(&self.clips_dir, &final_used);
+        let size_bytes = match fs::metadata(&final_used).await {
             Ok(meta) => meta.len() as i64,
             Err(e) => {
                 warn!(
                     error = %e,
-                    path = %state.path.display(),
+                    path = %final_used.display(),
                     "gst recorder could not stat clip; recording size_bytes=0"
                 );
                 0
@@ -454,6 +515,7 @@ impl ClipRecorder for GstClipRecorder {
                     ended_at: args.ended_at,
                     duration_ms,
                     size_bytes,
+                    path: Some(rel),
                 },
             )
             .await?;
@@ -468,11 +530,12 @@ impl ClipRecorder for GstClipRecorder {
         Ok(ClipMeta {
             clip_id: handle.clip_id,
             camera_id: state.camera_id,
-            path: state.path,
+            path: final_used,
             duration_ms,
             size_bytes,
             codec: CODEC.into(),
             container: CONTAINER.into(),
+            discarded: false,
         })
     }
 
@@ -641,15 +704,22 @@ mod tests {
         let t = chrono::DateTime::parse_from_rfc3339("2026-05-13T12:34:56.789Z")
             .unwrap()
             .with_timezone(&Utc);
-        let p = rec.clip_path(1, t);
-        assert!(p.starts_with(&clips_dir));
+        let p1 = rec.clip_path(1, t);
+        let p2 = rec.clip_path(2, t);
+        assert!(p1.starts_with(&clips_dir));
+        // M2.1 spec layout: {clips_dir}/{camera_id}/{YYYY-MM-DD}/{start_unix_ms}.partial.mp4
+        let expected_ms = t.timestamp_millis();
+        let s1 = p1.to_string_lossy().to_string();
+        let s2 = p2.to_string_lossy().to_string();
+        assert!(s1.contains("/1/"), "path missing camera_id component: {s1}");
+        assert!(s2.contains("/2/"), "path missing camera_id component: {s2}");
         assert!(
-            p.to_string_lossy().contains("cam1"),
-            "path missing cam1 component"
+            s1.contains("/2026-05-13/"),
+            "path missing UTC date dir: {s1}"
         );
         assert!(
-            p.to_string_lossy().ends_with("20260513T123456_789.mp4"),
-            "path tail wrong: {p:?}"
+            s1.ends_with(&format!("{expected_ms}.partial.mp4")),
+            "path tail wrong: {s1}"
         );
     }
 
@@ -789,5 +859,40 @@ mod tests {
             meta.duration_ms,
             meta.path.display()
         );
+    }
+
+    /// M2.1 audit: the recorder MUST be a strict codec passthrough.
+    /// We assert that the parse-launch description contains
+    /// `h264parse` (mux-side parser only, no decode/re-encode) and
+    /// does NOT contain any of the common H.264 encoders or any
+    /// raw-video element. If this fires, somebody has sneaked an
+    /// encoder into the pipeline and the recorder is no longer
+    /// passthrough — that's a CPU-cost regression and a quality
+    /// regression and needs a deliberate decision.
+    #[test]
+    fn pipeline_string_is_codec_passthrough() {
+        let desc = GstClipRecorder::pipeline_desc(Path::new(
+            "/var/lib/nexus/clips/1/2026-05-13/1234567890.partial.mp4",
+        ));
+        assert!(desc.contains("appsrc"), "missing appsrc: {desc}");
+        assert!(desc.contains("h264parse"), "missing h264parse: {desc}");
+        assert!(desc.contains("mp4mux"), "missing mp4mux: {desc}");
+        assert!(desc.contains("filesink"), "missing filesink: {desc}");
+        for forbidden in [
+            "x264enc",
+            "avenc_h264",
+            "openh264enc",
+            "vaapih264enc",
+            "vtenc_h264",
+            "videoconvert",
+            "video/x-raw",
+            "decodebin",
+            "avdec_h264",
+        ] {
+            assert!(
+                !desc.contains(forbidden),
+                "recorder pipeline must be codec-passthrough but contains `{forbidden}`: {desc}"
+            );
+        }
     }
 }

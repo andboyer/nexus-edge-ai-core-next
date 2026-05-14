@@ -33,6 +33,19 @@ use tokio::fs;
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
+/// Minimum acceptable clip duration. Below this threshold the close
+/// path deletes the file and cascade-deletes the metadata row, on
+/// the theory that anything shorter is from a spurious detection
+/// that flickered into existence and back out before the post-roll
+/// timer could even arm. Per M2.1 spec.
+pub const MIN_CLIP_DURATION_MS: i64 = 3_000;
+
+/// Maximum acceptable clip duration. Anything past this gets a
+/// rotation event from the supervisor (close current clip + open a
+/// new one immediately) so file sizes stay bounded during sustained
+/// activity. Per M2.1 spec.
+pub const MAX_CLIP_DURATION_MS: i64 = 5 * 60 * 1_000;
+
 /// Open a new clip for a camera. The path on disk is recorder-controlled
 /// so we don't have to thread filesystem layout through every caller.
 #[derive(Debug, Clone)]
@@ -68,6 +81,15 @@ pub struct ClipMeta {
     pub size_bytes: i64,
     pub codec: String,
     pub container: String,
+    /// True when the clip was **discarded at close time** because its
+    /// duration fell below [`MIN_CLIP_DURATION_MS`]. The on-disk file
+    /// has been unlinked and the `motion_clips` row + every
+    /// CASCADE-linked child has been removed via
+    /// [`Store::cascade_delete_clip_metadata`]. The supervisor treats
+    /// this as a normal outcome (no clip ever existed for this
+    /// motion burst); diagnostic fields above are populated for
+    /// logging only.
+    pub discarded: bool,
 }
 
 #[derive(Debug, Error)]
@@ -118,6 +140,61 @@ pub trait ClipRecorder: Send + Sync {
 }
 
 // ---------------------------------------------------------------------------
+// Path layout helpers
+// ---------------------------------------------------------------------------
+
+/// In-flight clip path per M2.1 spec layout, with a `.partial.mp4`
+/// suffix until the recorder closes the file and renames to the final
+/// `_{duration_ms}` form.
+///
+/// Layout: `{clips_dir}/{camera_id}/{YYYY-MM-DD}/{start_unix_ms}.partial.mp4`
+///
+/// `{YYYY-MM-DD}` is the UTC date of `started_at` so all clips for one
+/// surveillance day share a directory regardless of the operator's
+/// local timezone (matches how the API + retention sweeper reason
+/// about "yesterday's clips").
+pub fn inflight_clip_path(
+    clips_dir: &Path,
+    camera_id: CameraId,
+    started_at: DateTime<Utc>,
+) -> PathBuf {
+    let day = started_at.format("%Y-%m-%d");
+    let start_ms = started_at.timestamp_millis();
+    clips_dir
+        .join(camera_id.to_string())
+        .join(day.to_string())
+        .join(format!("{start_ms}.partial.mp4"))
+}
+
+/// Final clip path per M2.1 spec layout, set by the recorder at
+/// close time once `duration_ms` is known.
+///
+/// Layout: `{clips_dir}/{camera_id}/{YYYY-MM-DD}/{start_unix_ms}_{duration_ms}.mp4`
+pub fn final_clip_path(
+    clips_dir: &Path,
+    camera_id: CameraId,
+    started_at: DateTime<Utc>,
+    duration_ms: i64,
+) -> PathBuf {
+    let day = started_at.format("%Y-%m-%d");
+    let start_ms = started_at.timestamp_millis();
+    clips_dir
+        .join(camera_id.to_string())
+        .join(day.to_string())
+        .join(format!("{start_ms}_{duration_ms}.mp4"))
+}
+
+/// Best-effort relative path from `clips_dir` to `abs`. Returns the
+/// stripped relative path on success; falls back to the absolute
+/// representation if `abs` is not under `clips_dir` (shouldn't happen
+/// in practice but keeps the recorder defensive).
+pub fn clip_rel_path(clips_dir: &Path, abs: &Path) -> String {
+    abs.strip_prefix(clips_dir)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| abs.to_string_lossy().into_owned())
+}
+
+// ---------------------------------------------------------------------------
 // StubClipRecorder
 // ---------------------------------------------------------------------------
 
@@ -158,14 +235,11 @@ impl StubClipRecorder {
     }
 
     /// Path the recorder would write for `(camera_id, started_at)`.
-    /// Stable + collision-resistant across same-second opens by
-    /// including the unix-millis suffix.
+    /// Per M2.1 spec layout — see [`inflight_clip_path`]. Stage A
+    /// stub uses the same in-flight name as the GStreamer recorder
+    /// so the rename-on-close logic exercises the same path.
     pub fn clip_path(&self, camera_id: CameraId, started_at: DateTime<Utc>) -> PathBuf {
-        let ts = started_at.format("%Y%m%dT%H%M%S");
-        let ms = started_at.timestamp_subsec_millis();
-        self.clips_dir
-            .join(format!("cam{camera_id}"))
-            .join(format!("{ts}_{ms:03}.mp4"))
+        inflight_clip_path(&self.clips_dir, camera_id, started_at)
     }
 }
 
@@ -189,10 +263,7 @@ impl ClipRecorder for StubClipRecorder {
             .open(&path)
             .await?;
 
-        let rel = path
-            .strip_prefix(&self.clips_dir)
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|_| path.to_string_lossy().into_owned());
+        let rel = clip_rel_path(&self.clips_dir, &path);
 
         let new = NewClip {
             camera_id: args.camera_id,
@@ -231,12 +302,78 @@ impl ClipRecorder for StubClipRecorder {
             .ok_or(RecorderError::UnknownClip(handle.clip_id))?;
 
         let duration_ms = (args.ended_at - state.started_at).num_milliseconds().max(0);
-        let size_bytes = match fs::metadata(&state.path).await {
+
+        // M2.1 spec: discard sub-3s clips. The stub never has live
+        // bytes so the file is always 0 bytes; we still go through
+        // the cascade-delete + unlink path so the test harness can
+        // verify the discard is wired identically to the gst
+        // recorder.
+        if duration_ms < MIN_CLIP_DURATION_MS {
+            warn!(
+                camera_id = state.camera_id,
+                clip_id = handle.clip_id,
+                duration_ms,
+                min_ms = MIN_CLIP_DURATION_MS,
+                "stub recorder: clip too short -- discarding (delete file + cascade-delete metadata)"
+            );
+            if let Err(e) = fs::remove_file(&state.path).await {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    warn!(
+                        clip_id = handle.clip_id,
+                        path = %state.path.display(),
+                        error = %e,
+                        "stub recorder: failed to unlink discarded short clip"
+                    );
+                }
+            }
+            self.store
+                .cascade_delete_clip_metadata(handle.clip_id)
+                .await?;
+            return Ok(ClipMeta {
+                clip_id: handle.clip_id,
+                camera_id: state.camera_id,
+                path: state.path,
+                duration_ms,
+                size_bytes: 0,
+                codec: "stub".into(),
+                container: "mp4".into(),
+                discarded: true,
+            });
+        }
+
+        // Normal close path: rename the in-flight file to the final
+        // `{start_ms}_{duration_ms}.mp4` shape, stat for size, stamp
+        // the row.
+        let final_abs = final_clip_path(
+            &self.clips_dir,
+            state.camera_id,
+            state.started_at,
+            duration_ms,
+        );
+        if let Err(e) = fs::rename(&state.path, &final_abs).await {
+            warn!(
+                clip_id = handle.clip_id,
+                from = %state.path.display(),
+                to   = %final_abs.display(),
+                error = %e,
+                "stub recorder: rename to final path failed; row will keep in-flight path"
+            );
+        }
+        // After rename, the file lives at final_abs whether or not
+        // the rename succeeded (if it failed, state.path still
+        // points at the old name and we keep it).
+        let final_used = if final_abs.exists() {
+            final_abs
+        } else {
+            state.path.clone()
+        };
+        let rel = clip_rel_path(&self.clips_dir, &final_used);
+        let size_bytes = match fs::metadata(&final_used).await {
             Ok(meta) => meta.len() as i64,
             Err(e) => {
                 warn!(
                     error = %e,
-                    path = %state.path.display(),
+                    path = %final_used.display(),
                     "stub recorder could not stat clip; recording size_bytes=0"
                 );
                 0
@@ -250,6 +387,7 @@ impl ClipRecorder for StubClipRecorder {
                     ended_at: args.ended_at,
                     duration_ms,
                     size_bytes,
+                    path: Some(rel),
                 },
             )
             .await?;
@@ -263,11 +401,12 @@ impl ClipRecorder for StubClipRecorder {
         Ok(ClipMeta {
             clip_id: handle.clip_id,
             camera_id: state.camera_id,
-            path: state.path,
+            path: final_used,
             duration_ms,
             size_bytes,
             codec: "stub".into(),
             container: "mp4".into(),
+            discarded: false,
         })
     }
 
@@ -344,6 +483,11 @@ mod tests {
         let row = store.get_clip(handle.clip_id).await.unwrap().unwrap();
         let path_on_disk = clips_dir.join(&row.path);
         assert!(path_on_disk.exists(), "stub clip file should be created");
+        assert!(
+            row.path.ends_with(".partial.mp4"),
+            "in-flight clip should use the spec'd `.partial.mp4` suffix; got {}",
+            row.path
+        );
         assert_eq!(row.codec, "stub");
         assert_eq!(row.backend_id, "local");
         assert!(row.ended_at.is_none(), "ended_at unset until close");
@@ -355,11 +499,29 @@ mod tests {
             .unwrap();
         assert_eq!(meta.duration_ms, 7_000);
         assert_eq!(meta.size_bytes, 0); // touch-only file
+        assert!(!meta.discarded, "7s clip must NOT be discarded");
 
         let row_closed = store.get_clip(handle.clip_id).await.unwrap().unwrap();
         assert_eq!(row_closed.duration_ms, 7_000);
         assert_eq!(row_closed.size_bytes, 0);
         assert!(row_closed.ended_at.is_some());
+        // The DB row's path should be the FINAL renamed path
+        // (`{start_ms}_{duration_ms}.mp4`), not the in-flight name.
+        assert!(
+            row_closed.path.ends_with("_7000.mp4"),
+            "closed clip should be renamed to the spec layout; got {}",
+            row_closed.path
+        );
+        assert!(
+            !row_closed.path.contains(".partial."),
+            "closed clip path must not retain `.partial.`: {}",
+            row_closed.path
+        );
+        // The renamed file must exist on disk; the in-flight name must not.
+        assert!(
+            clips_dir.join(&row_closed.path).exists(),
+            "renamed clip file should exist on disk"
+        );
     }
 
     #[tokio::test]
@@ -368,6 +530,8 @@ mod tests {
         let rec = StubClipRecorder::new(store.clone(), &clips_dir);
 
         // Open one clip BEFORE panic so we have an in-flight handle.
+        // Use 5s so the close stays above MIN_CLIP_DURATION_MS and
+        // exercises the normal stamp path, not the discard path.
         let started = Utc::now();
         let handle = rec
             .open(OpenClip {
@@ -394,12 +558,13 @@ mod tests {
             .close(
                 handle,
                 ClipFinal {
-                    ended_at: started + chrono::Duration::seconds(2),
+                    ended_at: started + chrono::Duration::seconds(5),
                 },
             )
             .await
             .unwrap();
-        assert_eq!(meta.duration_ms, 2_000);
+        assert_eq!(meta.duration_ms, 5_000);
+        assert!(!meta.discarded, "5s clip must not be discarded");
 
         // Clearing panic re-enables opens.
         rec.set_panic(false);
@@ -407,10 +572,54 @@ mod tests {
         let _h2 = rec
             .open(OpenClip {
                 camera_id: 1,
-                started_at: started + chrono::Duration::seconds(3),
+                started_at: started + chrono::Duration::seconds(6),
             })
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn stub_recorder_discards_sub_min_clips() {
+        // M2.1 spec: clips shorter than MIN_CLIP_DURATION_MS are
+        // unlinked + cascade-deleted at close. Caller observes
+        // `meta.discarded == true`; the row + file are gone.
+        let (store, _dir, clips_dir) = fresh_store_and_dir().await;
+        let rec = StubClipRecorder::new(store.clone(), &clips_dir);
+
+        let started = Utc::now();
+        let handle = rec
+            .open(OpenClip {
+                camera_id: 1,
+                started_at: started,
+            })
+            .await
+            .unwrap();
+        // Sanity: the file + row exist before close.
+        assert!(store.get_clip(handle.clip_id).await.unwrap().is_some());
+
+        // Close at start + 1s — well below MIN_CLIP_DURATION_MS=3000.
+        let meta = rec
+            .close(
+                handle,
+                ClipFinal {
+                    ended_at: started + chrono::Duration::seconds(1),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(meta.discarded, "1s clip must be discarded");
+        assert_eq!(meta.duration_ms, 1_000);
+
+        // Row is GONE (cascade-deleted).
+        assert!(
+            store.get_clip(handle.clip_id).await.unwrap().is_none(),
+            "discarded clip's metadata row must be cascade-deleted"
+        );
+        // File is GONE (unlinked).
+        assert!(
+            !meta.path.exists(),
+            "discarded clip's file must be unlinked"
+        );
     }
 
     #[tokio::test]
@@ -461,8 +670,16 @@ mod tests {
             .with_timezone(&Utc);
         let p1 = rec.clip_path(1, t);
         let p2 = rec.clip_path(2, t);
-        assert!(p1.to_string_lossy().contains("cam1"));
-        assert!(p2.to_string_lossy().contains("cam2"));
-        assert!(p1.to_string_lossy().ends_with("20260513T220000_123.mp4"));
+        let s1 = p1.to_string_lossy().to_string();
+        let s2 = p2.to_string_lossy().to_string();
+        // Spec layout: {clips_dir}/{camera_id}/{YYYY-MM-DD}/{start_unix_ms}.partial.mp4
+        assert!(s1.contains("/1/"), "missing camera_id segment: {s1}");
+        assert!(s2.contains("/2/"), "missing camera_id segment: {s2}");
+        assert!(s1.contains("/2026-05-13/"), "missing UTC date dir: {s1}");
+        let expected_ms = t.timestamp_millis();
+        assert!(
+            s1.ends_with(&format!("{expected_ms}.partial.mp4")),
+            "path tail wrong: {s1}"
+        );
     }
 }

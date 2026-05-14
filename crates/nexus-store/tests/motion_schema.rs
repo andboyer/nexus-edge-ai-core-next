@@ -142,6 +142,7 @@ async fn motion_clips_round_trip_and_oldest_pick() {
                 ended_at: t0 + Duration::seconds(15),
                 duration_ms: 15_000,
                 size_bytes: 1_234_567,
+                path: None,
             },
         )
         .await
@@ -163,7 +164,12 @@ async fn motion_clips_round_trip_and_oldest_pick() {
 }
 
 #[tokio::test]
-async fn cascade_delete_drops_motion_events_and_nulls_event_clip() {
+async fn cascade_delete_drops_motion_events_and_alert_events() {
+    // M2.1 closeout: events.clip_id was originally ON DELETE SET NULL
+    // (migration 0002), then flipped to ON DELETE CASCADE in
+    // migration 0003 to satisfy the spec invariant that a
+    // cascade-delete leaves NO half-deleted state — including no
+    // alert rows pointing at a missing clip.
     let (store, _dir) = fresh_store().await;
     store
         .upsert_camera(&sample_camera(1, "front"))
@@ -215,12 +221,35 @@ async fn cascade_delete_drops_motion_events_and_nulls_event_clip() {
         .await
         .unwrap();
 
-    // Sanity: 3 motion events + 1 event row with the FK populated.
+    // A second alert NOT linked to any clip — sanity that CASCADE
+    // doesn't sweep unrelated rows.
+    let unlinked = AlertEvent {
+        event_id: Uuid::now_v7(),
+        camera_id: 1,
+        rule_id: "rule.other".into(),
+        track_id: None,
+        label: "bird".into(),
+        severity: Severity::Low,
+        bbox: None,
+        frame_id: 200,
+        captured_at: t0 + Duration::seconds(30),
+        trace_id: "trace-2".into(),
+        artifacts: Artifacts::default(),
+        context: serde_json::Map::new(),
+    };
+    store.record_event(&unlinked).await.unwrap();
+
+    // Sanity: 3 motion events + 2 event rows (one with FK populated).
     let n_motion: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM motion_events")
         .fetch_one(store.pool())
         .await
         .unwrap();
     assert_eq!(n_motion.0, 3);
+    let n_events: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM events")
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+    assert_eq!(n_events.0, 2);
     let event_clip: (Option<i64>,) =
         sqlx::query_as("SELECT clip_id FROM events WHERE event_id = ?")
             .bind(alert.event_id.to_string())
@@ -232,21 +261,33 @@ async fn cascade_delete_drops_motion_events_and_nulls_event_clip() {
     // The single-DELETE eviction.
     store.cascade_delete_clip_metadata(clip_id).await.unwrap();
 
-    // motion_events: gone (FK ON DELETE CASCADE).
+    // motion_events: gone (FK ON DELETE CASCADE from 0002).
     let n_motion_after: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM motion_events")
         .fetch_one(store.pool())
         .await
         .unwrap();
     assert_eq!(n_motion_after.0, 0);
 
-    // events row: still there, clip_id NULLed (FK ON DELETE SET NULL).
-    let event_clip_after: (Option<i64>,) =
-        sqlx::query_as("SELECT clip_id FROM events WHERE event_id = ?")
+    // The linked alert row: GONE (FK ON DELETE CASCADE from 0003).
+    let linked_after: Option<(String,)> =
+        sqlx::query_as("SELECT event_id FROM events WHERE event_id = ?")
             .bind(alert.event_id.to_string())
-            .fetch_one(store.pool())
+            .fetch_optional(store.pool())
             .await
             .unwrap();
-    assert!(event_clip_after.0.is_none());
+    assert!(
+        linked_after.is_none(),
+        "linked alert row should be cascade-deleted, found {linked_after:?}"
+    );
+
+    // The UNLINKED alert row: still there. CASCADE only eats rows
+    // whose clip_id pointed at the evicted clip.
+    let unlinked_after: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM events WHERE event_id = ?")
+        .bind(unlinked.event_id.to_string())
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+    assert_eq!(unlinked_after.0, 1);
 
     // Clip itself: gone.
     assert!(store.get_clip(clip_id).await.unwrap().is_none());
@@ -475,6 +516,10 @@ async fn schema_migrations_table_records_apply_order() {
     let ids: Vec<String> = rows.into_iter().map(|r| r.get::<String, _>(0)).collect();
     assert_eq!(
         ids,
-        vec!["0001_initial".to_string(), "0002_motion_clips".to_string()]
+        vec![
+            "0001_initial".to_string(),
+            "0002_motion_clips".to_string(),
+            "0003_events_clip_cascade".to_string(),
+        ]
     );
 }

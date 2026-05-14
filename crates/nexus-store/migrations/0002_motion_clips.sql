@@ -70,6 +70,12 @@ CREATE INDEX IF NOT EXISTS idx_motion_events_clip
 -- detail UI can deep-link into playback. NULLABLE: see invariant note above.
 -- Existing rows get NULL via the default; new alerts populate this when
 -- the recorder has an open clip handle for the camera at firing time.
+--
+-- NOTE: this column was originally added with `ON DELETE SET NULL`.
+-- Migration 0003 rebuilds the table to flip it to ON DELETE CASCADE
+-- so a single `DELETE FROM motion_clips WHERE id = ?` removes the
+-- alert rows that pointed at the evicted clip too — the half-deleted
+-- state the M2.1 schema invariant exists to prevent.
 ALTER TABLE events ADD COLUMN clip_id INTEGER
     REFERENCES motion_clips(id) ON DELETE SET NULL;
 

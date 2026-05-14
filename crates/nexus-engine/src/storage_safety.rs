@@ -355,6 +355,19 @@ async fn publish_storage_event(
 ///
 /// Returns Ok(()) whether or not a clip was actually evicted; the
 /// caller logs and tries again next tick.
+///
+/// **Crash-safety: metadata FIRST, file SECOND.** Per
+/// `docs/M2_STORAGE.md`, the only acceptable post-crash state is
+/// "file orphaned, no DB row" — those are picked up by the
+/// retention sweeper's orphan-file scan and unlinked. The reverse
+/// (DB row pointing at a missing file) leaves the playback UI
+/// returning 404s for clips the timeline still advertises, and
+/// 0002's `ON DELETE CASCADE` cannot be replayed against it. So
+/// we delete the row first; if `cascade_delete_clip_metadata`
+/// fails we abort and the clip stays whole. Only after the row is
+/// committed do we unlink the file; if the unlink fails (e.g.
+/// permission error, network mount glitch) the orphan-file scan
+/// reaps it on the next sweep.
 async fn evict_one(
     store: &Arc<Store>,
     clips_dir: &Path,
@@ -369,9 +382,12 @@ async fn evict_one(
         let idx = (*rr_cursor + offset) % n;
         let cam = cams[idx];
         if let Some(clip) = store.oldest_clip_for_camera(cam).await? {
-            // Resolve absolute path. ClipRow.path is stored relative
-            // to clips_dir (per StubClipRecorder; PR 5 will document
-            // this for any Stage B real recorder too).
+            // Step 1: remove the metadata. If this fails the clip
+            // stays whole and we'll retry next tick.
+            store.cascade_delete_clip_metadata(clip.id).await?;
+
+            // Step 2: unlink the file. Failures here are logged but
+            // not fatal — the orphan-file scan will reap it later.
             let abs = clips_dir.join(&clip.path);
             match tokio::fs::remove_file(&abs).await {
                 Ok(()) => {
@@ -381,10 +397,15 @@ async fn evict_one(
                     debug!(camera_id = cam, clip_id = clip.id, "clip file already gone");
                 }
                 Err(e) => {
-                    warn!(camera_id = cam, clip_id = clip.id, error = %e, "remove_file failed; deleting metadata anyway");
+                    warn!(
+                        camera_id = cam,
+                        clip_id = clip.id,
+                        error = %e,
+                        path = %abs.display(),
+                        "remove_file failed after metadata delete; orphan-file scan will reap on next sweep"
+                    );
                 }
             }
-            store.cascade_delete_clip_metadata(clip.id).await?;
             *rr_cursor = idx + 1;
             return Ok(());
         }
@@ -651,6 +672,173 @@ mod tests {
         );
 
         handle.abort();
+    }
+
+    /// Helper for the round-robin + crash-mid-eviction tests:
+    /// build a store with three cameras and seed `(cam_id, count)`
+    /// clips per camera, oldest-first. Returns a function that maps
+    /// camera_id -> remaining clip count.
+    async fn build_store_with_three_cams_and_clips(
+        seeds: [(CameraId, usize); 3],
+    ) -> (Arc<Store>, tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("nexus.db");
+        let store = Arc::new(
+            Store::open(&StoreConfig {
+                url: format!("sqlite:{}?mode=rwc", db_path.display()),
+                seed_from_config: false,
+                duckdb_attach: false,
+                duckdb_path: PathBuf::from("/tmp/unused.duckdb"),
+            })
+            .await
+            .unwrap(),
+        );
+        let clips_dir = dir.path().join("clips");
+        tokio::fs::create_dir_all(&clips_dir).await.unwrap();
+        let now = chrono::Utc::now();
+        for (cam_id, count) in seeds {
+            store
+                .upsert_camera(&CameraConfig {
+                    id: cam_id,
+                    name: format!("cam{cam_id}"),
+                    url: Url::parse(&format!("rtsp://127.0.0.1/stream{cam_id}")).unwrap(),
+                    enabled: true,
+                    prompts: vec![],
+                    model_override: None,
+                    zones: vec![],
+                    max_fps: 0,
+                    parking_lot_mode: false,
+                })
+                .await
+                .unwrap();
+            tokio::fs::create_dir_all(clips_dir.join(format!("{cam_id}")))
+                .await
+                .unwrap();
+            for i in 0..count {
+                let path_rel = format!("{cam_id}/clip_{i:04}.mp4");
+                store
+                    .open_clip(&NewClip {
+                        camera_id: cam_id,
+                        // Older i = older started_at; oldest_clip_for_camera
+                        // returns the smallest started_at first.
+                        started_at: now - chrono::Duration::seconds((count - i) as i64 * 60),
+                        path: path_rel.clone(),
+                        codec: "stub".into(),
+                        container: "mp4".into(),
+                        backend_id: "local".into(),
+                    })
+                    .await
+                    .unwrap();
+                tokio::fs::write(clips_dir.join(&path_rel), b"x")
+                    .await
+                    .unwrap();
+            }
+        }
+        (store, dir, clips_dir)
+    }
+
+    /// Audit fix #8: per-camera round-robin must be FAIR. Three
+    /// cameras seeded with skewed clip counts (10, 5, 20) all lose
+    /// exactly one clip per round of three eviction calls, no
+    /// matter how lopsided the on-disk distribution is.
+    #[tokio::test]
+    async fn evict_one_round_robin_is_fair() {
+        let (store, _dir, clips_dir) =
+            build_store_with_three_cams_and_clips([(1, 10), (2, 5), (3, 20)]).await;
+
+        async fn count_for(store: &Arc<Store>, cam: CameraId) -> i64 {
+            store
+                .per_camera_clip_stats()
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|s| s.camera_id == cam)
+                .map(|s| s.clip_count)
+                .unwrap_or(0)
+        }
+
+        // Snapshot pre-eviction counts.
+        let before = [
+            count_for(&store, 1).await,
+            count_for(&store, 2).await,
+            count_for(&store, 3).await,
+        ];
+        assert_eq!(before, [10, 5, 20]);
+
+        // Three eviction calls = one full round.
+        let mut cursor = 0usize;
+        for _ in 0..3 {
+            evict_one(&store, &clips_dir, &mut cursor).await.unwrap();
+        }
+        let after = [
+            count_for(&store, 1).await,
+            count_for(&store, 2).await,
+            count_for(&store, 3).await,
+        ];
+        assert_eq!(
+            after,
+            [9, 4, 19],
+            "round-robin must drop exactly one clip per camera per round; got {after:?} from {before:?}"
+        );
+
+        // Run two more full rounds to confirm fairness holds even
+        // after the cursor wraps.
+        for _ in 0..6 {
+            evict_one(&store, &clips_dir, &mut cursor).await.unwrap();
+        }
+        let after_three = [
+            count_for(&store, 1).await,
+            count_for(&store, 2).await,
+            count_for(&store, 3).await,
+        ];
+        assert_eq!(
+            after_three,
+            [7, 2, 17],
+            "after 3 full rounds each camera should have lost exactly 3 clips; got {after_three:?}"
+        );
+    }
+
+    /// Audit fix #1 + #8: the eviction is metadata-FIRST. Even if
+    /// the file-unlink step "fails" (here we simulate by pointing
+    /// the metadata at a nonexistent file), the metadata row MUST
+    /// still be cascade-deleted. The orphan-file scanner reaps any
+    /// genuinely-orphaned files on a later sweep.
+    #[tokio::test]
+    async fn evict_one_metadata_first_survives_missing_file() {
+        let (store, _dir, clips_dir) =
+            build_store_with_three_cams_and_clips([(1, 1), (2, 0), (3, 0)]).await;
+        // Cam 1 has 1 clip; nuke its file BEFORE eviction to
+        // simulate an externally-deleted clip whose row outlived
+        // the bytes.
+        let oldest = store.oldest_clip_for_camera(1).await.unwrap().unwrap();
+        let abs = clips_dir.join(&oldest.path);
+        assert!(abs.exists(), "fixture clip file must exist before nuke");
+        tokio::fs::remove_file(&abs).await.unwrap();
+        assert!(!abs.exists());
+
+        // Run one eviction. The file-unlink will return NotFound
+        // (logged at debug, swallowed). The metadata MUST be gone
+        // regardless.
+        let mut cursor = 0usize;
+        evict_one(&store, &clips_dir, &mut cursor).await.unwrap();
+
+        // Row is GONE.
+        assert!(
+            store.get_clip(oldest.id).await.unwrap().is_none(),
+            "metadata-first eviction must cascade-delete the row even when the file unlink is a no-op"
+        );
+        // No leftover row for cam 1.
+        let remaining = store.per_camera_clip_stats().await.unwrap();
+        assert!(
+            remaining.iter().find(|s| s.camera_id == 1).is_none()
+                || remaining
+                    .iter()
+                    .find(|s| s.camera_id == 1)
+                    .unwrap()
+                    .clip_count
+                    == 0,
+            "cam 1 must have zero remaining clips after eviction; got {remaining:?}"
+        );
     }
 
     // ---------------------------------------------------------------

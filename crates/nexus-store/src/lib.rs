@@ -11,7 +11,7 @@
 pub mod motion;
 pub use motion::{
     ClipClose, ClipId, ClipRow, MotionEventId, MotionEventKind, MotionEventRow,
-    MotionHistogramBucket, NewClip, NewMotionEvent,
+    MotionHistogramBucket, NewClip, NewMotionEvent, PerCameraClipStats,
 };
 
 use std::sync::Arc;
@@ -40,6 +40,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
     (
         "0002_motion_clips",
         include_str!("../migrations/0002_motion_clips.sql"),
+    ),
+    (
+        "0003_events_clip_cascade",
+        include_str!("../migrations/0003_events_clip_cascade.sql"),
     ),
 ];
 

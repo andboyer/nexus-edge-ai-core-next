@@ -73,6 +73,13 @@ pub struct ClipClose {
     pub ended_at: DateTime<Utc>,
     pub duration_ms: i64,
     pub size_bytes: i64,
+    /// Optional rename. M2.1 spec requires the on-disk filename to
+    /// include `duration_ms` (e.g. `{start_unix_ms}_{duration_ms}.mp4`)
+    /// which is only known at close time. The recorder renames the
+    /// in-flight file then sets this so the DB pointer stays valid.
+    /// `None` means "leave `path` unchanged" (Stage A stub recorder
+    /// when no rename is needed).
+    pub path: Option<String>,
 }
 
 /// Hydrated `motion_clips` row.
@@ -88,6 +95,25 @@ pub struct ClipRow {
     pub codec: String,
     pub container: String,
     pub backend_id: String,
+}
+
+/// Per-camera clip-occupancy snapshot for the storage health endpoint.
+///
+/// Returned by [`Store::per_camera_clip_stats`]. Cameras with zero
+/// clips are NOT in the result; the API handler may zero-fill if it
+/// wants a row per known camera.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PerCameraClipStats {
+    pub camera_id: CameraId,
+    /// Number of `motion_clips` rows owned by this camera.
+    pub clip_count: i64,
+    /// `SUM(size_bytes)` across those rows. In-flight clips
+    /// (size_bytes still 0) contribute 0 — eventually correct
+    /// once `close_clip` stamps the finalised file size.
+    pub bytes: i64,
+    /// `MIN(started_at)` across those rows. Drives "retention
+    /// horizon for camera X" in the UI.
+    pub oldest_started_at: DateTime<Utc>,
 }
 
 /// Args for writing a single `motion_events` row.
@@ -169,19 +195,37 @@ impl Store {
         Ok(row.get::<i64, _>(0))
     }
 
-    /// Stamp the close metadata on an in-progress clip.
+    /// Stamp the close metadata on an in-progress clip. Optionally
+    /// updates `path` too — set when the recorder renamed the file
+    /// from its in-flight name to the final `{start_ms}_{dur_ms}.mp4`
+    /// shape per M2.1 spec.
     pub async fn close_clip(&self, clip_id: ClipId, close: &ClipClose) -> Result<(), StoreError> {
-        let res = sqlx::query(
-            "UPDATE motion_clips
-                SET ended_at = ?, duration_ms = ?, size_bytes = ?
-              WHERE id = ?",
-        )
-        .bind(close.ended_at.to_rfc3339())
-        .bind(close.duration_ms)
-        .bind(close.size_bytes)
-        .bind(clip_id)
-        .execute(&self.pool)
-        .await?;
+        let res = if let Some(new_path) = &close.path {
+            sqlx::query(
+                "UPDATE motion_clips
+                    SET ended_at = ?, duration_ms = ?, size_bytes = ?, path = ?
+                  WHERE id = ?",
+            )
+            .bind(close.ended_at.to_rfc3339())
+            .bind(close.duration_ms)
+            .bind(close.size_bytes)
+            .bind(new_path)
+            .bind(clip_id)
+            .execute(&self.pool)
+            .await?
+        } else {
+            sqlx::query(
+                "UPDATE motion_clips
+                    SET ended_at = ?, duration_ms = ?, size_bytes = ?
+                  WHERE id = ?",
+            )
+            .bind(close.ended_at.to_rfc3339())
+            .bind(close.duration_ms)
+            .bind(close.size_bytes)
+            .bind(clip_id)
+            .execute(&self.pool)
+            .await?
+        };
         if res.rows_affected() == 0 {
             return Err(StoreError::NotFound(format!("motion_clip id={clip_id}")));
         }
@@ -231,6 +275,37 @@ impl Store {
         Ok(rows.into_iter().map(|r| r.get::<i64, _>(0)).collect())
     }
 
+    /// Per-camera clip occupancy snapshot. One row per camera that
+    /// currently owns at least one clip. Drives the
+    /// `per_camera[]` array of `GET /api/v1/storage/local`.
+    pub async fn per_camera_clip_stats(&self) -> Result<Vec<PerCameraClipStats>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT camera_id,
+                    COUNT(*)                AS clip_count,
+                    COALESCE(SUM(size_bytes), 0) AS bytes,
+                    MIN(started_at)         AS oldest_started_at
+               FROM motion_clips
+              GROUP BY camera_id
+              ORDER BY camera_id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|r| {
+                let oldest_raw: String = r.get("oldest_started_at");
+                let oldest_started_at = DateTime::parse_from_rfc3339(&oldest_raw)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .unwrap_or_else(|_| Utc::now());
+                Ok(PerCameraClipStats {
+                    camera_id: r.get::<i64, _>("camera_id"),
+                    clip_count: r.get::<i64, _>("clip_count"),
+                    bytes: r.get::<i64, _>("bytes"),
+                    oldest_started_at,
+                })
+            })
+            .collect()
+    }
+
     /// Every `motion_clips.path` currently in the DB. Used by the
     /// orphan-file scanner to compute "files on disk that have no
     /// matching row" by set difference. Paths are stored relative
@@ -242,9 +317,13 @@ impl Store {
         Ok(rows.into_iter().map(|r| r.get::<String, _>(0)).collect())
     }
 
-    /// Single-DELETE eviction. With the `ON DELETE CASCADE` FKs in
-    /// `0002_motion_clips.sql`, this also removes every linked
-    /// `motion_events` row and NULL-outs `events.clip_id`.
+    /// Single-DELETE eviction. With the `ON DELETE CASCADE` FKs from
+    /// `0002_motion_clips.sql` (motion_events) and `0003_events_clip_cascade.sql`
+    /// (events.clip_id, flipped from SET NULL to CASCADE in M2.1 closeout),
+    /// this also removes every linked `motion_events` row AND every
+    /// alert `events` row that referenced the clip — leaving no
+    /// half-deleted half-state the M2.1 schema invariant exists to
+    /// prevent.
     /// File unlink is the caller's responsibility (see
     /// `docs/M2_STORAGE.md` crash-safety section).
     pub async fn cascade_delete_clip_metadata(&self, clip_id: ClipId) -> Result<(), StoreError> {

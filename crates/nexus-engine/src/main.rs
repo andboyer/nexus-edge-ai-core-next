@@ -195,6 +195,8 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
         ui_root: cfg.server.ui_root.clone(),
         recorder: recorder.clone(),
         clips_dir: clips_dir.clone(),
+        low_watermark_pct: cfg.runtime.clips.low_watermark_pct,
+        panic_watermark_pct: cfg.runtime.clips.panic_watermark_pct,
     };
 
     if !cli.no_api {

@@ -24,7 +24,9 @@ use tracing::{debug, error, info, info_span, warn, Instrument};
 use crate::cache::LatestFrameCache;
 use crate::gate::MotionGate;
 use crate::post_roll::{PostRoll, PostRollAction};
-use crate::recorder::{ClipFinal, ClipHandle, ClipRecorder, OpenClip, RecorderError};
+use crate::recorder::{
+    ClipFinal, ClipHandle, ClipRecorder, OpenClip, RecorderError, MAX_CLIP_DURATION_MS,
+};
 use crate::source::{FrameSource, VirtualSource};
 
 pub struct CameraHandle {
@@ -142,6 +144,12 @@ async fn run_camera(
         // motion_events row before insert (schema invariant).
         let mut emitter = MotionEventEmitter::new(clips_cfg.motion_events_sample_hz);
         let mut current_clip: Option<ClipHandle> = None;
+        // Wall-clock anchor for the currently-open clip. Used to
+        // enforce the M2.1 MAX_CLIP_DURATION_MS bound — once the
+        // open clip exceeds 5min we force-close it and (if motion
+        // is still active on this frame) the next Born will open a
+        // fresh one. Reset to None on every close.
+        let mut clip_opened_at: Option<chrono::DateTime<chrono::Utc>> = None;
         let mut post_roll = PostRoll::new(clips_cfg.post_roll_secs);
 
         info!(camera_id = cfg.id, "pipeline running");
@@ -166,6 +174,54 @@ async fn run_camera(
             if !pass {
                 debug!(camera_id = cfg.id, frame_id, "gate dropped frame");
                 continue;
+            }
+
+            // M2.1: enforce MAX_CLIP_DURATION_MS. If the currently
+            // open clip has been writing for >= 5 min, close it now
+            // so a fresh one opens on the next Born (or right below
+            // if motion is still live). Done BEFORE motion/event
+            // handling so any alerts/motion on this frame attach
+            // to the new clip rather than the about-to-be-closed
+            // one.
+            let mut force_reopen_after_rotation = false;
+            if let (Some(handle), Some(opened_at)) = (current_clip, clip_opened_at) {
+                let age_ms = (frame.captured_at - opened_at).num_milliseconds();
+                if age_ms >= MAX_CLIP_DURATION_MS {
+                    debug!(
+                        camera_id = cfg.id,
+                        clip_id = handle.clip_id,
+                        age_ms,
+                        max_ms = MAX_CLIP_DURATION_MS,
+                        "rotating clip: max duration reached"
+                    );
+                    if let Err(e) = recorder
+                        .close(
+                            handle,
+                            ClipFinal {
+                                ended_at: frame.captured_at,
+                            },
+                        )
+                        .await
+                    {
+                        warn!(
+                            camera_id = cfg.id,
+                            "recorder.close (max-duration rotation) failed: {e}"
+                        );
+                    }
+                    current_clip = None;
+                    clip_opened_at = None;
+                    // Reset post-roll so the rotation isn't observed
+                    // as a motion-end window.
+                    post_roll.reset();
+                    // If motion was still live (Born was already
+                    // emitted prior to this frame), the upcoming
+                    // motion lifecycle will see Live decisions but
+                    // NOT another Born — so the existing
+                    // open-on-Born trigger won't re-open. Flag it
+                    // so the decisions loop opens on the first
+                    // decision regardless of kind.
+                    force_reopen_after_rotation = emitter.live_track_count(cfg.id) > 0;
+                }
             }
 
             let detections = {
@@ -241,7 +297,9 @@ async fn run_camera(
             let decisions = info_span!("frame.motion")
                 .in_scope(|| emitter.tick(cfg.id, &tracked, frame.captured_at));
             for d in &decisions {
-                if matches!(d.kind, MotionKind::Born) && current_clip.is_none() {
+                let should_open = current_clip.is_none()
+                    && (matches!(d.kind, MotionKind::Born) || force_reopen_after_rotation);
+                if should_open {
                     match recorder
                         .open(OpenClip {
                             camera_id: cfg.id,
@@ -249,7 +307,14 @@ async fn run_camera(
                         })
                         .await
                     {
-                        Ok(handle) => current_clip = Some(handle),
+                        Ok(handle) => {
+                            current_clip = Some(handle);
+                            clip_opened_at = Some(d.captured_at);
+                            // One-shot — only the first decision in
+                            // this frame triggers the post-rotation
+                            // reopen.
+                            force_reopen_after_rotation = false;
+                        }
                         Err(RecorderError::Refused) => {
                             // Watermark sampler has paused new
                             // clips. Drop ALL motion events for
@@ -320,6 +385,7 @@ async fn run_camera(
                     {
                         warn!(camera_id = cfg.id, "recorder.close failed: {e}");
                     }
+                    clip_opened_at = None;
                 }
             }
         }
@@ -335,7 +401,12 @@ async fn run_camera(
                     "final recorder.close on shutdown failed: {e}"
                 );
             }
+            clip_opened_at = None;
         }
+        // Suppress dead_assignment / unused_assignments warnings —
+        // `clip_opened_at` is reset for invariant clarity even on the
+        // shutdown path.
+        let _ = clip_opened_at;
         emitter.forget_camera(cfg.id);
 
         let _ = bus
