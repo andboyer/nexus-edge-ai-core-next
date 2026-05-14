@@ -4,7 +4,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use clap::Parser;
 use nexus_bus::build_bus;
-use nexus_config::{Config, InferenceConfig};
+use nexus_config::{CameraConfig, Config, InferenceConfig, RecorderKind};
 use nexus_inference::InferenceRouter;
 use nexus_pipeline::{spawn_camera, LatestFrameCache};
 use nexus_rules::RuleEvaluator;
@@ -106,9 +106,13 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
     if let Err(e) = tokio::fs::create_dir_all(&clips_dir).await {
         warn!(path = %clips_dir.display(), error = %e, "could not pre-create clips_dir");
     }
-    let recorder: Arc<dyn nexus_pipeline::ClipRecorder> = Arc::new(
-        nexus_pipeline::StubClipRecorder::new(store.clone(), clips_dir.clone()),
-    );
+    let recorder: Arc<dyn nexus_pipeline::ClipRecorder> = build_recorder(
+        &cfg.runtime.clips.recorder,
+        store.clone(),
+        &clips_dir,
+        &cameras,
+    )?;
+    info!(kind = recorder.kind(), "clip recorder constructed");
 
     let mut handles = Vec::new();
     for cam in cameras {
@@ -230,6 +234,59 @@ fn log_inference_summary(cfg: &InferenceConfig, has_pool: bool, router: &Inferen
         pool = has_pool,
         "inference router built"
     );
+}
+
+/// Build the per-process clip recorder according to
+/// `cfg.runtime.clips.recorder`. The watermark sampler + every
+/// per-camera supervisor share this single Arc so panic-flag flips
+/// affect everything atomically.
+///
+/// `Stub` is always available. `Gstreamer` requires the `gstreamer`
+/// cargo feature on `nexus-pipeline`; on a build without the feature
+/// the engine logs an error + falls back to `Stub` so a misconfigured
+/// box still records *something* (0-byte placeholder files) instead of
+/// failing to boot.
+fn build_recorder(
+    kind: &RecorderKind,
+    store: Arc<nexus_store::Store>,
+    clips_dir: &std::path::Path,
+    cameras: &[CameraConfig],
+) -> Result<Arc<dyn nexus_pipeline::ClipRecorder>> {
+    match kind {
+        RecorderKind::Stub => Ok(Arc::new(nexus_pipeline::StubClipRecorder::new(
+            store, clips_dir,
+        ))),
+        RecorderKind::Gstreamer => build_gst_recorder(store, clips_dir, cameras),
+    }
+}
+
+#[cfg(feature = "gstreamer")]
+fn build_gst_recorder(
+    store: Arc<nexus_store::Store>,
+    clips_dir: &std::path::Path,
+    cameras: &[CameraConfig],
+) -> Result<Arc<dyn nexus_pipeline::ClipRecorder>> {
+    let urls: std::collections::HashMap<i64, String> =
+        cameras.iter().map(|c| (c.id, c.url.to_string())).collect();
+    let rec = nexus_pipeline::GstClipRecorder::new(store, clips_dir, urls)
+        .map_err(|e| anyhow::anyhow!("GstClipRecorder::new: {e}"))?;
+    Ok(Arc::new(rec))
+}
+
+#[cfg(not(feature = "gstreamer"))]
+fn build_gst_recorder(
+    store: Arc<nexus_store::Store>,
+    clips_dir: &std::path::Path,
+    _cameras: &[CameraConfig],
+) -> Result<Arc<dyn nexus_pipeline::ClipRecorder>> {
+    tracing::error!(
+        "config selected RecorderKind::Gstreamer but this build was compiled without \
+         --features gstreamer; falling back to StubClipRecorder. Rebuild nexus-engine with \
+         the gstreamer feature to record real video."
+    );
+    Ok(Arc::new(nexus_pipeline::StubClipRecorder::new(
+        store, clips_dir,
+    )))
 }
 
 async fn wait_for_signal() {

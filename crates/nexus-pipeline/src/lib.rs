@@ -19,6 +19,9 @@ pub mod recorder;
 pub mod source;
 pub mod supervisor;
 
+#[cfg(feature = "gstreamer")]
+pub mod gst_clip_recorder;
+
 pub use cache::{LatestEntry, LatestFrameCache};
 pub use gate::MotionGate;
 pub use recorder::{
@@ -26,6 +29,9 @@ pub use recorder::{
 };
 pub use source::{FrameSource, FrameSourceError, VirtualSource};
 pub use supervisor::{spawn_camera, CameraHandle};
+
+#[cfg(feature = "gstreamer")]
+pub use gst_clip_recorder::GstClipRecorder;
 
 #[cfg(feature = "gstreamer")]
 pub use source::RtspSource;

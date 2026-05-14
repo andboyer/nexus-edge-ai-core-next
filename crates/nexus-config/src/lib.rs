@@ -136,6 +136,19 @@ fn default_state_dir() -> PathBuf {
 // Clips (M2.1 motion timeline + clip recording + safety floor)
 // ---------------------------------------------------------------------------
 
+/// Pick which clip-recorder implementation the engine wires up at
+/// boot. `Stub` writes 0-byte placeholder files; `Gstreamer` writes
+/// real H.264-pass-through fragmented mp4 via
+/// `nexus_pipeline::GstClipRecorder` (only available when the
+/// `gstreamer` feature is on for `nexus-pipeline`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RecorderKind {
+    #[default]
+    Stub,
+    Gstreamer,
+}
+
 /// Recording, retention, and disk-safety knobs for the motion timeline.
 ///
 /// **Hand-written `impl Default`.** The codebase rule (see DEV_NOTES.md
@@ -146,6 +159,9 @@ fn default_state_dir() -> PathBuf {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClipsConfig {
+    /// Which recorder implementation to wire up at boot.
+    #[serde(default)]
+    pub recorder: RecorderKind,
     /// Where the recorder writes mp4 files. Created on demand.
     #[serde(default = "default_clips_dir")]
     pub clips_dir: PathBuf,
@@ -176,6 +192,7 @@ pub struct ClipsConfig {
 impl Default for ClipsConfig {
     fn default() -> Self {
         Self {
+            recorder: RecorderKind::default(),
             clips_dir: default_clips_dir(),
             motion_clips_retention_days: default_motion_clips_retention_days(),
             motion_events_sample_hz: default_motion_events_sample_hz(),

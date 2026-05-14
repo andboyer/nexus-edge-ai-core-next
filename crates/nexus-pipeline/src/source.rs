@@ -97,12 +97,16 @@ pub struct RtspSource {
 }
 
 #[cfg(feature = "gstreamer")]
-mod gst_init {
+pub(crate) mod gst_init {
     use super::FrameSourceError;
     use std::sync::OnceLock;
 
     static GST_INIT: OnceLock<Result<(), String>> = OnceLock::new();
 
+    /// Idempotent `gstreamer::init()`. Both `RtspSource` and
+    /// `GstClipRecorder` call this on every entry into a GStreamer
+    /// code path; the OnceLock guarantees the underlying init only
+    /// runs once per process.
     pub fn ensure() -> Result<(), FrameSourceError> {
         let res = GST_INIT.get_or_init(|| gstreamer::init().map_err(|e| e.to_string()));
         match res {
