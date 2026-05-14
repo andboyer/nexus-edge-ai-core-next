@@ -8,7 +8,7 @@ use nexus_config::{Config, InferenceConfig};
 use nexus_inference::InferenceRouter;
 use nexus_pipeline::{spawn_camera, LatestFrameCache};
 use nexus_rules::RuleEvaluator;
-use nexus_store::{EventStore, Store};
+use nexus_store::Store;
 use nexus_tracker::build_tracker;
 use tracing::{info, warn};
 
@@ -96,6 +96,19 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
     let tracker: Arc<dyn nexus_tracker::Tracker> = Arc::from(build_tracker(&cfg.tracker));
     let cache = Arc::new(LatestFrameCache::new());
 
+    // Recorder is a per-process singleton: the watermark sampler
+    // (storage_safety) and every per-camera supervisor share the
+    // same Arc so panic-flag flips affect everything atomically.
+    // Constructed BEFORE the per-camera spawn loop so the loop can
+    // pass it in.
+    let clips_dir = cfg.runtime.clips.clips_dir.clone();
+    if let Err(e) = tokio::fs::create_dir_all(&clips_dir).await {
+        warn!(path = %clips_dir.display(), error = %e, "could not pre-create clips_dir");
+    }
+    let recorder: Arc<dyn nexus_pipeline::ClipRecorder> = Arc::new(
+        nexus_pipeline::StubClipRecorder::new(store.clone(), clips_dir.clone()),
+    );
+
     let mut handles = Vec::new();
     for cam in cameras {
         if !cam.enabled {
@@ -109,28 +122,20 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
             tracker.clone(),
             cfg.tracker.annotator.clone(),
             cfg.tracker.static_object.clone(),
+            cfg.runtime.clips.clone(),
             cfg.runtime.state_dir.clone(),
             evaluator.clone(),
-            store.clone() as Arc<dyn EventStore>,
+            store.clone(),
+            recorder.clone(),
             bus.clone(),
             cache.clone(),
         );
         handles.push(h);
     }
 
-    // Storage safety floor (M2.1 Stage A PR 4). Spawned even before
-    // the supervisor wiring (PR 5) is in place: the recorder is
-    // constructed up here so the watermark sampler can flip its
-    // panic flag in advance of anything actually opening clips. The
-    // safety floor is a per-process singleton — clip writes elsewhere
-    // hold the same recorder Arc.
-    let clips_dir = cfg.runtime.clips.clips_dir.clone();
-    if let Err(e) = tokio::fs::create_dir_all(&clips_dir).await {
-        warn!(path = %clips_dir.display(), error = %e, "could not pre-create clips_dir");
-    }
-    let _recorder: std::sync::Arc<dyn nexus_pipeline::ClipRecorder> = std::sync::Arc::new(
-        nexus_pipeline::StubClipRecorder::new(store.clone(), clips_dir.clone()),
-    );
+    // Storage safety floor (M2.1 Stage A PR 4). Watermark sampler
+    // shares the same recorder Arc as the per-camera supervisors
+    // above so panic-mode flips propagate atomically.
     let safety_cfg = storage_safety::StorageSafetyConfig {
         clips_dir: clips_dir.clone(),
         low_watermark_pct: cfg.runtime.clips.low_watermark_pct,
@@ -144,7 +149,7 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
             path: clips_dir.clone(),
         });
     let safety_handle = {
-        let recorder = _recorder.clone();
+        let recorder = recorder.clone();
         let store = store.clone();
         let bus = bus.clone();
         tokio::spawn(async move {
@@ -162,6 +167,8 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
         cache: cache.clone(),
         pool: pool.clone(),
         ui_root: cfg.server.ui_root.clone(),
+        recorder: recorder.clone(),
+        clips_dir: clips_dir.clone(),
     };
 
     if !cli.no_api {

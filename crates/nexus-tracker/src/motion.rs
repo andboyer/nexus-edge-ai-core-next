@@ -63,13 +63,28 @@ pub struct MotionDecision {
     pub attributes: serde_json::Map<String, serde_json::Value>,
 }
 
+/// Per-track bookkeeping kept alive between frames so Died can carry
+/// the last-known bbox/label/confidence/attributes (the snapshot
+/// disappeared from `tracker.update`, but operators care WHERE the
+/// track was when it was lost — for example to draw a fade-out arrow
+/// on the live view).
+#[derive(Debug, Clone)]
+struct TrackSnapshot {
+    /// Last time we emitted Updated, or None if only Born has been
+    /// emitted so far. Used to gate sampling.
+    last_emitted_at: Option<DateTime<Utc>>,
+    /// Last bbox/label/confidence/attributes seen for the track.
+    /// These are what Died will publish.
+    last_bbox: BBox,
+    last_label: String,
+    last_confidence: f32,
+    last_attributes: serde_json::Map<String, serde_json::Value>,
+}
+
 /// Shared state for one camera's open tracks.
 #[derive(Debug, Default)]
 struct CameraState {
-    /// `track_id -> last_emitted_updated_at`. Born+Died are recorded
-    /// as `None` so the next `Updated` waits for the full sample
-    /// interval (no double-fire right after Born).
-    tracks: HashMap<TrackId, Option<DateTime<Utc>>>,
+    tracks: HashMap<TrackId, TrackSnapshot>,
 }
 
 /// Pure decision engine. One instance owns the per-camera bookkeeping
@@ -129,12 +144,22 @@ impl MotionEventEmitter {
         let mut updated = Vec::new();
 
         for t in tracked {
-            match state.tracks.get(&t.track_id).copied() {
+            match state.tracks.get(&t.track_id) {
                 None => {
-                    state.tracks.insert(t.track_id, None);
+                    state.tracks.insert(
+                        t.track_id,
+                        TrackSnapshot {
+                            last_emitted_at: None,
+                            last_bbox: t.bbox,
+                            last_label: t.label.clone(),
+                            last_confidence: t.confidence,
+                            last_attributes: t.attributes.clone(),
+                        },
+                    );
                     born.push(decision(camera_id, MotionKind::Born, now, t));
                 }
-                Some(last_emit) => {
+                Some(snap) => {
+                    let last_emit = snap.last_emitted_at;
                     let due = match (interval, last_emit) {
                         (None, _) => false,
                         (Some(_), None) => false,
@@ -146,8 +171,17 @@ impl MotionEventEmitter {
                             gap >= int.as_micros() as i64
                         }
                     };
+                    // Refresh the last-known snapshot every frame so
+                    // Died always carries the most-recent bbox /
+                    // label / attributes, regardless of whether we
+                    // emitted an Updated this frame.
+                    let snap = state.tracks.get_mut(&t.track_id).unwrap();
+                    snap.last_bbox = t.bbox;
+                    snap.last_label = t.label.clone();
+                    snap.last_confidence = t.confidence;
+                    snap.last_attributes = t.attributes.clone();
                     if due {
-                        state.tracks.insert(t.track_id, Some(now));
+                        snap.last_emitted_at = Some(now);
                         updated.push(decision(camera_id, MotionKind::Updated, now, t));
                     }
                 }
@@ -159,14 +193,16 @@ impl MotionEventEmitter {
         // born event went out. Doing this in a second pass keeps the
         // first-sample-interval-after-born grace period.
         for d in &born {
-            state.tracks.insert(d.track_id, Some(now));
+            if let Some(snap) = state.tracks.get_mut(&d.track_id) {
+                snap.last_emitted_at = Some(now);
+            }
         }
 
         // Died: anything we knew about that's not in `live` this
-        // frame. Synthesize a minimal MotionDecision (no bbox in the
-        // current frame, so we use the empty/zero one). The
-        // supervisor stamps the previously-known clip_id at write
-        // time.
+        // frame. Use the last-known snapshot so the decision carries
+        // the operator-useful bbox / label / attributes from the
+        // last frame the track was visible. The supervisor stamps
+        // the previously-known clip_id at write time.
         let dead: Vec<TrackId> = state
             .tracks
             .keys()
@@ -175,21 +211,16 @@ impl MotionEventEmitter {
             .collect();
         let mut died = Vec::with_capacity(dead.len());
         for track_id in dead {
-            state.tracks.remove(&track_id);
+            let snap = state.tracks.remove(&track_id).expect("just enumerated");
             died.push(MotionDecision {
                 camera_id,
                 track_id,
                 kind: MotionKind::Died,
                 captured_at: now,
-                bbox: BBox {
-                    x1: 0.0,
-                    y1: 0.0,
-                    x2: 0.0,
-                    y2: 0.0,
-                },
-                label: String::new(),
-                confidence: 0.0,
-                attributes: serde_json::Map::new(),
+                bbox: snap.last_bbox,
+                label: snap.last_label,
+                confidence: snap.last_confidence,
+                attributes: snap.last_attributes,
             });
         }
 
@@ -326,6 +357,42 @@ mod tests {
         let out2 = em.tick(7, &[tobj(1, "person")], t0() + chrono::Duration::seconds(5));
         assert_eq!(out2.len(), 1);
         assert_eq!(out2[0].kind, MotionKind::Born);
+    }
+
+    #[test]
+    fn died_carries_last_known_bbox_and_label() {
+        // Operator-useful regression: when a track disappears, the
+        // Died decision should carry where + what the track was on
+        // its LAST visible frame — not zeros.
+        let mut em = MotionEventEmitter::new(0.0); // no Updateds, focus the test
+        let now = t0();
+        let _ = em.tick(7, &[tobj(1, "person")], now);
+
+        // Frame 2: same id, MOVED bbox.
+        let mut moved = tobj(1, "person");
+        moved.bbox = BBox {
+            x1: 500.0,
+            y1: 600.0,
+            x2: 540.0,
+            y2: 700.0,
+        };
+        moved.label = "person".into();
+        moved.confidence = 0.42;
+        let _ = em.tick(
+            7,
+            &[moved.clone()],
+            now + chrono::Duration::milliseconds(33),
+        );
+
+        // Frame 3: track gone -> Died should carry the moved bbox /
+        // confidence, not the original tobj() bbox.
+        let died = em.tick(7, &[], now + chrono::Duration::milliseconds(66));
+        assert_eq!(died.len(), 1);
+        assert_eq!(died[0].kind, MotionKind::Died);
+        assert_eq!(died[0].bbox.x1, 500.0);
+        assert_eq!(died[0].bbox.y2, 700.0);
+        assert_eq!(died[0].label, "person");
+        assert!((died[0].confidence - 0.42).abs() < 1e-6);
     }
 
     #[test]

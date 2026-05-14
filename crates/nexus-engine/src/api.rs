@@ -49,6 +49,16 @@ pub struct ApiState {
     pub cache: Arc<LatestFrameCache>,
     pub pool: Option<Arc<DetectorPool>>,
     pub ui_root: PathBuf,
+    /// Shared with the per-camera supervisors + the storage_safety
+    /// loop. The /api/v1/storage/local endpoint reads `is_panic()` +
+    /// `kind()` to surface the recorder state in the UI; /api/v1/clips/:id
+    /// uses `kind()` to decide whether to return a 503 stub error
+    /// (Stage A) or stream the file (Stage B).
+    pub recorder: Arc<dyn nexus_pipeline::ClipRecorder>,
+    /// Filesystem root that `motion_clips.path` is relative to.
+    /// Used by /api/v1/storage/local for the StatvfsProbe + by
+    /// /api/v1/clips/:id to compute the absolute path.
+    pub clips_dir: PathBuf,
 }
 
 pub fn router(state: ApiState) -> Router {
@@ -67,7 +77,11 @@ pub fn router(state: ApiState) -> Router {
         .route("/events", get(list_events))
         .route("/stream/metadata", get(stream_metadata))
         .route("/stream/events", get(stream_events))
-        .route("/backends", get(get_backends));
+        .route("/backends", get(get_backends))
+        // M2.1 Stage A — motion + clips + storage health.
+        .route("/v1/storage/local", get(get_storage_local))
+        .route("/v1/cameras/:id/motion", get(list_motion_for_camera))
+        .route("/v1/clips/:id", get(get_clip));
 
     let static_dir = ServeDir::new(state.ui_root.clone()).append_index_html_on_directories(true);
 
@@ -343,4 +357,142 @@ async fn get_backends(State(s): State<ApiState>) -> Json<BackendsResponse> {
             slots: vec![],
         }),
     }
+}
+
+// ---------------------------------------------------------------------------
+// M2.1 Stage A — storage / motion / clips endpoints
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Serialize)]
+struct StorageLocalResponse {
+    /// `stub` until the GStreamer recorder lands in Stage B.
+    recorder_kind: &'static str,
+    /// True iff the watermark sampler has the recorder paused. UI
+    /// uses this to render the "evicting / no new clips" banner.
+    panic: bool,
+    /// Free-pct under clips_dir, 0..=100. None on platforms without
+    /// statvfs (windows; will be wired in Stage B).
+    free_pct: Option<f32>,
+    clips_dir: PathBuf,
+}
+
+async fn get_storage_local(
+    State(s): State<ApiState>,
+) -> Result<Json<StorageLocalResponse>, ApiError> {
+    let free_pct = compute_free_pct(&s.clips_dir).await;
+    Ok(Json(StorageLocalResponse {
+        recorder_kind: s.recorder.kind(),
+        panic: s.recorder.is_panic(),
+        free_pct,
+        clips_dir: s.clips_dir.clone(),
+    }))
+}
+
+#[cfg(unix)]
+async fn compute_free_pct(path: &std::path::Path) -> Option<f32> {
+    let path = path.to_path_buf();
+    let r = tokio::task::spawn_blocking(move || nix::sys::statvfs::statvfs(path.as_path())).await;
+    match r {
+        Ok(Ok(stat)) => {
+            let blocks = stat.blocks() as f64;
+            let avail = stat.blocks_available() as f64;
+            if blocks <= 0.0 {
+                Some(0.0)
+            } else {
+                Some(((avail / blocks) * 100.0) as f32)
+            }
+        }
+        _ => None,
+    }
+}
+
+#[cfg(not(unix))]
+async fn compute_free_pct(_path: &std::path::Path) -> Option<f32> {
+    None
+}
+
+#[derive(serde::Deserialize)]
+struct MotionQuery {
+    /// RFC3339, inclusive lower bound. Defaults to now-1h.
+    from: Option<String>,
+    /// RFC3339, inclusive upper bound. Defaults to now.
+    to: Option<String>,
+    /// Cap the result page. Defaults to 1000, max 5000.
+    limit: Option<i64>,
+}
+
+async fn list_motion_for_camera(
+    State(s): State<ApiState>,
+    Path(camera_id): Path<CameraId>,
+    Query(q): Query<MotionQuery>,
+) -> Result<Json<Vec<nexus_store::MotionEventRow>>, ApiError> {
+    let now = chrono::Utc::now();
+    let from = match q.from.as_deref() {
+        Some(s) => chrono::DateTime::parse_from_rfc3339(s)
+            .map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("from: {e}")))?
+            .with_timezone(&chrono::Utc),
+        None => now - chrono::Duration::hours(1),
+    };
+    let to = match q.to.as_deref() {
+        Some(s) => chrono::DateTime::parse_from_rfc3339(s)
+            .map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("to: {e}")))?
+            .with_timezone(&chrono::Utc),
+        None => now,
+    };
+    if to < from {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "`to` must be >= `from`".into(),
+        ));
+    }
+    let limit = q.limit.unwrap_or(1000).clamp(1, 5000);
+    let rows = s
+        .store
+        .list_motion_events_for_camera(camera_id, from, to, limit)
+        .await
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(rows))
+}
+
+async fn get_clip(
+    State(s): State<ApiState>,
+    Path(clip_id): Path<i64>,
+) -> Result<Response, ApiError> {
+    let clip = s
+        .store
+        .get_clip(clip_id)
+        .await
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("clip {clip_id} not found")))?;
+
+    // Stage A: recorder is `stub` and the on-disk file is 0 bytes —
+    // serving it would be misleading. Return 503 with an explicit
+    // body so the UI can render "playback unavailable" instead of
+    // a broken video element. Stage B switches this to a streaming
+    // 200 response.
+    if s.recorder.kind() == "stub" {
+        let body = serde_json::json!({
+            "error": "playback unavailable",
+            "reason": "recorder=stub",
+            "clip_id": clip.id,
+            "camera_id": clip.camera_id,
+            "started_at": clip.started_at,
+            "ended_at": clip.ended_at,
+            "size_bytes": clip.size_bytes,
+            "duration_ms": clip.duration_ms,
+            "path": clip.path,
+        });
+        return Ok((StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response());
+    }
+
+    // Stage B will implement the real streaming response here. For
+    // now, still 503 if some future build sets a non-stub kind but
+    // hasn't implemented this branch yet.
+    Err(ApiError(
+        StatusCode::SERVICE_UNAVAILABLE,
+        format!(
+            "clip streaming not implemented for recorder kind '{}'",
+            s.recorder.kind()
+        ),
+    ))
 }

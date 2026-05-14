@@ -2,48 +2,32 @@
 //! → CelEngine rule → BroadcastBus.
 //!
 //! Closes M1's "first end-to-end CEL alert" item. The test wires the full
-//! supervisor (`spawn_camera`) against an in-memory bus + an in-memory
-//! event store, runs a virtual camera that emits a drifting "person"
-//! detection at 5fps, and asserts an `AlertEvent` with rule_id =
-//! "any_person" lands on the bus within a generous timeout.
+//! supervisor (`spawn_camera`) against an in-memory bus + an on-disk
+//! sqlite Store under tempdir + the StubClipRecorder, runs a virtual
+//! camera that emits a drifting "person" detection at 5fps, and asserts
+//! an `AlertEvent` with rule_id = "any_person" lands on the bus within
+//! a generous timeout.
 //!
-//! No filesystem, no GStreamer, no ORT. Pure CPU.
+//! No GStreamer, no ORT. Pure CPU + sqlite under tempdir.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use async_trait::async_trait;
 use futures::StreamExt;
 use nexus_bus::{topic, BroadcastBus, Bus, BusExt};
-use nexus_config::{CameraConfig, RuleConfig, RulesBackendKind, RulesConfig, TrackerConfig};
+use nexus_config::{
+    CameraConfig, ClipsConfig, RuleConfig, RulesBackendKind, RulesConfig, StoreConfig,
+    TrackerConfig,
+};
 use nexus_inference::MockDetector;
 use nexus_pipeline::cache::LatestFrameCache;
 use nexus_pipeline::supervisor::spawn_camera;
+use nexus_pipeline::{ClipRecorder, StubClipRecorder};
 use nexus_rules::RuleEvaluator;
-use nexus_store::{EventStore, StoreError};
+use nexus_store::{EventStore, Store};
 use nexus_types::AlertEvent;
-use parking_lot::Mutex;
 use url::Url;
-
-/// In-memory `EventStore` so the test never touches sqlite. The supervisor
-/// only needs `record_event` to succeed for the alert path; query-side
-/// methods can stay unimplemented for the smoke run.
-#[derive(Default)]
-struct MemoryEventStore {
-    events: Mutex<Vec<AlertEvent>>,
-}
-
-#[async_trait]
-impl EventStore for MemoryEventStore {
-    async fn record_event(&self, event: &AlertEvent) -> Result<(), StoreError> {
-        self.events.lock().push(event.clone());
-        Ok(())
-    }
-
-    async fn list_recent_events(&self, _limit: i64) -> Result<Vec<AlertEvent>, StoreError> {
-        Ok(self.events.lock().clone())
-    }
-}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cel_rule_emits_alert_for_virtual_person() {
@@ -81,8 +65,20 @@ async fn cel_rule_emits_alert_for_virtual_person() {
     };
     let evaluator = Arc::new(RuleEvaluator::new(&rules_cfg, &[rule]).expect("compile cel rule"));
 
-    let store: Arc<dyn EventStore> = Arc::new(MemoryEventStore::default());
-    let cache = Arc::new(LatestFrameCache::new());
+    // sqlite Store on tempdir. The supervisor needs the concrete Store
+    // (not just the EventStore trait) so it can call insert_motion_event.
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let db_path = dir.path().join("nexus.db");
+    let store = Arc::new(
+        Store::open(&StoreConfig {
+            url: format!("sqlite:{}?mode=rwc", db_path.display()),
+            seed_from_config: false,
+            duckdb_attach: false,
+            duckdb_path: PathBuf::from("/tmp/unused.duckdb"),
+        })
+        .await
+        .expect("open store"),
+    );
 
     // 3. Spawn the camera. `virtual://` scheme dispatches to VirtualSource
     //    inside `build_source`; max_fps=5 → ~200ms per frame.
@@ -97,17 +93,29 @@ async fn cel_rule_emits_alert_for_virtual_person() {
         max_fps: 5,
         parking_lot_mode: false,
     };
+    // Recorder + clips_dir under the same tempdir so artefacts are
+    // cleaned up when the test ends.
+    let clips_dir = dir.path().join("clips");
+    let recorder: Arc<dyn ClipRecorder> =
+        Arc::new(StubClipRecorder::new(store.clone(), clips_dir.clone()));
+    // Pre-seed cameras row so motion_clips inserts don't FK-fail.
+    store
+        .upsert_camera(&cam)
+        .await
+        .expect("seed cameras row for the virtual camera");
     let handle = spawn_camera(
         cam,
         detector,
         tracker,
         tracker_cfg.annotator.clone(),
         tracker_cfg.static_object.clone(),
+        ClipsConfig::default(),
         std::env::temp_dir(),
         evaluator,
         store.clone(),
+        recorder,
         bus.clone(),
-        cache,
+        cache_arc(),
     );
 
     // 4. Wait for the first AlertEvent. 5s budget covers the gate warmup
@@ -141,4 +149,8 @@ async fn cel_rule_emits_alert_for_virtual_person() {
     // 6. Tear down the supervisor task. abort() is best-effort; the test
     //    runtime is dropped immediately after this returns either way.
     handle.task.abort();
+}
+
+fn cache_arc() -> Arc<LatestFrameCache> {
+    Arc::new(LatestFrameCache::new())
 }

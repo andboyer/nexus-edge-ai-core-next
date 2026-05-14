@@ -9,11 +9,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use nexus_bus::{topic, Bus, BusExt};
-use nexus_config::{AnnotatorConfig, CameraConfig, StaticObjectConfig};
+use nexus_config::{AnnotatorConfig, CameraConfig, ClipsConfig, StaticObjectConfig};
 use nexus_inference::Detector;
 use nexus_rules::RuleEvaluator;
-use nexus_store::EventStore;
-use nexus_tracker::{StaticObjectFilter, TrackAnnotator, Tracker};
+use nexus_store::{EventStore, MotionEventKind, NewMotionEvent, Store};
+use nexus_tracker::{
+    MotionDecision, MotionEventEmitter, MotionKind, StaticObjectFilter, TrackAnnotator, Tracker,
+};
 use nexus_types::{CameraId, Frame, FrameMetadata, PipelineState, PipelineStatus};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -21,6 +23,7 @@ use tracing::{debug, error, info, info_span, warn, Instrument};
 
 use crate::cache::LatestFrameCache;
 use crate::gate::MotionGate;
+use crate::recorder::{ClipFinal, ClipHandle, ClipRecorder, OpenClip, RecorderError};
 use crate::source::{FrameSource, VirtualSource};
 
 pub struct CameraHandle {
@@ -37,9 +40,11 @@ pub fn spawn_camera(
     tracker: Arc<dyn Tracker>,
     annotator_cfg: AnnotatorConfig,
     static_object_cfg: StaticObjectConfig,
+    clips_cfg: ClipsConfig,
     state_dir: PathBuf,
     evaluator: Arc<RuleEvaluator>,
-    store: Arc<dyn EventStore>,
+    store: Arc<Store>,
+    recorder: Arc<dyn ClipRecorder>,
     bus: Arc<dyn Bus>,
     cache: Arc<LatestFrameCache>,
 ) -> CameraHandle {
@@ -50,9 +55,11 @@ pub fn spawn_camera(
         tracker,
         annotator_cfg,
         static_object_cfg,
+        clips_cfg,
         state_dir,
         evaluator,
         store,
+        recorder,
         bus,
         cache,
     ));
@@ -66,9 +73,11 @@ async fn run_camera(
     tracker: Arc<dyn Tracker>,
     annotator_cfg: AnnotatorConfig,
     static_object_cfg: StaticObjectConfig,
+    clips_cfg: ClipsConfig,
     state_dir: PathBuf,
     evaluator: Arc<RuleEvaluator>,
-    store: Arc<dyn EventStore>,
+    store: Arc<Store>,
+    recorder: Arc<dyn ClipRecorder>,
     bus: Arc<dyn Bus>,
     cache: Arc<LatestFrameCache>,
 ) {
@@ -124,6 +133,14 @@ async fn run_camera(
         } else {
             None
         };
+
+        // Motion-event emitter + per-camera clip handle. Single
+        // open clip at a time per camera: opens on the first Born
+        // event when no clip is open, closes on the frame where the
+        // last live track disappears. clip_id is stamped on every
+        // motion_events row before insert (schema invariant).
+        let mut emitter = MotionEventEmitter::new(clips_cfg.motion_events_sample_hz);
+        let mut current_clip: Option<ClipHandle> = None;
 
         info!(camera_id = cfg.id, "pipeline running");
 
@@ -200,7 +217,89 @@ async fn run_camera(
                 }
                 let _ = bus.publish(topic::ALERT_EVENT, &ev).await;
             }
+
+            // Motion lifecycle. The emitter is pure — it just tells
+            // us what changed. We turn its decisions into open/close
+            // recorder calls + motion_events rows here.
+            //
+            // The synchronous emitter.tick() runs inside the span
+            // via in_scope(); we don't hold an EnteredSpan guard
+            // across recorder/store awaits because EnteredSpan is
+            // !Send and would break tokio::spawn.
+            let decisions = info_span!("frame.motion")
+                .in_scope(|| emitter.tick(cfg.id, &tracked, frame.captured_at));
+            for d in &decisions {
+                if matches!(d.kind, MotionKind::Born) && current_clip.is_none() {
+                    match recorder
+                        .open(OpenClip {
+                            camera_id: cfg.id,
+                            started_at: d.captured_at,
+                        })
+                        .await
+                    {
+                        Ok(handle) => current_clip = Some(handle),
+                        Err(RecorderError::Refused) => {
+                            // Watermark sampler has paused new
+                            // clips. Drop ALL motion events for
+                            // this frame: the schema requires
+                            // clip_id NOT NULL and we have no
+                            // open clip to attach to.
+                            debug!(
+                                camera_id = cfg.id,
+                                "recorder refused open (panic mode); dropping motion frame"
+                            );
+                            break;
+                        }
+                        Err(e) => {
+                            warn!(camera_id = cfg.id, "recorder.open failed: {e}");
+                            break;
+                        }
+                    }
+                }
+                let Some(handle) = current_clip else {
+                    // Open was refused earlier in this frame and
+                    // we have no clip to stamp. Skip silently —
+                    // the next Born will retry recorder.open.
+                    continue;
+                };
+                if let Err(e) = insert_motion_decision(&store, handle, d).await {
+                    warn!(camera_id = cfg.id, "insert_motion_event failed: {e}");
+                }
+            }
+
+            // Close the clip the moment all live tracks have
+            // gone away. (Stage A keeps this simple: no post-roll
+            // grace; that lands with the real GStreamer recorder
+            // in Stage B.)
+            if emitter.live_track_count(cfg.id) == 0 {
+                if let Some(handle) = current_clip.take() {
+                    if let Err(e) = recorder
+                        .close(
+                            handle,
+                            ClipFinal {
+                                ended_at: frame.captured_at,
+                            },
+                        )
+                        .await
+                    {
+                        warn!(camera_id = cfg.id, "recorder.close failed: {e}");
+                    }
+                }
+            }
         }
+
+        // Pipeline ended — close any clip still open so its row
+        // doesn't sit forever with NULL ended_at.
+        if let Some(handle) = current_clip.take() {
+            let now = chrono::Utc::now();
+            if let Err(e) = recorder.close(handle, ClipFinal { ended_at: now }).await {
+                warn!(
+                    camera_id = cfg.id,
+                    "final recorder.close on shutdown failed: {e}"
+                );
+            }
+        }
+        emitter.forget_camera(cfg.id);
 
         let _ = bus
             .publish(
@@ -237,4 +336,32 @@ fn build_source(cfg: &CameraConfig) -> Box<dyn FrameSource + Send> {
             fps: if cfg.max_fps == 0 { 5 } else { cfg.max_fps },
         }),
     }
+}
+
+/// Translate one [`MotionDecision`] into a `motion_events` row write.
+/// Lifted out of the loop body so the `match` on `kind` and the
+/// attribute-serialization stay readable.
+async fn insert_motion_decision(
+    store: &Arc<Store>,
+    handle: ClipHandle,
+    d: &MotionDecision,
+) -> Result<(), nexus_store::StoreError> {
+    let kind = match d.kind {
+        MotionKind::Born => MotionEventKind::Born,
+        MotionKind::Updated => MotionEventKind::Updated,
+        MotionKind::Died => MotionEventKind::Died,
+    };
+    let attrs_json = serde_json::Value::Object(d.attributes.clone()).to_string();
+    let new = NewMotionEvent {
+        camera_id: d.camera_id,
+        clip_id: handle.clip_id,
+        track_id: d.track_id,
+        kind,
+        captured_at: d.captured_at,
+        bbox: d.bbox,
+        label: d.label.clone(),
+        confidence: d.confidence,
+        attributes_json: attrs_json,
+    };
+    store.insert_motion_event(&new).await.map(|_id| ())
 }
