@@ -9,6 +9,7 @@ import type {
   CameraId,
   ClipId,
   MotionEventRow,
+  MotionHistogramBucket,
   RuleConfig,
   RuleId,
   StorageLocalResponse,
@@ -94,6 +95,27 @@ export const api = {
       const suffix = qs ? `?${qs}` : "";
       return request<MotionEventRow[]>(
         `/v1/cameras/${cameraId}/motion${suffix}`,
+      );
+    },
+
+    /// Bucketed motion-density histogram for the per-camera Timeline
+    /// grid. The engine clamps `bucket_seconds` to [60, 86400] and
+    /// defaults the window to the last 24h with one-hour buckets.
+    /// Returned buckets are sparse: empty intervals are absent.
+    histogramForCamera: (
+      cameraId: CameraId,
+      opts: { from?: string; to?: string; bucket_seconds?: number } = {},
+    ) => {
+      const q = new URLSearchParams();
+      if (opts.from) q.set("from", opts.from);
+      if (opts.to) q.set("to", opts.to);
+      if (opts.bucket_seconds != null) {
+        q.set("bucket_seconds", String(opts.bucket_seconds));
+      }
+      const qs = q.toString();
+      const suffix = qs ? `?${qs}` : "";
+      return request<MotionHistogramBucket[]>(
+        `/v1/cameras/${cameraId}/motion/histogram${suffix}`,
       );
     },
   },

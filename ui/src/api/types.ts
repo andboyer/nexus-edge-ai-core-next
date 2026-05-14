@@ -182,3 +182,14 @@ export interface MotionEventRow {
   attributes_json: string;
 }
 
+/// Sparse motion-density bucket for the per-camera Timeline grid.
+/// Empty intervals are NOT included; the UI fills zeros client-side.
+/// `bucket_start` is the inclusive lower edge; `bucket` is the
+/// zero-based offset from the request's `from`.
+export interface MotionHistogramBucket {
+  bucket: number;
+  bucket_start: string;
+  event_count: number;
+  clip_count: number;
+}
+

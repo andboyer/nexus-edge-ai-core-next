@@ -453,3 +453,98 @@ textarea {
   font-size: 13px;
   text-align: center;
 }
+
+/* M2.1 B7 — Timeline tab. */
+.timeline-host {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 8px;
+}
+
+.timeline-scale,
+.timeline-row {
+  display: grid;
+  grid-template-columns: 160px 1fr;
+  gap: 8px;
+  align-items: stretch;
+}
+
+.timeline-scale-label,
+.timeline-row-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  padding: 0 6px;
+}
+
+.timeline-scale-cells,
+.timeline-cells {
+  display: grid;
+  grid-template-columns: repeat(24, minmax(0, 1fr));
+  gap: 2px;
+}
+
+.timeline-scale-cell {
+  font-size: 10px;
+  text-align: center;
+  height: 14px;
+  line-height: 14px;
+}
+
+.timeline-cell {
+  position: relative;
+  height: 28px;
+  border: 1px solid var(--line);
+  background: var(--bg-elev);
+  border-radius: 2px;
+  cursor: pointer;
+  padding: 0;
+  font: inherit;
+  color: var(--text-dim);
+  transition: outline-color 0.1s ease;
+}
+
+.timeline-cell:hover {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+}
+
+.timeline-cell.density-0 { background: var(--bg-elev); }
+.timeline-cell.density-1 { background: rgba(56, 225, 255, 0.15); }
+.timeline-cell.density-2 { background: rgba(56, 225, 255, 0.32); }
+.timeline-cell.density-3 { background: rgba(56, 225, 255, 0.55); }
+.timeline-cell.density-4 { background: rgba(56, 225, 255, 0.78); color: #02161b; }
+
+.timeline-cell-count {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 10px;
+  font-weight: 600;
+  pointer-events: none;
+}
+
+.timeline-row {
+  margin-top: 2px;
+}
+
+.timeline-drawer {
+  grid-column: 1 / -1;
+  margin: 4px 0 12px 0;
+}
+
+.timeline-drawer:empty {
+  display: none;
+}
+
+.timeline-drawer-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 6px 0;
+  font-size: 13px;
+}

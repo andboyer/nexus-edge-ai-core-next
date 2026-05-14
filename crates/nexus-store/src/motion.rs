@@ -120,6 +120,29 @@ pub struct MotionEventRow {
     pub attributes_json: String,
 }
 
+/// One time-bucket aggregation of motion activity for a camera.
+/// Returned by [`Store::list_motion_histogram_for_camera`] and
+/// surfaced to the UI as the per-hour Timeline grid bars.
+///
+/// Buckets are sparse — empty intervals are NOT included; the UI
+/// fills zeros client-side. `bucket_start` is the inclusive lower
+/// edge of the bucket, computed as `from + bucket_seconds * bucket`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MotionHistogramBucket {
+    /// Zero-based bucket index counted from `from`. The UI uses
+    /// this for grid layout without re-deriving timestamps.
+    pub bucket: i64,
+    /// Inclusive start time of this bucket
+    /// (`from + bucket_seconds * bucket`).
+    pub bucket_start: DateTime<Utc>,
+    /// Number of `motion_events` rows whose `captured_at` falls in
+    /// the bucket. Drives the bar height.
+    pub event_count: i64,
+    /// Number of distinct `clip_id` values referenced by those
+    /// events. Drives the secondary clip-count badge on hover.
+    pub clip_count: i64,
+}
+
 // ---------------------------------------------------------------------------
 // Store impl block — one new method per repo operation.
 // ---------------------------------------------------------------------------
@@ -314,6 +337,56 @@ impl Store {
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter().map(motion_event_row_from_row).collect()
+    }
+
+    /// Bucketed motion-event counts for the per-camera Timeline UI
+    /// (M2.1 Stage B B7). Powers
+    /// `GET /api/v1/cameras/:id/motion/histogram`.
+    ///
+    /// Returns sparse buckets — only intervals containing events are
+    /// included. The bucket index is computed against `from` so the
+    /// UI can position bars deterministically without re-parsing
+    /// timestamps. `bucket_seconds` must be > 0 (caller validates).
+    pub async fn list_motion_histogram_for_camera(
+        &self,
+        camera_id: CameraId,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+        bucket_seconds: i64,
+    ) -> Result<Vec<MotionHistogramBucket>, StoreError> {
+        debug_assert!(bucket_seconds > 0);
+        let from_unix = from.timestamp();
+        let rows = sqlx::query(
+            "SELECT
+                 CAST((strftime('%s', captured_at) - ?) / ? AS INTEGER) AS bucket,
+                 COUNT(*) AS event_count,
+                 COUNT(DISTINCT clip_id) AS clip_count
+               FROM motion_events
+              WHERE camera_id = ? AND captured_at BETWEEN ? AND ?
+              GROUP BY bucket
+              ORDER BY bucket ASC",
+        )
+        .bind(from_unix)
+        .bind(bucket_seconds)
+        .bind(camera_id)
+        .bind(from.to_rfc3339())
+        .bind(to.to_rfc3339())
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                let bucket: i64 = row.get("bucket");
+                let event_count: i64 = row.get("event_count");
+                let clip_count: i64 = row.get("clip_count");
+                let bucket_start = from + chrono::Duration::seconds(bucket * bucket_seconds);
+                Ok(MotionHistogramBucket {
+                    bucket,
+                    bucket_start,
+                    event_count,
+                    clip_count,
+                })
+            })
+            .collect()
     }
 
     /// Stamp `events.clip_id` for an alert. Called by the supervisor in

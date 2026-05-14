@@ -81,6 +81,10 @@ pub fn router(state: ApiState) -> Router {
         // M2.1 Stage A — motion + clips + storage health.
         .route("/v1/storage/local", get(get_storage_local))
         .route("/v1/cameras/:id/motion", get(list_motion_for_camera))
+        .route(
+            "/v1/cameras/:id/motion/histogram",
+            get(list_motion_histogram_for_camera),
+        )
         .route("/v1/clips/:id", get(get_clip))
         .route("/v1/clips/:id/thumbnail", get(get_clip_thumbnail));
 
@@ -453,6 +457,51 @@ async fn list_motion_for_camera(
         .await
         .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(rows))
+}
+
+#[derive(serde::Deserialize)]
+struct MotionHistogramQuery {
+    /// RFC3339, inclusive lower bound. Defaults to now-24h.
+    from: Option<String>,
+    /// RFC3339, inclusive upper bound. Defaults to now.
+    to: Option<String>,
+    /// Bucket width in seconds. Defaults to 3600 (one hour).
+    /// Clamped to [60, 86400] so the UI can't blow up sqlite with
+    /// per-second buckets over a multi-day window.
+    bucket_seconds: Option<i64>,
+}
+
+async fn list_motion_histogram_for_camera(
+    State(s): State<ApiState>,
+    Path(camera_id): Path<CameraId>,
+    Query(q): Query<MotionHistogramQuery>,
+) -> Result<Json<Vec<nexus_store::MotionHistogramBucket>>, ApiError> {
+    let now = chrono::Utc::now();
+    let from = match q.from.as_deref() {
+        Some(s) => chrono::DateTime::parse_from_rfc3339(s)
+            .map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("from: {e}")))?
+            .with_timezone(&chrono::Utc),
+        None => now - chrono::Duration::hours(24),
+    };
+    let to = match q.to.as_deref() {
+        Some(s) => chrono::DateTime::parse_from_rfc3339(s)
+            .map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("to: {e}")))?
+            .with_timezone(&chrono::Utc),
+        None => now,
+    };
+    if to < from {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "`to` must be >= `from`".into(),
+        ));
+    }
+    let bucket_seconds = q.bucket_seconds.unwrap_or(3600).clamp(60, 86_400);
+    let buckets = s
+        .store
+        .list_motion_histogram_for_camera(camera_id, from, to, bucket_seconds)
+        .await
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(buckets))
 }
 
 async fn get_clip(

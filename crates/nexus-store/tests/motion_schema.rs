@@ -16,7 +16,7 @@
 
 use std::path::PathBuf;
 
-use chrono::{Duration, Utc};
+use chrono::{Duration, Timelike, Utc};
 use nexus_config::{CameraConfig, StoreConfig};
 use nexus_store::{ClipClose, EventStore, MotionEventKind, NewClip, NewMotionEvent, Store};
 use nexus_types::{AlertEvent, Artifacts, BBox, Severity};
@@ -308,6 +308,93 @@ async fn list_motion_events_for_camera_window_and_order() {
     assert_eq!(rows[0].label, "person");
     assert!((rows[0].confidence - 0.87).abs() < 1e-5);
     assert_eq!(rows[0].bbox.x1, 10.0);
+}
+
+#[tokio::test]
+async fn list_motion_histogram_for_camera_buckets_by_seconds() {
+    // M2.1 Stage B B7 — Timeline UI grid wants per-hour bars.
+    // Verify the SQL bucket math: events scattered across a 3h
+    // window with 3600s buckets land in buckets {0, 1, 2} with the
+    // right per-bucket counts and distinct clip_count.
+    let (store, _dir) = fresh_store().await;
+    store
+        .upsert_camera(&sample_camera(1, "front"))
+        .await
+        .unwrap();
+
+    // Anchor `from` on a wall-clock minute boundary so SQLite's
+    // strftime('%s', captured_at) - from_unix maps cleanly into
+    // bucket indices instead of bobbing on sub-second drift.
+    let from = Utc::now()
+        .with_nanosecond(0)
+        .unwrap()
+        .with_second(0)
+        .unwrap()
+        - Duration::hours(3);
+    let to = from + Duration::hours(3);
+
+    // Two clips so clip_count is observably > 1 in at least one
+    // bucket.
+    let clip_a = store
+        .open_clip(&sample_clip(1, from + Duration::minutes(10)))
+        .await
+        .unwrap();
+    let clip_b = store
+        .open_clip(&sample_clip(1, from + Duration::minutes(70)))
+        .await
+        .unwrap();
+
+    // Bucket 0 (0..60min): 3 events, 1 distinct clip.
+    for i in 0..3 {
+        store
+            .insert_motion_event(&sample_motion_event(
+                1,
+                clip_a,
+                100 + i as u64,
+                MotionEventKind::Updated,
+                from + Duration::minutes(5 + i * 10),
+            ))
+            .await
+            .unwrap();
+    }
+    // Bucket 1 (60..120min): 2 events, 2 distinct clips.
+    store
+        .insert_motion_event(&sample_motion_event(
+            1,
+            clip_a,
+            200,
+            MotionEventKind::Updated,
+            from + Duration::minutes(65),
+        ))
+        .await
+        .unwrap();
+    store
+        .insert_motion_event(&sample_motion_event(
+            1,
+            clip_b,
+            201,
+            MotionEventKind::Born,
+            from + Duration::minutes(75),
+        ))
+        .await
+        .unwrap();
+    // Bucket 2 (120..180min): NO events. Expect this bucket to be
+    // absent from the response (sparse).
+
+    let buckets = store
+        .list_motion_histogram_for_camera(1, from, to, 3600)
+        .await
+        .unwrap();
+
+    assert_eq!(buckets.len(), 2, "empty bucket 2 must be omitted");
+    assert_eq!(buckets[0].bucket, 0);
+    assert_eq!(buckets[0].event_count, 3);
+    assert_eq!(buckets[0].clip_count, 1);
+    assert_eq!(buckets[0].bucket_start, from);
+    assert_eq!(buckets[1].bucket, 1);
+    assert_eq!(buckets[1].event_count, 2);
+    assert_eq!(buckets[1].clip_count, 2);
+    assert_eq!(buckets[1].bucket_start, from + Duration::hours(1));
 }
 
 #[tokio::test]

@@ -10,8 +10,8 @@
 
 pub mod motion;
 pub use motion::{
-    ClipClose, ClipId, ClipRow, MotionEventId, MotionEventKind, MotionEventRow, NewClip,
-    NewMotionEvent,
+    ClipClose, ClipId, ClipRow, MotionEventId, MotionEventKind, MotionEventRow,
+    MotionHistogramBucket, NewClip, NewMotionEvent,
 };
 
 use std::sync::Arc;
