@@ -92,7 +92,7 @@ impl FrameSource for FailingSource {
 //
 // Pipeline:
 //   rtspsrc location=URL latency=200 protocols=tcp+udp
-//   ! decodebin ! videoconvert ! videorate
+//   ! decodebin force-sw-decoders=true ! videoconvert ! videorate
 //   ! video/x-raw,format=RGB,framerate=N/1
 //   ! appsink name=sink emit-signals=false sync=false drop=true max-buffers=4
 //
@@ -101,6 +101,15 @@ impl FrameSource for FailingSource {
 // thread; we `try_send` so a slow downstream consumer drops frames at the
 // edge instead of stalling the camera. The pool / gate decide what to drop,
 // not the source.
+//
+// `force-sw-decoders=true` is REQUIRED on macOS: without it, decodebin
+// autoplugs `vtdec` (Apple VideoToolbox), which produces GL textures and
+// triggers a `GStreamer-GL-WARNING: An NSApplication needs to be running
+// on the main thread`. Caps negotiation between vtdec and videoconvert
+// then hangs at PAUSED→PLAYING and no samples ever reach the appsink.
+// We don't run an NSApplication (we're a headless engine), so software
+// decode is the only path that produces frames. avdec_h264/avdec_h265 from
+// gst-libav handle every realistic camera codec at the FPS rates we use.
 //
 // Bus is pumped on a `spawn_blocking` task because gst-rs's `iter_timed`
 // blocks the calling thread. EOS / Error end the session; the outer
@@ -178,7 +187,7 @@ impl RtspSource {
         let fr = if self.max_fps == 0 { 15 } else { self.max_fps };
         let desc = format!(
             "rtspsrc location=\"{url_safe}\" latency=200 protocols=tcp+udp \
-             ! decodebin ! videoconvert ! videorate \
+             ! decodebin force-sw-decoders=true ! videoconvert ! videorate \
              ! video/x-raw,format=RGB,framerate={fr}/1 \
              ! appsink name=sink emit-signals=false sync=false drop=true max-buffers=4"
         );
