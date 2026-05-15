@@ -36,7 +36,7 @@ pub use preroll::{NalRingBuffer, NalSample};
 pub use recorder::{
     ClipFinal, ClipHandle, ClipMeta, ClipRecorder, OpenClip, RecorderError, StubClipRecorder,
 };
-pub use source::{FrameSource, FrameSourceError, VirtualSource};
+pub use source::{FailingSource, FrameSource, FrameSourceError, VirtualSource};
 pub use supervisor::{spawn_camera, CameraHandle};
 
 #[cfg(feature = "gstreamer")]

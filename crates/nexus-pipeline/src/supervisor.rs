@@ -437,6 +437,22 @@ fn build_source(cfg: &CameraConfig) -> Box<dyn FrameSource + Send> {
             url: cfg.url.to_string(),
             max_fps: cfg.max_fps,
         }),
+        // Without the `gstreamer` feature there is no real RTSP backend.
+        // Refuse to silently fall back to a 640x480 black VirtualSource —
+        // surface a loud error and return a FailingSource so the
+        // supervisor's existing warn path makes the misconfiguration
+        // visible in `/api/cameras` (pipeline state stays Initializing →
+        // error) instead of "running" with a fake feed.
+        #[cfg(not(feature = "gstreamer"))]
+        "rtsp" | "rtsps" => {
+            let msg = format!(
+                "camera {} url {} requires the `gstreamer` feature; rebuild \
+                 nexus-engine with `cargo build --features gstreamer,...`",
+                cfg.id, cfg.url
+            );
+            error!(camera_id = cfg.id, url = %cfg.url, "{}", msg);
+            Box::new(crate::source::FailingSource { message: msg })
+        }
         _ => Box::new(VirtualSource {
             camera_id: cfg.id,
             width: 640,

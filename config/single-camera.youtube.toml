@@ -1,0 +1,76 @@
+# Local-dev config — one RTSP camera fed by the youtube-rtsp-bridge,
+# real ORT detector (yolo26n @ 640), CoreML-eligible on Apple Silicon.
+#
+# Pre-flight:
+#   brew install gstreamer node@22 onnxruntime yt-dlp ffmpeg mediamtx
+#   mediamtx                                                      # terminal A
+#   tools/youtube-rtsp-bridge/bin/yt-rtsp-bridge.sh \
+#       "https://www.youtube.com/watch?v=jfKfPfyJRdk" cam1        # terminal B
+#
+# Then:
+#   ORT_DYLIB_PATH=/opt/homebrew/lib/libonnxruntime.dylib \
+#   cargo run --release -p nexus-engine \
+#       --features ort,ep-cpu,ep-coreml,gstreamer \
+#       --bin nexus-engine -- --config config/single-camera.youtube.toml
+#
+# `gstreamer` is REQUIRED for rtsp:// URLs — without it the engine silently
+# falls back to a 640x480 black-frame VirtualSource.
+
+[runtime]
+state_dir = "./data/state"
+
+[runtime.clips]
+clips_dir = "./data/clips"
+
+[server]
+api_bind = "127.0.0.1:8089"
+ui_root = "ui/dist"
+
+[store]
+url = "sqlite:./data/nexus.db?mode=rwc"
+seed_from_config = true
+
+[telemetry]
+log_level = "info,nexus=debug"
+
+[auth]
+mode = "none"
+
+[inference]
+backend = "in_process"
+workers = 1
+ep_priority = ["coreml", "cpu"]
+
+[inference.model]
+kind = "yolo"          # closed-vocab yolo26n_dynamic.onnx
+pack_path = "models"   # resolves models/models-manifest.json
+preset = "640"
+score_threshold = 0.30
+
+[tracker]
+backend = "iou_naive"
+
+[rules]
+backend = "cel"
+
+[[rules.inline]]
+id = "any_person"
+name = "Any person"
+when = "object.label == 'person'"
+severity = "low"
+min_track_age_ms = 0
+consecutive_frames = 1
+cooldown_ms = 5000
+enabled = true
+
+[bus]
+backend = "broadcast"
+capacity = 256
+
+[[cameras]]
+id = 1
+name = "Lofi Girl (RTSP)"
+url = "rtsp://127.0.0.1:8554/cam1"
+enabled = true
+prompts = ["person"]
+max_fps = 5

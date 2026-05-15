@@ -67,6 +67,26 @@ impl FrameSource for VirtualSource {
 }
 
 // ---------------------------------------------------------------------------
+// FailingSource — a source that immediately returns a `Backend(msg)` error
+// without producing any frames. Used by the supervisor as the dispatch
+// target when a camera URL requires a backend the engine wasn't compiled
+// with (today: rtsp:// without the `gstreamer` feature). Surfaces as a
+// loud "frame source ended" warn in the supervisor instead of silently
+// falling through to a 640x480 VirtualSource.
+// ---------------------------------------------------------------------------
+
+pub struct FailingSource {
+    pub message: String,
+}
+
+#[async_trait]
+impl FrameSource for FailingSource {
+    async fn run(self: Box<Self>, _tx: mpsc::Sender<Frame>) -> Result<(), FrameSourceError> {
+        Err(FrameSourceError::Backend(self.message))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // RtspSource — real GStreamer RTSP source. Behind the `gstreamer` feature so
 // the workspace builds bare on dev boxes.
 //
