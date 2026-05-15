@@ -1,8 +1,18 @@
 # Smoke-test config — single virtual camera, mock detector. Used by
 # `cargo run --bin nexus-engine -- --config config/single-camera.toml --mock-detector`.
 
+# Local-dev paths so this config works as-is on macOS / Apple Silicon
+# (no /var/lib/nexus access required).
+[runtime]
+state_dir = "./data/state"
+
+[runtime.clips]
+clips_dir = "./data/clips"
+
 [server]
-api_bind = "0.0.0.0:8089"
+# Loopback by default — required by M-Install Checkpoint 2 when
+# auth.mode = "none". Flip to 0.0.0.0 only with auth.mode = "dev_token".
+api_bind = "127.0.0.1:8089"
 ui_root = "ui/dist"
 
 [store]
@@ -11,6 +21,11 @@ seed_from_config = true
 
 [telemetry]
 log_level = "info,nexus=debug"
+
+# Explicit so the grandfather WARN doesn't fire on the dev loop.
+# Loopback bind above keeps this safe.
+[auth]
+mode = "none"
 
 [inference]
 backend = "in_process"
