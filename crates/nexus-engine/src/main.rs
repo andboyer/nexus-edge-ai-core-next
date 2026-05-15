@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use nexus_bus::build_bus;
 use nexus_config::{CameraConfig, Config, InferenceConfig, RecorderKind};
 use nexus_inference::InferenceRouter;
@@ -14,12 +14,48 @@ use tracing::{info, warn};
 
 mod admin_auth;
 mod api;
+mod auth_bootstrap;
 mod cold_read_cache;
 mod cold_replicator;
 mod oauth_sessions;
 mod retention;
 mod storage_safety;
 mod usb_watch;
+
+/// Default config path used when neither `--config` nor `--tier` is given.
+/// Matches the M0/M1 dev-loop expectation (run from repo root).
+const DEFAULT_CONFIG: &str = "config/single-camera.toml";
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+#[clap(rename_all = "lowercase")]
+enum TierChoice {
+    /// Run `nexus-probe` in-process and load the recommended tier file.
+    Auto,
+    T10,
+    T24,
+    T36,
+    T36s,
+    T64,
+    /// Apple-silicon / fallback dev profile (`config/single-camera.toml`).
+    Dev,
+}
+
+impl TierChoice {
+    /// Resolve a named tier (anything other than `Auto`) to its
+    /// canonical config-file path. `Auto` is handled by the caller
+    /// because it requires a probe round-trip.
+    fn config_path(self) -> Option<PathBuf> {
+        match self {
+            TierChoice::Auto => None,
+            TierChoice::T10 => Some(PathBuf::from("config/tiers/t10.toml")),
+            TierChoice::T24 => Some(PathBuf::from("config/tiers/t24.toml")),
+            TierChoice::T36 => Some(PathBuf::from("config/tiers/t36.toml")),
+            TierChoice::T36s => Some(PathBuf::from("config/tiers/t36s.toml")),
+            TierChoice::T64 => Some(PathBuf::from("config/tiers/t64.toml")),
+            TierChoice::Dev => Some(PathBuf::from("config/single-camera.toml")),
+        }
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -28,14 +64,17 @@ mod usb_watch;
     about = "Nexus edge engine — pipeline + API + UI in one process"
 )]
 struct Cli {
-    /// Path to the TOML config file.
-    #[arg(
-        short,
-        long,
-        env = "NEXUS_CONFIG",
-        default_value = "config/single-camera.toml"
-    )]
-    config: PathBuf,
+    /// Path to the TOML config file. When set, takes precedence over
+    /// `--tier`. Falls back to `config/single-camera.toml` if neither
+    /// `--config` nor `--tier` is provided.
+    #[arg(short, long, env = "NEXUS_CONFIG")]
+    config: Option<PathBuf>,
+
+    /// Hardware tier to load (M-Install Checkpoint 1). `auto` runs
+    /// `nexus-probe` in-process and picks the matching
+    /// `config/tiers/<tier>.toml`. Ignored when `--config` is given.
+    #[arg(long, env = "NEXUS_TIER", value_enum)]
+    tier: Option<TierChoice>,
 
     /// Override `inference.backend` from the config (mock|in_process|pool).
     /// Convenience for smoke tests so we don't need a separate config.
@@ -47,13 +86,61 @@ struct Cli {
     no_api: bool,
 }
 
+impl Cli {
+    /// Resolve the config path according to the precedence rules:
+    /// `--config` > `--tier` > built-in default.
+    ///
+    /// Emits status to stderr because tracing is not initialised yet
+    /// at this point in startup; operators get immediate feedback on
+    /// which file the engine is about to load.
+    fn resolved_config_path(&self) -> PathBuf {
+        if let Some(path) = self.config.clone() {
+            return path;
+        }
+        if let Some(tier) = self.tier {
+            match tier {
+                TierChoice::Auto => {
+                    let path = nexus_probe::recommend_tier_config_path();
+                    eprintln!(
+                        "nexus-engine: --tier auto -> probe recommends {}",
+                        path.display()
+                    );
+                    return path;
+                }
+                other => {
+                    let path = other
+                        .config_path()
+                        .expect("non-Auto TierChoice always returns Some(path)");
+                    eprintln!("nexus-engine: --tier {:?} -> {}", other, path.display());
+                    return path;
+                }
+            }
+        }
+        PathBuf::from(DEFAULT_CONFIG)
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let mut cfg =
-        Config::load(&cli.config).with_context(|| format!("loading config {:?}", cli.config))?;
+    let config_path = cli.resolved_config_path();
+    let (mut cfg, compat) = Config::load_with_compat(&config_path)
+        .with_context(|| format!("loading config {:?}", config_path))?;
     if cli.mock_detector {
         cfg.inference.model.kind = "mock".into();
     }
+
+    // Apply M-Install Checkpoint 2 auth posture rules:
+    // - WARN about grandfathered missing-[auth]-section configs
+    // - auto-provision dev_token at <state_dir>/dev-token when needed
+    // - refuse to boot if mode = none + non-loopback bind
+    //
+    // Tracing isn't initialised yet, so the WARN+INFO emitted by
+    // auth_bootstrap reach stderr through the global default
+    // subscriber (no JSON formatting, no OTLP). That is intentional
+    // — the operator-visible secret-token line MUST land before
+    // anything else can swallow it.
+    let state_dir = auth_bootstrap::state_dir(&cfg);
+    auth_bootstrap::apply(&mut cfg, &state_dir, compat)?;
 
     let runtime = build_runtime(&cfg.runtime)?;
     runtime.block_on(run(cfg, cli))

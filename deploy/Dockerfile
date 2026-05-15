@@ -39,6 +39,21 @@ ARG ORT_VERSION=1.20.0
 RUN curl -fsSL https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-linux-x64-${ORT_VERSION}.tgz \
     | tar -xz -C /opt && mv /opt/onnxruntime-linux-x64-${ORT_VERSION} /opt/onnxruntime
 
+# M-Install Checkpoint 2 — kitchen-sink EP build. The runtime image
+# always ships the same set of binaries; which execution providers
+# they're linked against is decided at build time via this ARG.
+# The default is the empty set ("just CPU + stub ORT"), matching
+# the M0/M1 dev cadence. The release pipeline overrides this to
+# `ort,ep-cpu,ep-openvino,ep-cuda,ep-tensorrt` so a single image
+# works on every tier from T10 (CPU only) through T64 (NVIDIA).
+#
+# The features are forwarded both to nexus-engine (for its own
+# `gstreamer` flag) and to nexus-inference via cargo's --features
+# resolution against workspace deps. ORT shared libs are pulled
+# from /opt/onnxruntime at runtime regardless; only the cargo-side
+# wiring changes between feature sets.
+ARG FEATURES=
+
 WORKDIR /work
 # Copy manifests first for better layer caching.
 COPY rust-toolchain.toml Cargo.toml ./
@@ -57,10 +72,13 @@ COPY crates/nexus-probe/Cargo.toml      crates/nexus-probe/
 # Now the sources.
 COPY crates crates
 
-# Build the binaries. Add `--features gstreamer` when M1 is wired.
-RUN cargo build --release \
-    --bin nexus-engine \
-    --bin nexus-probe
+# Build the binaries. nexus-engine takes the FEATURES override
+# (forwarded into nexus-inference for ORT + per-EP wiring); nexus-probe
+# has no EP-relevant features so it builds with workspace defaults.
+# Two separate `cargo build` calls because `--features` at workspace
+# root requires `-p` or a single-package selection.
+RUN cargo build --release -p nexus-engine --features "${FEATURES}" --bin nexus-engine \
+ && cargo build --release -p nexus-probe --bin nexus-probe
 
 # ----------------------- stage 3: runtime --------------------------
 FROM debian:bookworm-slim AS runtime

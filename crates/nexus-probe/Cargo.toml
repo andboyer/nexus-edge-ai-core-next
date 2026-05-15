@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[lib]
+name = "nexus_probe"
+path = "src/lib.rs"
+
 [[bin]]
 name = "nexus-probe"
 path = "src/main.rs"

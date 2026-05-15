@@ -8,10 +8,29 @@ rust-version.workspace = true
 [features]
 default = []
 gstreamer = ["nexus-pipeline/gstreamer"]
+# M-Install Checkpoint 2 — feature proxies that forward into
+# nexus-inference. The release pipeline (and the kitchen-sink Docker
+# image) selects `ort,ep-cpu,ep-openvino,ep-cuda,ep-tensorrt`; lighter
+# builds (LAN dev box, CI smoke) leave them off and pay zero cost.
+ort         = ["nexus-inference/ort"]
+ep-cpu      = ["nexus-inference/ep-cpu"]
+ep-openvino = ["nexus-inference/ep-openvino"]
+ep-cuda     = ["nexus-inference/ep-cuda"]
+ep-tensorrt = ["nexus-inference/ep-tensorrt"]
+ep-coreml   = ["nexus-inference/ep-coreml"]
+ep-directml = ["nexus-inference/ep-directml"]
 
 [[bin]]
 name = "nexus-engine"
 path = "src/main.rs"
+
+# `nexus-doctor` runs the INSTALL.md §9 smoke checks against a live
+# engine on `http://localhost:8089`. Lives here (instead of in its
+# own crate) because it shares no code with the engine but does
+# share the engine's release-pipeline cadence (M-Install Checkpoint 1).
+[[bin]]
+name = "nexus-doctor"
+path = "src/bin/doctor.rs"
 
 [dependencies]
 nexus-types = { workspace = true }
@@ -31,6 +50,9 @@ nexus-storage = { workspace = true }
 # CI matrix without saving bytes on disk (reqwest+rustls is
 # already in the dep graph via the cold-replicator's HTTP path).
 nexus-storage-cloud = { workspace = true }
+# Probe library for `--tier auto` (M-Install Checkpoint 1) and the
+# `nexus-doctor` binary. Pure-Rust; pulls in serde + chrono only.
+nexus-probe = { workspace = true }
 
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
@@ -56,9 +78,22 @@ tower = { workspace = true }
 # HS256 bearer verifier for admin writes (M2.2 Phase 2 step 12).
 jsonwebtoken = { workspace = true }
 
+# HTTP client for `nexus-doctor` (M-Install Checkpoint 1). Uses the
+# `blocking` API so the doctor binary can stay sync — no tokio runtime
+# required for an 8-step smoke test against `http://localhost:8089`.
+reqwest = { workspace = true, features = ["blocking"] }
+
 image = { workspace = true }
 async-stream = "0.3"
 sha2 = "0.10"
+
+# M-Install Checkpoint 2 — token bytes for the auto-provisioned
+# dev_token. `getrandom 0.3` is already in the dep graph
+# transitively (via rand-using crates); pinning it here makes
+# the dependency explicit instead of leaning on a transitive.
+getrandom = "0.3"
+# URL-safe base64 encoding for that token.
+base64 = { workspace = true }
 
 # statvfs for the watermark sampler. Unix-only — non-unix builds
 # fall back to a never-panic probe (see storage_safety.rs).

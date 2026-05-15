@@ -172,6 +172,7 @@ nexus-inference = { path = "crates/nexus-inference" }
 nexus-storage = { path = "crates/nexus-storage" }
 nexus-storage-cloud = { path = "crates/nexus-storage-cloud" }
 nexus-pipeline = { path = "crates/nexus-pipeline" }
+nexus-probe = { path = "crates/nexus-probe" }
 
 [profile.release]
 opt-level = 3

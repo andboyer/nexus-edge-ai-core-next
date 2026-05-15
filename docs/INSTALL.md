@@ -630,6 +630,16 @@ git clone https://github.com/andboyer/nexus-edge-ai-core-next.git .
 
 ### 6.3 Pick the tier config
 
+> **Optional once you're on the dogfooding kit.** Engine ≥ 0.1
+> understands `--tier auto` (or `NEXUS_TIER=auto`), which calls
+> `nexus-probe` in-process at startup and loads the matching
+> `config/tiers/<tier>.toml` itself. The manual copy below is still
+> the right move for production deployments where you want to pin a
+> version-controlled config under `/etc/nexus/nexus.toml` and audit
+> changes — but for fast bring-up on the box you just unboxed,
+> `nexus-engine --tier auto` skips this step entirely. See
+> [`docs/ROADMAP.md` → M-Install Checkpoint 1](ROADMAP.md#checkpoint-1--dogfooding-kit-now-2-days).
+
 Replace `t24.toml` with the file matching your tier from §1.
 
 ```bash
@@ -1201,6 +1211,9 @@ This guide will grow §6.7 / §10 sections for both once they ship.
 | Symptom | Likely cause | Fix |
 | ------- | ------------ | --- |
 | `curl /api/health` returns connection refused | Engine isn't up. | `systemctl status nexus-engine` or `docker compose ps`; check logs (§10.1). |
+| Engine refuses to start with `auth.mode = "none" is only allowed when server.api_bind is on loopback` | Since M-Install Checkpoint 2 the engine refuses to bind unauthenticated APIs onto a LAN. | Either change `[server].api_bind` to `127.0.0.1:8089` (LAN-only deployments), or set `[auth].mode = "dev_token"` and read the auto-generated token from `/var/lib/nexus/dev-token` (mode 0600). |
+| Engine logs `auth: generated new dev token` at boot | First boot under `mode = "dev_token"` (the default since M-Install Checkpoint 2). The token is the credential clients send as `Authorization: Bearer <token>`. | Copy the token from the WARN line *or* from `/var/lib/nexus/dev-token`. To rotate: stop the engine, delete the file, restart. |
+| Engine logs `nexus.toml has no [auth] section` at boot | Pre-Checkpoint-2 config; the engine grandfathers it to `mode = "none"` for 7 days. | Add an explicit `[auth]` block (see [config/nexus.example.toml](../config/nexus.example.toml)) before the deadline printed in the WARN line. |
 | UI loads but `/` returns 404 | `ui_root` mismatch — engine pointing at a path that doesn't exist. | Container: image build incomplete; rebuild. Bare-metal: `ls /usr/share/nexus/ui` should list `index.html`. Update `[server].ui_root` in `/etc/nexus/nexus.toml` to match. |
 | Camera stuck on `connecting` for > 2 min | RTSP transport mismatch (camera serves UDP, engine asks TCP), bad credentials, blocked port. | Test with `gst-launch-1.0 -v rtspsrc location=<url> ! fakesink` from the host. If the password contains `!`, run `set +H` first and single-quote the URL (zsh history expansion). |
 | `vainfo` succeeds for `nexus-admin` but engine logs say "no VAAPI device" | `nexus` user not in `render` group. | `sudo usermod -aG render nexus` then restart the engine + reload the systemd-cgroup view (`systemctl daemon-reload && systemctl restart nexus-engine`). |

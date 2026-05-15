@@ -24,6 +24,48 @@ pub enum ConfigError {
     Validation(String),
 }
 
+/// Compatibility shims applied to a parsed config so the engine can
+/// emit operator-visible warnings on upgrade paths. Returned by
+/// [`Config::load_with_compat`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct CompatNotice {
+    /// True when the on-disk file had no `[auth]` section and so
+    /// the loader pinned `auth.mode = none` (instead of using the
+    /// new `dev_token` default that landed in M-Install
+    /// Checkpoint 2). Engines emit a 7-day-deprecation WARN log
+    /// when this is set.
+    pub auth_grandfathered: bool,
+}
+
+/// Cheap line-scan check for `[<name>]` at the top level of a TOML
+/// document. Used by [`Config::load_with_compat`] to detect a
+/// missing `[auth]` section without re-parsing the file. Lines
+/// inside other tables (`[runtime.foo]`) are intentionally ignored
+/// — only an exact `[name]` header (after trimming whitespace and
+/// stripping inline comments) counts.
+///
+/// This is a structural check, not a full TOML parser; it relies
+/// on the standard TOML rule that table headers occupy their own
+/// line. Round-tripping through `toml::from_str` afterwards is
+/// what actually validates the file.
+fn toml_has_top_level_table(txt: &str, name: &str) -> bool {
+    let target = format!("[{name}]");
+    for line in txt.lines() {
+        // Strip inline comments — TOML comments start with `#` and
+        // run to end-of-line. A `#` inside a string isn't a comment,
+        // but table headers can't contain strings, so the simple
+        // strip is sound for headers.
+        let no_comment = match line.find('#') {
+            Some(i) => &line[..i],
+            None => line,
+        };
+        if no_comment.trim() == target {
+            return true;
+        }
+    }
+    false
+}
+
 // ---------------------------------------------------------------------------
 // Top-level config
 // ---------------------------------------------------------------------------
@@ -59,6 +101,30 @@ impl Config {
         let cfg: Config = toml::from_str(&txt)?;
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// Same as [`Config::load`] but reports compatibility shims
+    /// applied to the parsed config so the engine can surface them
+    /// at boot. Currently the only shim is the M-Install
+    /// Checkpoint 2 auth grandfather: configs whose file predates
+    /// the `[auth]` section keep `mode = none` for one
+    /// deprecation window instead of being silently flipped to the
+    /// new `dev_token` default.
+    pub fn load_with_compat(path: impl AsRef<Path>) -> Result<(Self, CompatNotice), ConfigError> {
+        let txt = std::fs::read_to_string(path)?;
+        let auth_section_present = toml_has_top_level_table(&txt, "auth");
+        let mut cfg: Config = toml::from_str(&txt)?;
+        let mut notice = CompatNotice::default();
+        if !auth_section_present {
+            // Pre-Checkpoint-2 dev installs never wrote an [auth]
+            // block; serde's `default` would now hand them
+            // `DevToken` and lock them out on upgrade. Pin them
+            // back to `None` and let the engine WARN for one week.
+            cfg.auth.mode = AuthMode::None;
+            notice.auth_grandfathered = true;
+        }
+        cfg.validate()?;
+        Ok((cfg, notice))
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
@@ -413,9 +479,20 @@ pub struct AuthConfig {
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AuthMode {
-    /// No auth (dev only).
-    #[default]
+    /// No auth (dev only). The engine refuses to bind anything other
+    /// than loopback when this mode is active — see
+    /// `nexus-engine`'s startup checks. Existing dev installs whose
+    /// `nexus.toml` predates the auth section are grandfathered to
+    /// this mode for 7 days; see `Config::load_with_compat`.
     None,
+    // M-Install Checkpoint 2 — secure by default. Anything deployed
+    // beyond a hand-rolled `mode = "none"` opt-in lands on the
+    // dev-token path automatically.
+    /// Default. On first boot the engine generates a 32-byte
+    /// URL-safe random token at `/var/lib/nexus/dev-token` (mode
+    /// 0600) and prints it to the WARN log; clients send it as
+    /// `Authorization: Bearer <token>` on every request.
+    #[default]
     DevToken,
     Oidc,
 }
@@ -1050,5 +1127,57 @@ mod tests {
         cfg.inference.backend = InferenceBackendKind::Pool;
         cfg.inference.workers = 0;
         assert!(cfg.validate().is_err());
+    }
+
+    // M-Install Checkpoint 2 — secure-by-default. New deployments
+    // (and any TOML that only writes `[auth]\n`) land on DevToken
+    // automatically. Failing this test means a new install without
+    // an explicit `mode = "..."` would silently leak a no-auth API.
+    #[test]
+    fn auth_mode_default_is_dev_token() {
+        let auth: AuthConfig = Default::default();
+        assert_eq!(auth.mode, AuthMode::DevToken);
+        let parsed: AuthConfig = toml::from_str("").unwrap();
+        assert_eq!(parsed.mode, AuthMode::DevToken);
+    }
+
+    #[test]
+    fn toml_top_level_table_detector() {
+        assert!(toml_has_top_level_table(
+            "[auth]\nmode = \"oidc\"\n",
+            "auth"
+        ));
+        assert!(toml_has_top_level_table("  [auth]   # comment\n", "auth"));
+        // Subtables (`[auth.oidc]`) must NOT count as the parent table.
+        assert!(!toml_has_top_level_table(
+            "[auth.oidc]\nissuer = \"x\"\n",
+            "auth"
+        ));
+        assert!(!toml_has_top_level_table("[server]\n", "auth"));
+        assert!(!toml_has_top_level_table("", "auth"));
+    }
+
+    // M-Install Checkpoint 2 — grandfather: pre-existing dev installs
+    // whose nexus.toml has no `[auth]` block must be pinned back to
+    // `mode = "none"` so the new DevToken default doesn't lock them
+    // out on upgrade.
+    #[test]
+    fn load_with_compat_grandfathers_missing_auth() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nexus.toml");
+        std::fs::write(&path, "[server]\napi_bind = \"127.0.0.1:8089\"\n").unwrap();
+        let (cfg, notice) = Config::load_with_compat(&path).unwrap();
+        assert!(notice.auth_grandfathered);
+        assert_eq!(cfg.auth.mode, AuthMode::None);
+    }
+
+    #[test]
+    fn load_with_compat_respects_explicit_auth() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nexus.toml");
+        std::fs::write(&path, "[auth]\nmode = \"dev_token\"\n").unwrap();
+        let (cfg, notice) = Config::load_with_compat(&path).unwrap();
+        assert!(!notice.auth_grandfathered);
+        assert_eq!(cfg.auth.mode, AuthMode::DevToken);
     }
 }
