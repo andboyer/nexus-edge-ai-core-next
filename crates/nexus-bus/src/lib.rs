@@ -31,6 +31,71 @@ pub mod topic {
     /// Ok→Panic transition (debounced); the matching exit event is
     /// emitted on Panic→Ok.
     pub const STORAGE_PANIC: &str = "storage.panic";
+
+    // ---- M2.2 cold-mirror topics ----
+    //
+    // These are metadata-only events; never carry frame bytes or the
+    // clip blob itself. Subscribers fetch the actual payload from
+    // `motion_clips` + the relevant backend.
+
+    /// Recorder finished writing a clip to the hot backend. Payload
+    /// is `ClipClosedEvent { clip_id, camera_id, hot_handle,
+    /// hot_path, size_bytes, sha256 }`. Drives the cold replicator
+    /// follower; the replicator also has a 5-min polling backstop
+    /// in case the bus is lossy on a Lagged subscriber.
+    pub const CLIP_CLOSED: &str = "clip.closed";
+
+    /// Cold backend `health()` returned an error or an upload
+    /// failed in a way that suggests the link is down. Emitted at
+    /// most ONCE per outage (the replicator de-bounces follow-up
+    /// failures so a 60 GiB backlog does not spam the bus).
+    /// Payload: `StorageColdUnreachableEvent { handle, kind, error,
+    /// pending_bytes }`.
+    pub const STORAGE_COLD_UNREACHABLE: &str = "storage.cold.unreachable";
+
+    /// Storage-safety soft-evict step ran: hot file was unlinked
+    /// and `hot_handle`/`hot_path` cleared on a clip whose cold
+    /// copy is intact. Payload: `ClipHotEvictedEvent { clip_id,
+    /// camera_id, freed_bytes, cold_handle }`. UI uses this to
+    /// flip the clip's badge from "local+cold" to "cold-only".
+    pub const CLIP_HOT_EVICTED: &str = "clip.hot.evicted";
+
+    /// Storage-safety hard-evict step ran: a clip with NO cold
+    /// copy was metadata-cascade-deleted (M2.1 behavior).
+    /// Payload: `ClipHardEvictedEvent { clip_id, camera_id,
+    /// freed_bytes }`. UI uses this to remove the clip card.
+    pub const CLIP_HARD_EVICTED: &str = "clip.hard.evicted";
+
+    /// `storage_backends` table mutated (insert/update/delete) or
+    /// `storage_cold_replica` policy row updated. Payload:
+    /// `StorageBackendsChangedEvent { kind: "upsert"|"delete"|
+    /// "policy", handle: Option<String> }`. The cold replicator
+    /// re-loads its `Registry` on this signal.
+    pub const STORAGE_BACKENDS_CHANGED: &str = "storage.backends.changed";
+
+    // ---- M2.2 Phase 3 — USB hot-plug topics ----
+    //
+    // Emitted by the `usb_watch` task when a `NEXUS_*`-labeled
+    // volume appears or disappears under the configured mount root
+    // (`<clips_dir>/usb/` on Linux, `/Volumes/` on macOS dev).
+    // Recorder subscribes indirectly via the shared `UsbRegistry`;
+    // the bus event is for the UI + audit log so operators can see
+    // the attach history.
+
+    /// A USB volume mounted under the watch root and is now
+    /// available as a hot-tier target. Payload:
+    /// `UsbAttachedEvent { label, mount_path }`. Mount path is
+    /// stored relative to the engine's `clips_dir`.
+    pub const STORAGE_USB_ATTACHED: &str = "storage.usb.attached";
+
+    /// A previously-attached USB volume disappeared. Payload:
+    /// `UsbDetachedEvent { label }`. The recorder will fall back
+    /// to the local hot tier on the next `open()` if this volume
+    /// was the preferred target; in-flight clips finish at their
+    /// original path (the data may become unreadable mid-write
+    /// — that's a hardware-level failure, not something the
+    /// recorder can recover from).
+    pub const STORAGE_USB_DETACHED: &str = "storage.usb.detached";
 }
 
 // ---------------------------------------------------------------------------

@@ -10,9 +10,16 @@ import type {
   ClipId,
   MotionEventRow,
   MotionHistogramBucket,
+  OAuthStartReq,
+  OAuthStartResp,
+  OAuthStatusResp,
+  PutBackendReq,
+  PutColdReq,
   RuleConfig,
   RuleId,
+  StorageBackendOut,
   StorageLocalResponse,
+  StorageResponse,
   FrameMetadata,
 } from "./types.js";
 
@@ -77,6 +84,76 @@ export const api = {
   // the engine streams them with HTTP Range support so seeking works.
   storage: {
     local: () => request<StorageLocalResponse>("/v1/storage/local"),
+    /// M2.2 Phase 5 — combined hot + cold + backends snapshot. The
+    /// admin/storage page polls this; the existing storage tab uses
+    /// it to render the cold-tier health pill alongside the M2.1
+    /// hot strip.
+    full: () => request<StorageResponse>("/v1/storage"),
+  },
+
+  /// M2.2 Phase 5 — cold-replication admin mutations. Every method
+  /// returns once the engine has audited + republished the change
+  /// to the bus, so the UI can refetch `storage.full()` immediately
+  /// after and see the new state.
+  adminStorage: {
+    /// Switch the active cold backend (or disable cold replication
+    /// by passing `handle: null`). The handle MUST exist in
+    /// `storage_backends` — a 4xx surfaces if it doesn't.
+    cold: (req: PutColdReq) =>
+      request<{ handle: string | null; throttle_bps: number }>(
+        "/v1/admin/storage/cold",
+        { method: "PUT", body: JSON.stringify(req) },
+      ),
+    /// Register or update a backend. Body is validated by the
+    /// engine via `nexus_storage::build_backend` before the row is
+    /// inserted, so an invalid `kind` or `config` surfaces as 400
+    /// without dirtying the table.
+    upsertBackend: (handle: string, body: PutBackendReq) =>
+      request<StorageBackendOut>(
+        `/v1/admin/storage/backends/${encodeURIComponent(handle)}`,
+        { method: "PUT", body: JSON.stringify(body) },
+      ),
+    /// Delete a backend. Returns 409 if the backend is referenced
+    /// by any `motion_clips` row OR is the active cold replica;
+    /// returns 400 for the implicit `'local'` backend.
+    removeBackend: (handle: string) =>
+      request<void>(
+        `/v1/admin/storage/backends/${encodeURIComponent(handle)}`,
+        { method: "DELETE" },
+      ),
+    /// M2.2 closeout — set/clear the runtime preferred USB label.
+    /// Sending `{label: null}` clears the preference; the engine
+    /// persists the choice in `engine_runtime_settings` AND updates
+    /// the shared `PreferredUsbLabel` handle so the next clip
+    /// honours it without restart. In-flight clips finish where
+    /// they started.
+    usbPreferred: (label: string | null) =>
+      request<{ label: string | null }>(
+        "/v1/admin/runtime/usb_preferred",
+        { method: "PUT", body: JSON.stringify({ label }) },
+      ),
+
+    /// M2.2 closeout — OAuth auth-code flow for cloud cold
+    /// backends (gdrive, onedrive). The UI never sees the
+    /// refresh_token directly; the engine encrypts it before
+    /// upserting the row. Flow: caller hits `oauthStart` with the
+    /// same client_id/secret it would otherwise put in the form,
+    /// opens `authorize_url` in a popup, then polls `oauthStatus`
+    /// every ~2 s with the returned `state` token until
+    /// `status === "complete"` or `"error"`.
+    oauthStart: (provider: string, body: OAuthStartReq) =>
+      request<OAuthStartResp>(
+        `/v1/admin/oauth/${encodeURIComponent(provider)}/start`,
+        { method: "POST", body: JSON.stringify(body) },
+      ),
+    /// Poll the pending-session status. 404 once the session has
+    /// expired (10 min TTL) or after it terminates and is swept;
+    /// the caller should treat 404 after a previous `complete`
+    /// as success-already-reported.
+    oauthStatus: (state: string) =>
+      request<OAuthStatusResp>(
+        `/v1/admin/oauth/status?state=${encodeURIComponent(state)}`,
+      ),
   },
 
   motion: {

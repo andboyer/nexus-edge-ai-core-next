@@ -58,10 +58,10 @@ fn sample_clip(camera_id: i64, started: chrono::DateTime<Utc>) -> NewClip {
     NewClip {
         camera_id,
         started_at: started,
-        path: format!("cam{camera_id}/{}.mp4", started.timestamp()),
+        hot_path: format!("cam{camera_id}/{}.mp4", started.timestamp()),
         codec: "h264".into(),
         container: "mp4".into(),
-        backend_id: "local".into(),
+        hot_handle: "local".into(),
     }
 }
 
@@ -95,12 +95,12 @@ async fn migrations_apply_and_are_idempotent() {
     let (store, dir) = fresh_store().await;
 
     let row: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM schema_migrations WHERE id IN ('0001_initial','0002_motion_clips')",
+        "SELECT COUNT(*) FROM schema_migrations WHERE id IN ('0001_initial','0002_motion_clips','0003_events_clip_cascade','0004_storage_backends')",
     )
     .fetch_one(store.pool())
     .await
     .unwrap();
-    assert_eq!(row.0, 2, "both migrations should be recorded");
+    assert_eq!(row.0, 4, "all four migrations should be recorded");
 
     // Re-open the same DB. `ALTER TABLE events ADD COLUMN clip_id` would
     // fail on a second run; if it doesn't, the migration runner correctly
@@ -142,7 +142,8 @@ async fn motion_clips_round_trip_and_oldest_pick() {
                 ended_at: t0 + Duration::seconds(15),
                 duration_ms: 15_000,
                 size_bytes: 1_234_567,
-                path: None,
+                hot_path: None,
+                sha256: None,
             },
         )
         .await
@@ -520,6 +521,8 @@ async fn schema_migrations_table_records_apply_order() {
             "0001_initial".to_string(),
             "0002_motion_clips".to_string(),
             "0003_events_clip_cascade".to_string(),
+            "0004_storage_backends".to_string(),
+            "0005_runtime_settings".to_string(),
         ]
     );
 }

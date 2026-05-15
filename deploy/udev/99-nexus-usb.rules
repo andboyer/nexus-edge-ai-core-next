@@ -1,0 +1,43 @@
+# udev rule: auto-mount NEXUS_*-labeled USB volumes for the engine
+#
+# Drop this file at `/etc/udev/rules.d/99-nexus-usb.rules` (or
+# `/usr/lib/udev/rules.d/` for system-wide installs) and reload
+# udev:
+#
+#     sudo install -m 0644 deploy/udev/99-nexus-usb.rules \
+#         /etc/udev/rules.d/99-nexus-usb.rules
+#     sudo udevadm control --reload-rules
+#     sudo udevadm trigger
+#
+# The engine watches `<clips_dir>/usb/` (default
+# `/var/lib/nexus/clips/usb/`) for `NEXUS_*` subdirectories and
+# routes new clips there when `runtime.clips.preferred_usb_label`
+# matches a mounted volume.
+#
+# How this rule works:
+#   * Matches block devices added to the system whose filesystem
+#     LABEL starts with `NEXUS_`.
+#   * Calls `systemd-mount --no-block --collect` to mount the
+#     device at `/var/lib/nexus/clips/usb/<LABEL>/`. `--collect`
+#     means the mount is dropped automatically when the device
+#     disappears (no stale mount points after `udevadm trigger`).
+#   * The engine's `usb_watch` task re-scans on a 5s timer; the
+#     volume becomes available to the recorder on the next scan.
+#
+# To unmount on detach, udev's REMOVE event combined with
+# `--collect` handles cleanup. No additional rule is required.
+#
+# Notes:
+#   * The shipped path `/var/lib/nexus/clips/usb` MUST be a
+#     subdirectory of the engine's `clips_dir`. If you've moved
+#     `clips_dir`, edit the RUN action below to match.
+#   * This rule trusts filesystem labels. Use a unique scheme
+#     (`NEXUS_VAULT_01`, etc.) to avoid two sticks colliding.
+#   * Filesystems supported: ext4, xfs, exfat, ntfs (read/write
+#     depends on what's installed on the host). The engine needs
+#     POSIX semantics for `rename` to work atomically — exfat and
+#     ntfs are best-effort only.
+
+ACTION=="add", SUBSYSTEM=="block", ENV{ID_FS_LABEL}=="NEXUS_*", \
+    RUN+="/usr/bin/systemd-mount --no-block --collect --fsck=no \
+          /dev/$kernel /var/lib/nexus/clips/usb/$env{ID_FS_LABEL}"

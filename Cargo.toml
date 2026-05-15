@@ -9,6 +9,8 @@ members = [
     "crates/nexus-rules",
     "crates/nexus-tracker",
     "crates/nexus-inference",
+    "crates/nexus-storage",
+    "crates/nexus-storage-cloud",
     "crates/nexus-pipeline",
     "crates/nexus-engine",
     "crates/nexus-probe",
@@ -61,10 +63,21 @@ clap = { version = "4", features = ["derive", "env"] }
 # HTTP
 axum = { version = "0.8", features = ["macros", "ws"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["cors", "trace", "compression-gzip", "fs"] }
+tower-http = { version = "0.6", features = [
+    "cors",
+    "trace",
+    "compression-gzip",
+    "fs",
+] }
 
 # Storage
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "sqlite", "macros", "chrono", "uuid"] }
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio-rustls",
+    "sqlite",
+    "macros",
+    "chrono",
+    "uuid",
+] }
 
 # Rules
 cel-interpreter = "0.10"
@@ -74,9 +87,16 @@ cel-interpreter = "0.10"
 # (`SessionOptionsAppendExecutionProvider_VitisAI`) that doesn't exist in the
 # corresponding `ort-sys` build, even when no Vitis feature is selected.
 # Revisit once upstream ships a working post-rc.10 release.
-ort = { version = "=2.0.0-rc.10", default-features = false, features = ["std", "load-dynamic", "ndarray"] }
+ort = { version = "=2.0.0-rc.10", default-features = false, features = [
+    "std",
+    "load-dynamic",
+    "ndarray",
+] }
 ndarray = "0.16"
-image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+image = { version = "0.25", default-features = false, features = [
+    "jpeg",
+    "png",
+] }
 
 # Media
 gstreamer = "0.23"
@@ -95,11 +115,50 @@ raw_sync = "0.1"
 rmp-serde = "1.3"
 
 # TS bindings
-ts-rs = { version = "10", features = ["serde-compat", "uuid-impl", "chrono-impl"] }
+ts-rs = { version = "10", features = [
+    "serde-compat",
+    "uuid-impl",
+    "chrono-impl",
+] }
 
 once_cell = "1"
 url = { version = "2", features = ["serde"] }
 tempfile = "3"
+
+# Crypto — used by `nexus-storage::token_crypto` to encrypt OAuth
+# refresh tokens at rest before they hit `storage_backends.config_json`
+# (M2.2 Phase 2). Versions are RustCrypto-aligned: aes-gcm 0.10 +
+# hkdf 0.12 + sha2 0.10 all share the same `digest 0.10` /
+# `aead 0.5` ecosystem.
+aes-gcm = "0.10"
+hkdf = "0.12"
+base64 = "0.22"
+zeroize = { version = "1", features = ["derive"] }
+
+# HS256 JWT verifier for the admin → engine bearer (M2.2 Phase 2
+# step 12). nexus-admin signs the token with `admin-auth.json:secret`
+# and POSTs it to the engine on writes against `/api/v1/admin/*`.
+# Version 9 is the current major; tracks aws-lc-rs underneath.
+jsonwebtoken = "9"
+
+# HTTP client for cloud cold backends (M2.2 Phase 2 step 10).
+# `rustls-tls` keeps us off openssl; `json` and `stream` are what
+# we actually use against Google Drive / Microsoft Graph.
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+    "json",
+    "stream",
+    "http2",
+] }
+
+# Hex encoding for sha256 round-trip in cloud `exists()` checks.
+hex = "0.4"
+
+# HTTP mocking — only pulled in by `nexus-storage-cloud` tests so
+# the Drive / OneDrive integration tests don't need real cloud
+# accounts. Lives under [workspace.dependencies] so the version
+# stays in lockstep across any other crates that grow tests later.
+wiremock = "0.6"
 
 # Internal
 nexus-types = { path = "crates/nexus-types" }
@@ -110,6 +169,8 @@ nexus-store = { path = "crates/nexus-store" }
 nexus-rules = { path = "crates/nexus-rules" }
 nexus-tracker = { path = "crates/nexus-tracker" }
 nexus-inference = { path = "crates/nexus-inference" }
+nexus-storage = { path = "crates/nexus-storage" }
+nexus-storage-cloud = { path = "crates/nexus-storage-cloud" }
 nexus-pipeline = { path = "crates/nexus-pipeline" }
 
 [profile.release]

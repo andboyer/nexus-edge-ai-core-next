@@ -5,6 +5,7 @@ import { renderViewer } from "./ui/viewer.js";
 import { renderBackends } from "./ui/backends.js";
 import { renderHealth } from "./ui/health.js";
 import { renderStorage } from "./ui/storage.js";
+import { renderAdminStorage } from "./ui/admin-storage.js";
 import { renderTimeline } from "./ui/timeline.js";
 import { mountAlertTicker } from "./ui/alert-ticker.js";
 import { api } from "./api/client.js";
@@ -18,6 +19,7 @@ const TABS: { id: string; label: string; render: TabRender }[] = [
   { id: "events", label: "Events", render: renderEvents },
   { id: "timeline", label: "Timeline", render: renderTimeline },
   { id: "storage", label: "Storage", render: renderStorage },
+  { id: "admin-storage", label: "Storage Admin", render: renderAdminStorage },
   { id: "backends", label: "Backends", render: renderBackends },
   { id: "health", label: "Health", render: renderHealth },
 ];

@@ -169,6 +169,178 @@ export interface StorageLocalResponse {
   clips_dir: string;
 }
 
+// ---------------------------------------------------------------------------
+// M2.2 Phase 5 — combined storage view + cold replication admin.
+// Mirrors crates/nexus-engine/src/api.rs `StorageResponse`/`ColdStatus`
+// /`ColdHealthOut`/`StorageBackendOut`/`PutColdReq`/`PutBackendReq`
+// verbatim. Keep additive-only on the engine side.
+// ---------------------------------------------------------------------------
+
+/// Backend health pill. `serde(tag = "status")` on the Rust side, so
+/// the discriminant is a plain `status` field on the wire and the
+/// `reason` field is only present for the failure variants. The
+/// `not_registered` variant is distinct from `unreachable` because
+/// the fix is operator re-config, not waiting for a transient outage
+/// to recover.
+export type ColdHealthOut =
+  | { status: "ok" }
+  | { status: "read_only"; reason: string }
+  | { status: "unreachable"; reason: string }
+  | { status: "not_registered" };
+
+/// Active cold-replication policy + live counters. `null` on
+/// `StorageResponse.cold` when no cold backend is configured.
+export interface ColdStatus {
+  handle: string;
+  /// Backend kind (`"lan"`, etc.).
+  kind: string;
+  throttle_bps: number;
+  updated_at: string;
+  /// Closed, hashed, hot-resident clips queued for upload.
+  pending_count: number;
+  /// Clips with a cold pointer set (still-hot OR cold-only).
+  /// Strictly monotonic for a given backend.
+  replicated_count: number;
+  /// Clips that are cold-only (soft-evicted). First request
+  /// rehydrates from cold via the Phase 4 cache job.
+  cold_only_count: number;
+  /// Lifetime bytes ever uploaded to cold across all clips that
+  /// currently carry a cold pointer.
+  lifetime_uploaded_bytes: number;
+  health: ColdHealthOut;
+}
+
+/// One row of `storage_backends`. `config` is the parsed JSON blob
+/// (e.g. `{"root":"/mnt/lan-archive"}` for `lan`).
+export interface StorageBackendOut {
+  handle: string;
+  kind: string;
+  config: unknown;
+  created_at: string;
+  updated_at: string;
+}
+
+/// Combined `GET /api/v1/storage` payload. The `hot` section is
+/// intentionally a richer superset of [`StorageLocalResponse`]: it
+/// carries the M2.1 fields PLUS the watermark FSM snapshot and per-
+/// camera occupancy strip used by the storage tab.
+export interface StorageHotSection {
+  recorder_kind: string;
+  panic: boolean;
+  clips_dir: string;
+  fs_total_bytes: number | null;
+  fs_used_bytes: number | null;
+  fs_free_bytes: number | null;
+  free_pct: number | null;
+  watermark_state: "ok" | "low" | "panic";
+  watermark_low_pct: number;
+  watermark_panic_pct: number;
+  per_camera: PerCameraClipStats[];
+}
+
+export interface PerCameraClipStats {
+  camera_id: CameraId;
+  clip_count: number;
+  bytes: number;
+  oldest_started_at: string;
+}
+
+export interface StorageResponse {
+  hot: StorageHotSection;
+  cold: ColdStatus | null;
+  backends: StorageBackendOut[];
+  /// Top-level mirror of `cold.cold_only_count`. Surfaced even when
+  /// `cold` is `null` so the storage tab can render the "N clips
+  /// cold-only" subtitle for previously-replicated clips.
+  cold_only_count: number;
+  /// M2.2 Phase 3 — USB hot-plug visibility.
+  usb: UsbSection;
+}
+
+/// Live snapshot of the engine's `usb_watch::UsbRegistry`. The
+/// recorder consults the same registry at clip-open time; this
+/// section lets the operator see (a) what's currently attached and
+/// (b) whether the configured `preferred_usb_label` is matched
+/// right now (preferred_active === true) or just listed in
+/// `nexus.toml` waiting for the volume to come back.
+export interface UsbSection {
+  attached: UsbVolumeOut[];
+  preferred_label: string | null;
+  preferred_active: boolean;
+}
+
+export interface UsbVolumeOut {
+  label: string;
+  /// Mount path **relative to `clips_dir`** (e.g. `usb/NEXUS_VAULT`).
+  mount_relpath: string;
+}
+
+/// `PUT /api/v1/admin/storage/cold` request body. `handle: null`
+/// disables cold replication; omitting `throttle_bps` keeps the
+/// current value (so the operator can switch backends without
+/// re-specifying bandwidth).
+export interface PutColdReq {
+  handle: string | null;
+  throttle_bps?: number | null;
+}
+
+/// `PUT /api/v1/admin/storage/backends/:handle` request body. The
+/// engine builds the backend before inserting, so an invalid `kind`
+/// or `config` returns 400 without dirtying the row.
+export interface PutBackendReq {
+  kind: string;
+  config: unknown;
+}
+
+// ---------------------------------------------------------------------------
+// M2.2 closeout — OAuth 3-leg auth-code flow for cloud cold-storage.
+// Mirrors crates/nexus-engine/src/api.rs `StartOAuthReq`/`StartOAuthResp`
+// /`OAuthStatusResp` (kept in lock-step; additive-only).
+// ---------------------------------------------------------------------------
+
+/// `POST /api/v1/admin/oauth/{provider}/start` body. `provider` is
+/// derived from the URL path. The handle/client_id/client_secret are
+/// the same values the operator would otherwise paste into the
+/// add-backend form; the engine stashes them in an in-memory pending
+/// session keyed by the returned `state` so the `/callback` handler
+/// can finish the upsert without the UI re-sending them.
+export interface OAuthStartReq {
+  handle: string;
+  client_id: string;
+  client_secret: string;
+  /// Optional `account_email` (gdrive) — passed through verbatim to
+  /// the backend `config` when the callback completes.
+  account_email?: string | null;
+  /// Optional `root_folder_id` — same treatment as `account_email`.
+  root_folder_id?: string | null;
+  /// Where the provider should redirect after consent. MUST exactly
+  /// match a redirect URI the operator pre-registered with the
+  /// provider; the engine echoes this verbatim to the token endpoint
+  /// during the code exchange.
+  redirect_uri: string;
+}
+
+/// `POST /api/v1/admin/oauth/{provider}/start` response. The UI
+/// opens `authorize_url` in a popup and polls `/status?state=` with
+/// the `state` token until the callback completes.
+export interface OAuthStartResp {
+  authorize_url: string;
+  state: string;
+  /// Server-side TTL of the pending session, in seconds. The UI
+  /// stops polling and surfaces a timeout banner when the local
+  /// clock exceeds this window.
+  expires_in_secs: number;
+}
+
+/// `GET /api/v1/admin/oauth/status?state=` response. Discriminated
+/// by `status`; `pending` is the in-progress state, `complete`
+/// arrives once `/callback` has encrypted + upserted the backend,
+/// `error` is terminal (the operator hits "Connect" again).
+export type OAuthStatusResp =
+  | { status: "pending" }
+  | { status: "complete"; handle: string }
+  | { status: "error"; message: string };
+
 export interface MotionEventRow {
   id: MotionEventId;
   camera_id: CameraId;

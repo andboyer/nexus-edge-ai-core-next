@@ -37,6 +37,9 @@ futures = { workspace = true }
 gstreamer = { workspace = true, optional = true }
 gstreamer-app = { workspace = true, optional = true }
 gstreamer-video = { workspace = true, optional = true }
+# M2.2: streaming hash for cold-replication. Same dep version as
+# `nexus-storage` to keep the workspace lock single-versioned.
+sha2 = "0.10"
 
 [dev-dependencies]
 tempfile = { workspace = true }

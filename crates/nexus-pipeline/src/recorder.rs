@@ -195,6 +195,106 @@ pub fn clip_rel_path(clips_dir: &Path, abs: &Path) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// USB hot-plug resolver — M2.2 Phase 3
+// ---------------------------------------------------------------------------
+
+/// Inversion-of-control trait the recorder uses to ask "is this USB
+/// label currently attached, and if so where under `clips_dir` is it
+/// mounted?". Implemented by `nexus_engine::usb_watch::UsbRegistry`;
+/// kept in this crate so the recorder doesn't depend on the engine.
+///
+/// `lookup` returns the USB volume's mount path **relative to the
+/// engine's `clips_dir`** (e.g. `"usb/NEXUS_VAULT"`). Returning
+/// `None` means "not attached right now" — the recorder treats that
+/// as a fall-through to the local hot tier.
+pub trait UsbResolver: Send + Sync {
+    fn lookup(&self, label: &str) -> Option<PathBuf>;
+}
+
+/// Shared, hot-mutable handle to the operator-selected preferred USB
+/// label. The engine constructs one of these at boot (seeded from
+/// the `engine_runtime_settings` table, falling back to
+/// `nexus.toml`) and shares clones with both the recorder and the
+/// admin API. Every clip-open reads the *current* value, so a
+/// `PUT /api/v1/admin/runtime/usb_preferred` takes effect on the
+/// next clip without restarting the engine.
+///
+/// `arc-swap` gives us a wait-free atomic read on the hot recorder
+/// path (`open()` reads the label once per clip — well off the
+/// per-frame fast path, but still synchronous so we don't want a
+/// `Mutex` here). Writes are admin-PUT-only and contend with no
+/// readers in practice.
+///
+/// `From<Option<String>>` is implemented so existing test callsites
+/// like `with_usb(resolver, Some("X".into()))` keep compiling — the
+/// label gets wrapped in a fresh, per-test handle that nothing else
+/// can mutate.
+#[derive(Clone, Default)]
+pub struct PreferredUsbLabel {
+    inner: Arc<arc_swap::ArcSwapOption<String>>,
+}
+
+impl PreferredUsbLabel {
+    /// Seed a new handle with the boot-time value.
+    pub fn new(initial: Option<String>) -> Self {
+        Self {
+            inner: Arc::new(arc_swap::ArcSwapOption::from(initial.map(Arc::new))),
+        }
+    }
+
+    /// Read the current label. Cheap — `arc-swap`'s `load_full`
+    /// bumps the inner Arc's refcount but doesn't acquire a lock.
+    pub fn get(&self) -> Option<String> {
+        self.inner.load_full().as_deref().map(|s| s.to_owned())
+    }
+
+    /// Atomically replace the label. Takes effect on the next
+    /// `open()` call across every clone.
+    pub fn set(&self, label: Option<String>) {
+        self.inner.store(label.map(Arc::new));
+    }
+}
+
+impl From<Option<String>> for PreferredUsbLabel {
+    fn from(initial: Option<String>) -> Self {
+        Self::new(initial)
+    }
+}
+
+impl std::fmt::Debug for PreferredUsbLabel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreferredUsbLabel")
+            .field("current", &self.get())
+            .finish()
+    }
+}
+
+/// Resolve the clip-output directory + matching `hot_handle` for a
+/// new clip. Pure function so it can be unit-tested without standing
+/// up a recorder.
+///
+/// Truth table:
+///
+/// | preferred_label | resolver       | lookup      | result                                                         |
+/// |-----------------|----------------|-------------|----------------------------------------------------------------|
+/// | `None`          | *              | *           | `(clips_dir.into(), "local")`                                  |
+/// | `Some(label)`   | `None`         | *           | `(clips_dir.into(), "local")`                                  |
+/// | `Some(label)`   | `Some(r)`      | `None`      | `(clips_dir.into(), "local")`                                  |
+/// | `Some(label)`   | `Some(r)`      | `Some(rel)` | `(clips_dir.join(rel), format!("usb-{label}"))`                |
+pub fn effective_clips_dir(
+    clips_dir: &Path,
+    preferred_label: Option<&str>,
+    resolver: Option<&dyn UsbResolver>,
+) -> (PathBuf, String) {
+    if let (Some(label), Some(r)) = (preferred_label, resolver) {
+        if let Some(mount_relpath) = r.lookup(label) {
+            return (clips_dir.join(mount_relpath), format!("usb-{label}"));
+        }
+    }
+    (clips_dir.to_path_buf(), "local".to_string())
+}
+
+// ---------------------------------------------------------------------------
 // StubClipRecorder
 // ---------------------------------------------------------------------------
 
@@ -215,6 +315,27 @@ pub struct StubClipRecorder {
     /// `path` belongs to a handle without doing a second store
     /// roundtrip. Keyed by `clip_id`.
     open: Mutex<std::collections::HashMap<ClipId, OpenState>>,
+    /// M2.2: optional bus for publishing `CLIP_CLOSED`. Stub clips
+    /// are 0-byte so the cold replicator skips them anyway (the
+    /// `mark_cold_replicated` path requires a non-NULL sha256), but
+    /// we publish the event so integration tests covering the
+    /// replicator wiring can use the stub recorder as a stand-in
+    /// for the gst pipeline.
+    bus: Option<Arc<dyn nexus_bus::Bus>>,
+    /// M2.2 Phase 3: optional USB resolver + preferred label. When
+    /// both are set and the resolver reports the label as attached
+    /// at `open()` time, the new clip is routed under the USB
+    /// volume's mount path and stamped with `hot_handle = "usb-<label>"`.
+    /// In-flight clips never migrate — the choice is locked in
+    /// at `open()` and recorded in [`OpenState`].
+    ///
+    /// `preferred_usb_label` is a [`PreferredUsbLabel`] handle
+    /// rather than a plain `Option<String>` so the admin API can
+    /// flip the label at runtime without restarting the engine
+    /// (M2.2 Phase 3 closeout). A `Default` handle (label `None`)
+    /// is functionally identical to the old static-`None` state.
+    usb_resolver: Option<Arc<dyn UsbResolver>>,
+    preferred_usb_label: PreferredUsbLabel,
 }
 
 #[derive(Debug, Clone)]
@@ -222,6 +343,15 @@ struct OpenState {
     camera_id: CameraId,
     started_at: DateTime<Utc>,
     path: PathBuf,
+    /// Directory the in-flight + final files live under. Equal to
+    /// `clips_dir` for `local` clips and to `clips_dir.join(mount_relpath)`
+    /// for USB clips. Cached on `open()` so `close()` writes the
+    /// final-name file in the same directory the partial was
+    /// written to (in-flight clips finish where they started).
+    effective_dir: PathBuf,
+    /// Hot handle stamped on the row at open + repeated on the
+    /// `CLIP_CLOSED` bus event. `"local"` or `"usb-<label>"`.
+    hot_handle: String,
 }
 
 impl StubClipRecorder {
@@ -231,13 +361,52 @@ impl StubClipRecorder {
             clips_dir: clips_dir.as_ref().to_path_buf(),
             panic: parking_lot::RwLock::new(false),
             open: Mutex::new(std::collections::HashMap::new()),
+            bus: None,
+            usb_resolver: None,
+            preferred_usb_label: PreferredUsbLabel::default(),
         }
     }
 
-    /// Path the recorder would write for `(camera_id, started_at)`.
-    /// Per M2.1 spec layout — see [`inflight_clip_path`]. Stage A
-    /// stub uses the same in-flight name as the GStreamer recorder
-    /// so the rename-on-close logic exercises the same path.
+    /// Attach a bus so the stub recorder publishes
+    /// `topic::CLIP_CLOSED` on every successful close. Builder
+    /// pattern keeps existing callsites that don't pass a bus
+    /// working unchanged.
+    pub fn with_bus(mut self, bus: Arc<dyn nexus_bus::Bus>) -> Self {
+        self.bus = Some(bus);
+        self
+    }
+
+    /// M2.2 Phase 3: attach a USB resolver + preferred-label so
+    /// new clips can be routed to a hot-tier USB volume. Both
+    /// arguments are required together — passing one without the
+    /// other is a no-op. Builder pattern keeps existing callsites
+    /// (and the gst-disabled fallback in `nexus-engine::main`)
+    /// working unchanged.
+    ///
+    /// `preferred_label` accepts anything that converts into a
+    /// [`PreferredUsbLabel`] — the engine passes a shared handle
+    /// it also gave to the admin API; tests pass a bare
+    /// `Some("X".to_string())` and get a fresh per-test handle
+    /// via the `From<Option<String>>` impl.
+    pub fn with_usb(
+        mut self,
+        resolver: Arc<dyn UsbResolver>,
+        preferred_label: impl Into<PreferredUsbLabel>,
+    ) -> Self {
+        self.usb_resolver = Some(resolver);
+        self.preferred_usb_label = preferred_label.into();
+        self
+    }
+
+    /// Path the recorder would write for `(camera_id, started_at)`
+    /// **on the local hot tier**. Per M2.1 spec layout — see
+    /// [`inflight_clip_path`]. Stage A stub uses the same in-flight
+    /// name as the GStreamer recorder so the rename-on-close logic
+    /// exercises the same path.
+    ///
+    /// Note: when USB routing is active this is *not* the path the
+    /// next clip will actually use; the USB-resolved directory is
+    /// computed inside `open()` and cached on the `OpenState`.
     pub fn clip_path(&self, camera_id: CameraId, started_at: DateTime<Utc>) -> PathBuf {
         inflight_clip_path(&self.clips_dir, camera_id, started_at)
     }
@@ -250,7 +419,20 @@ impl ClipRecorder for StubClipRecorder {
             return Err(RecorderError::Refused);
         }
 
-        let path = self.clip_path(args.camera_id, args.started_at);
+        // Resolve the hot tier (local vs. USB) at open time. The
+        // choice is locked into `OpenState` — close() will use the
+        // same `effective_dir` even if the USB volume detaches
+        // mid-recording. `preferred_usb_label.get()` reads the
+        // *current* admin-supplied label; a concurrent PUT can
+        // change it but won't affect any clip already open.
+        let preferred = self.preferred_usb_label.get();
+        let (effective_dir, hot_handle) = effective_clips_dir(
+            &self.clips_dir,
+            preferred.as_deref(),
+            self.usb_resolver.as_deref().map(|r| r as &dyn UsbResolver),
+        );
+
+        let path = inflight_clip_path(&effective_dir, args.camera_id, args.started_at);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).await?;
         }
@@ -263,15 +445,19 @@ impl ClipRecorder for StubClipRecorder {
             .open(&path)
             .await?;
 
+        // Path stored in DB is always relative to `clips_dir` (the
+        // top-level), so a USB-rooted clip looks like
+        // `usb/NEXUS_VAULT/<camera>/<date>/<file>.partial.mp4`. Reads
+        // resolve via `clips_dir.join(rel)` exactly as before.
         let rel = clip_rel_path(&self.clips_dir, &path);
 
         let new = NewClip {
             camera_id: args.camera_id,
             started_at: args.started_at,
-            path: rel,
+            hot_path: rel,
             codec: "stub".into(),
             container: "mp4".into(),
-            backend_id: "local".into(),
+            hot_handle: hot_handle.clone(),
         };
         let clip_id = self.store.open_clip(&new).await?;
 
@@ -281,6 +467,8 @@ impl ClipRecorder for StubClipRecorder {
                 camera_id: args.camera_id,
                 started_at: args.started_at,
                 path,
+                effective_dir,
+                hot_handle,
             },
         );
         debug!(
@@ -345,7 +533,7 @@ impl ClipRecorder for StubClipRecorder {
         // `{start_ms}_{duration_ms}.mp4` shape, stat for size, stamp
         // the row.
         let final_abs = final_clip_path(
-            &self.clips_dir,
+            &state.effective_dir,
             state.camera_id,
             state.started_at,
             duration_ms,
@@ -380,6 +568,10 @@ impl ClipRecorder for StubClipRecorder {
             }
         };
 
+        // Snapshot for the post-close bus publish (rel is moved into
+        // ClipClose below).
+        let rel_for_event = rel.clone();
+
         self.store
             .close_clip(
                 handle.clip_id,
@@ -387,7 +579,10 @@ impl ClipRecorder for StubClipRecorder {
                     ended_at: args.ended_at,
                     duration_ms,
                     size_bytes,
-                    path: Some(rel),
+                    hot_path: Some(rel),
+                    // Stub recorder skips the streaming hash —
+                    // its 0-byte output is meaningless to replicate.
+                    sha256: None,
                 },
             )
             .await?;
@@ -398,6 +593,28 @@ impl ClipRecorder for StubClipRecorder {
             duration_ms,
             "stub recorder closed clip"
         );
+
+        // M2.2: best-effort CLIP_CLOSED publish; sha256 is null so
+        // the cold replicator will skip until/unless an operator
+        // opts into a one-shot rehash sweep.
+        if let Some(bus) = &self.bus {
+            let payload = serde_json::json!({
+                "clip_id": handle.clip_id,
+                "camera_id": state.camera_id,
+                "hot_handle": state.hot_handle,
+                "hot_path": rel_for_event,
+                "size_bytes": size_bytes,
+                "sha256": serde_json::Value::Null,
+            });
+            use nexus_bus::BusExt;
+            if let Err(e) = bus.publish(nexus_bus::topic::CLIP_CLOSED, &payload).await {
+                debug!(
+                    clip_id = handle.clip_id,
+                    error = %e,
+                    "stub recorder: publish CLIP_CLOSED failed (replicator will catch up)"
+                );
+            }
+        }
         Ok(ClipMeta {
             clip_id: handle.clip_id,
             camera_id: state.camera_id,
@@ -481,15 +698,19 @@ mod tests {
 
         // File exists on disk + clip row exists in the DB.
         let row = store.get_clip(handle.clip_id).await.unwrap().unwrap();
-        let path_on_disk = clips_dir.join(&row.path);
+        let hot_path = row.hot_path.as_deref().expect("in-flight clip is hot");
+        let path_on_disk = clips_dir.join(hot_path);
         assert!(path_on_disk.exists(), "stub clip file should be created");
         assert!(
-            row.path.ends_with(".partial.mp4"),
-            "in-flight clip should use the spec'd `.partial.mp4` suffix; got {}",
-            row.path
+            hot_path.ends_with(".partial.mp4"),
+            "in-flight clip should use the spec'd `.partial.mp4` suffix; got {hot_path}"
         );
         assert_eq!(row.codec, "stub");
-        assert_eq!(row.backend_id, "local");
+        assert_eq!(row.hot_handle.as_deref(), Some("local"));
+        assert!(
+            row.cold_handle.is_none(),
+            "new clip must be hot-only; cold filled by replicator"
+        );
         assert!(row.ended_at.is_none(), "ended_at unset until close");
 
         let ended = started + chrono::Duration::seconds(7);
@@ -505,21 +726,23 @@ mod tests {
         assert_eq!(row_closed.duration_ms, 7_000);
         assert_eq!(row_closed.size_bytes, 0);
         assert!(row_closed.ended_at.is_some());
-        // The DB row's path should be the FINAL renamed path
+        let closed_hot = row_closed
+            .hot_path
+            .as_deref()
+            .expect("closed clip is still hot");
+        // The DB row's hot_path should be the FINAL renamed path
         // (`{start_ms}_{duration_ms}.mp4`), not the in-flight name.
         assert!(
-            row_closed.path.ends_with("_7000.mp4"),
-            "closed clip should be renamed to the spec layout; got {}",
-            row_closed.path
+            closed_hot.ends_with("_7000.mp4"),
+            "closed clip should be renamed to the spec layout; got {closed_hot}"
         );
         assert!(
-            !row_closed.path.contains(".partial."),
-            "closed clip path must not retain `.partial.`: {}",
-            row_closed.path
+            !closed_hot.contains(".partial."),
+            "closed clip path must not retain `.partial.`: {closed_hot}"
         );
         // The renamed file must exist on disk; the in-flight name must not.
         assert!(
-            clips_dir.join(&row_closed.path).exists(),
+            clips_dir.join(closed_hot).exists(),
             "renamed clip file should exist on disk"
         );
     }
@@ -681,5 +904,162 @@ mod tests {
             s1.ends_with(&format!("{expected_ms}.partial.mp4")),
             "path tail wrong: {s1}"
         );
+    }
+
+    // ---- M2.2 Phase 3 — USB hot-plug routing ----
+
+    /// Test fake for the [`UsbResolver`] trait. Tests mutate
+    /// `attached` directly to simulate the `usb_watch` task seeing
+    /// a volume appear or disappear between two recorder opens.
+    #[derive(Default)]
+    struct FakeUsbResolver {
+        attached: parking_lot::RwLock<std::collections::HashMap<String, PathBuf>>,
+    }
+
+    impl FakeUsbResolver {
+        fn attach(&self, label: &str, mount_relpath: PathBuf) {
+            self.attached
+                .write()
+                .insert(label.to_string(), mount_relpath);
+        }
+        fn detach(&self, label: &str) {
+            self.attached.write().remove(label);
+        }
+    }
+
+    impl UsbResolver for FakeUsbResolver {
+        fn lookup(&self, label: &str) -> Option<PathBuf> {
+            self.attached.read().get(label).cloned()
+        }
+    }
+
+    #[test]
+    fn effective_clips_dir_truth_table() {
+        let clips_dir = PathBuf::from("/var/lib/nexus/clips");
+        let resolver = FakeUsbResolver::default();
+        resolver.attach("NEXUS_VAULT", PathBuf::from("usb/NEXUS_VAULT"));
+
+        // No preferred label → always local.
+        assert_eq!(
+            effective_clips_dir(&clips_dir, None, Some(&resolver)),
+            (clips_dir.clone(), "local".to_string())
+        );
+
+        // Preferred label but no resolver → local (recorder built
+        // without USB support, e.g. test harness).
+        assert_eq!(
+            effective_clips_dir(&clips_dir, Some("NEXUS_VAULT"), None),
+            (clips_dir.clone(), "local".to_string())
+        );
+
+        // Preferred label set, resolver doesn't know about it →
+        // local (volume not currently attached).
+        assert_eq!(
+            effective_clips_dir(&clips_dir, Some("NEXUS_OTHER"), Some(&resolver)),
+            (clips_dir.clone(), "local".to_string())
+        );
+
+        // Preferred label set + attached → USB.
+        let (effective, handle) =
+            effective_clips_dir(&clips_dir, Some("NEXUS_VAULT"), Some(&resolver));
+        assert_eq!(effective, clips_dir.join("usb/NEXUS_VAULT"));
+        assert_eq!(handle, "usb-NEXUS_VAULT");
+    }
+
+    #[tokio::test]
+    async fn stub_recorder_routes_to_usb_after_attach() {
+        let (store, _dir, clips_dir) = fresh_store_and_dir().await;
+        // Seed the storage_backends row the schema FK demands.
+        // In production the `usb_watch` task does this when the
+        // volume first appears; here we do it inline so the test
+        // doesn't need to spin up the watcher.
+        store
+            .upsert_storage_backend("usb-NEXUS_VAULT", "usb", "{}")
+            .await
+            .unwrap();
+        let resolver = Arc::new(FakeUsbResolver::default());
+        let rec = StubClipRecorder::new(store.clone(), &clips_dir)
+            .with_usb(resolver.clone(), Some("NEXUS_VAULT".to_string()));
+
+        // Open #1: volume not yet attached → must land local.
+        let t1 = Utc::now();
+        let h1 = rec
+            .open(OpenClip {
+                camera_id: 1,
+                started_at: t1,
+            })
+            .await
+            .unwrap();
+        let row1 = store.get_clip(h1.clip_id).await.unwrap().unwrap();
+        assert_eq!(
+            row1.hot_handle.as_deref(),
+            Some("local"),
+            "with no USB attached, hot_handle must be `local`"
+        );
+        let hot_path1 = row1.hot_path.as_deref().unwrap();
+        assert!(
+            !hot_path1.starts_with("usb/"),
+            "local clip path must not start with usb/: {hot_path1}"
+        );
+
+        // Mid-stream: volume appears.
+        resolver.attach("NEXUS_VAULT", PathBuf::from("usb/NEXUS_VAULT"));
+
+        // Open #2: routed to USB.
+        let t2 = t1 + chrono::Duration::seconds(1);
+        let h2 = rec
+            .open(OpenClip {
+                camera_id: 1,
+                started_at: t2,
+            })
+            .await
+            .unwrap();
+        let row2 = store.get_clip(h2.clip_id).await.unwrap().unwrap();
+        assert_eq!(
+            row2.hot_handle.as_deref(),
+            Some("usb-NEXUS_VAULT"),
+            "newly-attached USB volume must be picked up on the next open"
+        );
+        let hot_path2 = row2.hot_path.as_deref().unwrap();
+        assert!(
+            hot_path2.starts_with("usb/NEXUS_VAULT/"),
+            "USB clip path must be relative to clips_dir under the mount: {hot_path2}"
+        );
+        // The on-disk file must exist under the USB-mount subdir
+        // of clips_dir, NOT directly under clips_dir.
+        assert!(
+            clips_dir.join(hot_path2).exists(),
+            "USB clip file should live under {:?}",
+            clips_dir.join(hot_path2)
+        );
+
+        // Detach mid-recording must NOT migrate the in-flight clip.
+        // close() must finish at the same path open() chose.
+        resolver.detach("NEXUS_VAULT");
+        let ended = t2 + chrono::Duration::seconds(5);
+        let meta2 = rec.close(h2, ClipFinal { ended_at: ended }).await.unwrap();
+        assert!(!meta2.discarded);
+        let row2_closed = store.get_clip(h2.clip_id).await.unwrap().unwrap();
+        let closed_hot = row2_closed.hot_path.as_deref().unwrap();
+        assert!(
+            closed_hot.starts_with("usb/NEXUS_VAULT/"),
+            "in-flight USB clip must finish on USB even after detach: {closed_hot}"
+        );
+        assert_eq!(
+            row2_closed.hot_handle.as_deref(),
+            Some("usb-NEXUS_VAULT"),
+            "hot_handle must NOT change at close time"
+        );
+        // And after detach, a brand-new open must fall back to local.
+        let t3 = ended + chrono::Duration::seconds(1);
+        let h3 = rec
+            .open(OpenClip {
+                camera_id: 1,
+                started_at: t3,
+            })
+            .await
+            .unwrap();
+        let row3 = store.get_clip(h3.clip_id).await.unwrap().unwrap();
+        assert_eq!(row3.hot_handle.as_deref(), Some("local"));
     }
 }

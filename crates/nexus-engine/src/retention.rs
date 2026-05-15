@@ -118,17 +118,30 @@ pub async fn sweep_once(
     // ---- 1. Retention ----
     let stale = store.clips_older_than(cutoff, RETENTION_BATCH_SIZE).await?;
     for clip in &stale {
-        let abs = clips_dir.join(&clip.path);
-        match tokio::fs::remove_file(&abs).await {
-            Ok(()) => debug!(clip_id = clip.id, path = %abs.display(), "retention unlinked file"),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                debug!(clip_id = clip.id, "retention: file already gone");
+        // Best-effort unlink the hot file. Soft-evicted clips have no
+        // hot pointer; the cascade-delete below still tears down the
+        // metadata. Cold-replicated rows are NOT special-cased here
+        // because retention is a deliberate horizon eviction —
+        // operators set the horizon precisely to discard everything
+        // past it, including cold copies (the cold backend is then
+        // responsible for its own retention; the replicator never
+        // deletes from cold). Phase 4 may revisit if customers want
+        // "keep cold forever" semantics.
+        if let Some(hot_path) = clip.hot_path.as_deref() {
+            let abs = clips_dir.join(hot_path);
+            match tokio::fs::remove_file(&abs).await {
+                Ok(()) => {
+                    debug!(clip_id = clip.id, path = %abs.display(), "retention unlinked file")
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    debug!(clip_id = clip.id, "retention: file already gone");
+                }
+                Err(e) => warn!(
+                    clip_id = clip.id,
+                    error = %e,
+                    "retention: remove_file failed; deleting metadata anyway"
+                ),
             }
-            Err(e) => warn!(
-                clip_id = clip.id,
-                error = %e,
-                "retention: remove_file failed; deleting metadata anyway"
-            ),
         }
         store.cascade_delete_clip_metadata(clip.id).await?;
         out.evicted += 1;
@@ -136,7 +149,7 @@ pub async fn sweep_once(
 
     // ---- 2. Orphan-file scan ----
     let known: HashSet<PathBuf> = store
-        .known_clip_paths()
+        .known_local_clip_paths()
         .await?
         .into_iter()
         .map(|p| clips_dir.join(p))
@@ -253,10 +266,10 @@ mod tests {
             .open_clip(&NewClip {
                 camera_id,
                 started_at: started,
-                path: rel_name.into(),
+                hot_path: rel_name.into(),
                 codec: "stub".into(),
                 container: "mp4".into(),
-                backend_id: "local".into(),
+                hot_handle: "local".into(),
             })
             .await
             .unwrap();

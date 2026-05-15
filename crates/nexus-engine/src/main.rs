@@ -12,9 +12,14 @@ use nexus_store::Store;
 use nexus_tracker::build_tracker;
 use tracing::{info, warn};
 
+mod admin_auth;
 mod api;
+mod cold_read_cache;
+mod cold_replicator;
+mod oauth_sessions;
 mod retention;
 mod storage_safety;
+mod usb_watch;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -106,14 +111,53 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
     if let Err(e) = tokio::fs::create_dir_all(&clips_dir).await {
         warn!(path = %clips_dir.display(), error = %e, "could not pre-create clips_dir");
     }
+
+    // M2.2 Phase 3: USB hot-plug registry + watcher. Constructed
+    // BEFORE the recorder so the recorder builder can clone the
+    // registry. The watcher polls `<clips_dir>/usb/` for `NEXUS_*`
+    // mounts and updates the registry the recorder consults at
+    // open() time. None preferred_label means USB tiering is
+    // observable (the API surfaces attached volumes) but no clip
+    // is ever routed to USB until the operator sets a preferred
+    // label in `nexus.toml`.
+    let usb_registry = usb_watch::UsbRegistry::new();
+    let usb_resolver: Arc<dyn nexus_pipeline::recorder::UsbResolver> =
+        Arc::new(usb_registry.clone());
+    // The preferred USB label is now a runtime-mutable handle:
+    //   1. `engine_runtime_settings` (admin override) takes
+    //      precedence; a NULL row means "explicitly cleared".
+    //   2. Falling back to `cfg.runtime.clips.preferred_usb_label`
+    //      preserves TOML-only deployments that haven't touched
+    //      the new admin endpoint.
+    //
+    // The handle is shared between the recorder (reads on every
+    // `open()`) and the API (mutates via PUT /admin/runtime/usb_preferred).
+    let initial_label = match store.read_runtime_setting("preferred_usb_label").await {
+        Ok(Some(stored)) => stored, // Some(Some(s)) -> Some(s); Some(None) -> None (explicit clear)
+        Ok(None) => cfg.runtime.clips.preferred_usb_label.clone(),
+        Err(e) => {
+            warn!(error = %e, "could not read preferred_usb_label from engine_runtime_settings; falling back to TOML");
+            cfg.runtime.clips.preferred_usb_label.clone()
+        }
+    };
+    let preferred_usb_label =
+        nexus_pipeline::recorder::PreferredUsbLabel::new(initial_label.clone());
+
     let recorder: Arc<dyn nexus_pipeline::ClipRecorder> = build_recorder(
         &cfg.runtime.clips.recorder,
         store.clone(),
         &clips_dir,
         &cameras,
         cfg.runtime.clips.pre_roll_secs,
+        bus.clone(),
+        usb_resolver.clone(),
+        preferred_usb_label.clone(),
     )?;
-    info!(kind = recorder.kind(), "clip recorder constructed");
+    info!(
+        kind = recorder.kind(),
+        preferred_usb_label = ?initial_label,
+        "clip recorder constructed"
+    );
 
     let mut handles = Vec::new();
     for cam in cameras {
@@ -154,16 +198,59 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
         std::sync::Arc::new(storage_safety::StatvfsProbe {
             path: clips_dir.clone(),
         });
+    let watermark_signal = storage_safety::WatermarkSignal::new();
     let safety_handle = {
         let recorder = recorder.clone();
         let store = store.clone();
         let bus = bus.clone();
+        let signal = watermark_signal.clone();
         tokio::spawn(async move {
             if let Err(e) =
-                storage_safety::run_storage_safety(safety_cfg, probe, recorder, store, bus).await
+                storage_safety::run_storage_safety(safety_cfg, probe, recorder, store, bus, signal)
+                    .await
             {
                 tracing::error!(error = %e, "storage safety loop exited");
             }
+        })
+    };
+
+    // M2.2 cold-mirror replicator. Hydrate the registry from the
+    // `storage_backends` table at boot and spawn the follower task.
+    // The registry is shared (cheap Arc clone) — the API layer can
+    // call `Registry::replace_all` after mutating storage_backends
+    // to live-update without restarting the engine.
+    let registry = nexus_storage::Registry::new();
+    match store.list_storage_backends().await {
+        Ok(rows) => {
+            let mut backends = Vec::with_capacity(rows.len());
+            for row in rows {
+                match nexus_storage::build_backend(&row.handle, &row.kind, &row.config_json) {
+                    Ok(b) => backends.push(b),
+                    Err(e) => warn!(
+                        handle = %row.handle,
+                        kind = %row.kind,
+                        error = %e,
+                        "cold replicator: skipping backend that failed to build"
+                    ),
+                }
+            }
+            registry.replace_all(backends);
+        }
+        Err(e) => warn!(error = %e, "cold replicator: list_storage_backends failed at boot"),
+    }
+    let (cold_shutdown_tx, cold_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let cold_handle = {
+        let store = store.clone();
+        let bus = bus.clone();
+        let registry = registry.clone();
+        let cfg = cold_replicator::ColdReplicatorConfig {
+            clips_dir: clips_dir.clone(),
+        };
+        tokio::spawn(async move {
+            cold_replicator::run_cold_replicator(cfg, store, bus, registry, async {
+                let _ = cold_shutdown_rx.await;
+            })
+            .await;
         })
     };
 
@@ -187,6 +274,31 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
         })
     };
 
+    // M2.2 Phase 3: USB hot-plug watcher. Polls `<clips_dir>/usb/`
+    // for `NEXUS_*`-labeled subdirectories every 5s and updates
+    // `usb_registry` so the recorder + API see attach/detach
+    // events promptly.
+    let (usb_shutdown_tx, usb_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let usb_watch_handle = {
+        let cfg = usb_watch::UsbWatchConfig::new(&clips_dir);
+        let registry = usb_registry.clone();
+        let store_for_watch = store.clone();
+        let bus = bus.clone();
+        tokio::spawn(async move {
+            usb_watch::run_usb_watch(cfg, registry, store_for_watch, bus, async {
+                let _ = usb_shutdown_rx.await;
+            })
+            .await;
+        })
+    };
+
+    let cache_jobs = cold_read_cache::CacheJobs::new(
+        store.clone(),
+        registry.clone(),
+        clips_dir.clone(),
+        watermark_signal.clone(),
+    );
+
     let api_state = api::ApiState {
         store: store.clone(),
         bus: bus.clone(),
@@ -197,6 +309,23 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
         clips_dir: clips_dir.clone(),
         low_watermark_pct: cfg.runtime.clips.low_watermark_pct,
         panic_watermark_pct: cfg.runtime.clips.panic_watermark_pct,
+        registry: registry.clone(),
+        cache_jobs: cache_jobs.clone(),
+        usb_registry: usb_registry.clone(),
+        preferred_usb_label: preferred_usb_label.clone(),
+        // M2.2 closeout — in-memory pending-session cache for the
+        // OAuth auth-code dance. Empty at boot; lives only as long
+        // as the process. Operators who restart mid-consent just
+        // retry from the UI.
+        oauth_sessions: oauth_sessions::OAuthSessions::new(),
+        // HS256 bearer state — see `admin_auth` module docs.
+        // Boot fails closed if `auth.admin_secret_path` points at
+        // an unreadable file; absence of the path is the expected
+        // state for LAN-only / single-box deployments.
+        admin_auth: std::sync::Arc::new(
+            admin_auth::AdminAuthState::from_config(&cfg.auth)
+                .context("building admin-auth state")?,
+        ),
     };
 
     if !cli.no_api {
@@ -204,8 +333,17 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
         let app = api::router(api_state);
         let listener = tokio::net::TcpListener::bind(&bind).await?;
         info!(bind = %bind, "HTTP API + UI listening");
+        // `into_make_service_with_connect_info::<SocketAddr>()`
+        // is required so the admin-auth middleware can pull the
+        // peer address out of request extensions for the
+        // loopback-fallback check (see admin_auth module).
         let server = tokio::spawn(async move {
-            if let Err(e) = axum::serve(listener, app.into_make_service()).await {
+            if let Err(e) = axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            {
                 tracing::error!("axum error: {e}");
             }
         });
@@ -217,8 +355,12 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
     }
 
     safety_handle.abort();
+    let _ = cold_shutdown_tx.send(());
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), cold_handle).await;
     let _ = retention_shutdown_tx.send(());
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), retention_handle).await;
+    let _ = usb_shutdown_tx.send(());
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), usb_watch_handle).await;
     for h in handles {
         h.task.abort();
     }
@@ -249,18 +391,34 @@ fn log_inference_summary(cfg: &InferenceConfig, has_pool: bool, router: &Inferen
 /// the engine logs an error + falls back to `Stub` so a misconfigured
 /// box still records *something* (0-byte placeholder files) instead of
 /// failing to boot.
+// Single internal scaffolding fn — pulling the eight wires through a
+// struct just to satisfy the lint costs more clarity than it buys.
+#[allow(clippy::too_many_arguments)]
 fn build_recorder(
     kind: &RecorderKind,
     store: Arc<nexus_store::Store>,
     clips_dir: &std::path::Path,
     cameras: &[CameraConfig],
     pre_roll_secs: u32,
+    bus: Arc<dyn nexus_bus::Bus>,
+    usb_resolver: Arc<dyn nexus_pipeline::recorder::UsbResolver>,
+    preferred_usb_label: nexus_pipeline::recorder::PreferredUsbLabel,
 ) -> Result<Arc<dyn nexus_pipeline::ClipRecorder>> {
     match kind {
-        RecorderKind::Stub => Ok(Arc::new(nexus_pipeline::StubClipRecorder::new(
-            store, clips_dir,
-        ))),
-        RecorderKind::Gstreamer => build_gst_recorder(store, clips_dir, cameras, pre_roll_secs),
+        RecorderKind::Stub => Ok(Arc::new(
+            nexus_pipeline::StubClipRecorder::new(store, clips_dir)
+                .with_bus(bus)
+                .with_usb(usb_resolver, preferred_usb_label),
+        )),
+        RecorderKind::Gstreamer => build_gst_recorder(
+            store,
+            clips_dir,
+            cameras,
+            pre_roll_secs,
+            bus,
+            usb_resolver,
+            preferred_usb_label,
+        ),
     }
 }
 
@@ -270,6 +428,9 @@ fn build_gst_recorder(
     clips_dir: &std::path::Path,
     cameras: &[CameraConfig],
     pre_roll_secs: u32,
+    bus: Arc<dyn nexus_bus::Bus>,
+    usb_resolver: Arc<dyn nexus_pipeline::recorder::UsbResolver>,
+    preferred_usb_label: nexus_pipeline::recorder::PreferredUsbLabel,
 ) -> Result<Arc<dyn nexus_pipeline::ClipRecorder>> {
     // Build one always-on PreRollIngester per enabled camera. The
     // ingester holds the only RTSP connection for that camera; the
@@ -299,7 +460,9 @@ fn build_gst_recorder(
         }
     }
     let rec = nexus_pipeline::GstClipRecorder::new(store, clips_dir, ingesters)
-        .map_err(|e| anyhow::anyhow!("GstClipRecorder::new: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("GstClipRecorder::new: {e}"))?
+        .with_bus(bus)
+        .with_usb(usb_resolver, preferred_usb_label);
     Ok(Arc::new(rec))
 }
 
@@ -309,15 +472,20 @@ fn build_gst_recorder(
     clips_dir: &std::path::Path,
     _cameras: &[CameraConfig],
     _pre_roll_secs: u32,
+    bus: Arc<dyn nexus_bus::Bus>,
+    usb_resolver: Arc<dyn nexus_pipeline::recorder::UsbResolver>,
+    preferred_usb_label: nexus_pipeline::recorder::PreferredUsbLabel,
 ) -> Result<Arc<dyn nexus_pipeline::ClipRecorder>> {
     tracing::error!(
         "config selected RecorderKind::Gstreamer but this build was compiled without \
          --features gstreamer; falling back to StubClipRecorder. Rebuild nexus-engine with \
          the gstreamer feature to record real video."
     );
-    Ok(Arc::new(nexus_pipeline::StubClipRecorder::new(
-        store, clips_dir,
-    )))
+    Ok(Arc::new(
+        nexus_pipeline::StubClipRecorder::new(store, clips_dir)
+            .with_bus(bus)
+            .with_usb(usb_resolver, preferred_usb_label),
+    ))
 }
 
 async fn wait_for_signal() {

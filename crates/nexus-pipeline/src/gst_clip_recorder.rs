@@ -107,12 +107,34 @@ pub struct GstClipRecorder {
     /// because the close path awaits on the pump shutdown and the
     /// bus drain.
     open: Mutex<HashMap<ClipId, OpenState>>,
+    /// M2.2: optional bus for publishing `CLIP_CLOSED` so the cold
+    /// replicator can pick up new clips event-driven instead of
+    /// waiting on its 5-min polling backstop. None in tests that
+    /// don't care about cold-mirror; the close path skips publish
+    /// when None.
+    bus: Option<Arc<dyn nexus_bus::Bus>>,
+    /// M2.2 Phase 3: optional USB resolver + preferred label. See
+    /// [`crate::recorder::effective_clips_dir`] for the routing
+    /// truth table. None on resolver disables USB tiering and
+    /// every clip lands on the local hot tier. The label handle is
+    /// shared with the admin API — see
+    /// [`crate::recorder::PreferredUsbLabel`] for the rationale.
+    usb_resolver: Option<Arc<dyn crate::recorder::UsbResolver>>,
+    preferred_usb_label: crate::recorder::PreferredUsbLabel,
 }
 
 struct OpenState {
     camera_id: CameraId,
     started_at: DateTime<Utc>,
     path: PathBuf,
+    /// Hot-tier directory the in-flight + final files live under.
+    /// Cached at `open()` so `close()` writes the renamed file in
+    /// the same dir even if a USB volume detached mid-recording
+    /// (in-flight clips finish where they started).
+    effective_dir: PathBuf,
+    /// `"local"` or `"usb-<label>"`. Stamped on the row at open and
+    /// repeated on the `CLIP_CLOSED` bus event.
+    hot_handle: String,
     pipeline: gst::Pipeline,
     appsrc: AppSrc,
     /// Signals the live-pump task to stop forwarding broadcast
@@ -141,7 +163,37 @@ impl GstClipRecorder {
             ingesters,
             panic: PlMutex::new(false),
             open: Mutex::new(HashMap::new()),
+            bus: None,
+            usb_resolver: None,
+            preferred_usb_label: crate::recorder::PreferredUsbLabel::default(),
         })
+    }
+
+    /// Attach a bus so the recorder publishes `topic::CLIP_CLOSED`
+    /// on every successful normal-path close. Builder pattern so
+    /// existing callsites that don't yet pass a bus keep working.
+    pub fn with_bus(mut self, bus: Arc<dyn nexus_bus::Bus>) -> Self {
+        self.bus = Some(bus);
+        self
+    }
+
+    /// M2.2 Phase 3: attach a USB resolver + preferred label so
+    /// new clips can be routed to a hot-tier USB volume. Both
+    /// arguments are required together. Builder pattern so
+    /// existing callsites that don't yet care about USB keep
+    /// working unchanged.
+    ///
+    /// `preferred_label` accepts anything that converts into a
+    /// [`crate::recorder::PreferredUsbLabel`] — the engine passes a
+    /// shared handle; tests pass a bare `Some("X".to_string())`.
+    pub fn with_usb(
+        mut self,
+        resolver: Arc<dyn crate::recorder::UsbResolver>,
+        preferred_label: impl Into<crate::recorder::PreferredUsbLabel>,
+    ) -> Self {
+        self.usb_resolver = Some(resolver);
+        self.preferred_usb_label = preferred_label.into();
+        self
     }
 
     /// In-flight path the recorder will write for `(camera_id,
@@ -238,7 +290,22 @@ impl ClipRecorder for GstClipRecorder {
             }
         };
 
-        let path = self.clip_path(args.camera_id, args.started_at);
+        // Resolve USB hot-tier routing once at open(). The choice
+        // is captured into `OpenState` so close() finishes the clip
+        // in the same dir even if the volume detaches mid-recording.
+        // `preferred_usb_label.get()` reads the *current* admin
+        // setting; an in-flight clip ignores subsequent PUTs.
+        let preferred = self.preferred_usb_label.get();
+        let (effective_dir, hot_handle) = crate::recorder::effective_clips_dir(
+            &self.clips_dir,
+            preferred.as_deref(),
+            self.usb_resolver
+                .as_deref()
+                .map(|r| r as &dyn crate::recorder::UsbResolver),
+        );
+
+        let path =
+            crate::recorder::inflight_clip_path(&effective_dir, args.camera_id, args.started_at);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).await?;
         }
@@ -314,10 +381,13 @@ impl ClipRecorder for GstClipRecorder {
         let new = NewClip {
             camera_id: args.camera_id,
             started_at: args.started_at,
-            path: rel,
+            hot_path: rel,
             codec: CODEC.into(),
             container: CONTAINER.into(),
-            backend_id: "local".into(),
+            // M2.2: "local" or "usb-<label>" depending on the hot
+            // tier resolution above. Cold pointer is left null for
+            // the replicator to fill in after the close-time hash.
+            hot_handle: hot_handle.clone(),
         };
         let clip_id = match self.store.open_clip(&new).await {
             Ok(id) => id,
@@ -350,6 +420,8 @@ impl ClipRecorder for GstClipRecorder {
                 camera_id: args.camera_id,
                 started_at: args.started_at,
                 path,
+                effective_dir,
+                hot_handle,
                 pipeline,
                 appsrc,
                 pump_stop: Some(pump_stop_tx),
@@ -476,7 +548,7 @@ impl ClipRecorder for GstClipRecorder {
         // Normal close path: rename in-flight file to spec layout
         // `{start_ms}_{duration_ms}.mp4`, stat for size, stamp the row.
         let final_abs = crate::recorder::final_clip_path(
-            &self.clips_dir,
+            &state.effective_dir,
             state.camera_id,
             state.started_at,
             duration_ms,
@@ -508,6 +580,30 @@ impl ClipRecorder for GstClipRecorder {
             }
         };
 
+        // M2.2: hash the closed mp4 so the cold replicator knows what
+        // bytes it's about to copy. Done in a blocking task to keep
+        // the tokio worker pool free; mp4 clips are typically <50 MB
+        // so the wall-clock cost is sub-100 ms on modern SSDs. A
+        // hash failure is logged and stored as NULL — the replicator
+        // skips NULL-sha256 rows on the next tick rather than copy
+        // an unverified blob.
+        let sha256 = match hash_file_sha256(&final_used).await {
+            Ok(hex) => Some(hex),
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    path = %final_used.display(),
+                    "gst recorder: sha256 of closed clip failed; cold replicator will skip"
+                );
+                None
+            }
+        };
+
+        // Snapshot fields we want to publish AFTER moving them into
+        // ClipClose below.
+        let rel_for_event = rel.clone();
+        let sha256_for_event = sha256.clone();
+
         self.store
             .close_clip(
                 handle.clip_id,
@@ -515,7 +611,8 @@ impl ClipRecorder for GstClipRecorder {
                     ended_at: args.ended_at,
                     duration_ms,
                     size_bytes,
-                    path: Some(rel),
+                    hot_path: Some(rel),
+                    sha256,
                 },
             )
             .await?;
@@ -527,6 +624,30 @@ impl ClipRecorder for GstClipRecorder {
             size_bytes,
             "gst recorder closed clip"
         );
+
+        // M2.2: notify the cold replicator. Best-effort — a missing
+        // bus, a serialize failure, or zero subscribers MUST NOT
+        // fail the close (the row is already on disk and the 5-min
+        // polling backstop will pick it up regardless).
+        if let Some(bus) = &self.bus {
+            let payload = serde_json::json!({
+                "clip_id": handle.clip_id,
+                "camera_id": state.camera_id,
+                "hot_handle": state.hot_handle,
+                "hot_path": rel_for_event,
+                "size_bytes": size_bytes,
+                "sha256": sha256_for_event,
+            });
+            use nexus_bus::BusExt;
+            if let Err(e) = bus.publish(nexus_bus::topic::CLIP_CLOSED, &payload).await {
+                debug!(
+                    clip_id = handle.clip_id,
+                    error = %e,
+                    "publish CLIP_CLOSED failed (replicator will catch up via polling backstop)"
+                );
+            }
+        }
+
         Ok(ClipMeta {
             clip_id: handle.clip_id,
             camera_id: state.camera_id,
@@ -554,6 +675,34 @@ impl ClipRecorder for GstClipRecorder {
     fn kind(&self) -> &'static str {
         "gstreamer"
     }
+}
+
+/// Compute the lower-case hex sha256 of `path`. Reads the file in
+/// 1 MiB chunks on a blocking task so the tokio worker pool stays
+/// free while a 50 MB clip hashes (~50 ms on NVMe). Surfaced as an
+/// `io::Error` on any failure so the caller can swallow it (and
+/// store sha256=NULL) without leaking a Box<dyn Error>.
+async fn hash_file_sha256(path: &Path) -> std::io::Result<String> {
+    use sha2::{Digest, Sha256};
+    use tokio::io::AsyncReadExt;
+
+    let mut f = tokio::fs::File::open(path).await?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 1 << 20]; // 1 MiB
+    loop {
+        let n = f.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for b in digest {
+        use std::fmt::Write;
+        let _ = write!(hex, "{b:02x}");
+    }
+    Ok(hex)
 }
 
 /// Push one [`NalSample`] into appsrc, rebasing PTS/DTS so the

@@ -129,6 +129,85 @@ pub enum WatermarkLevel {
     Panic,
 }
 
+impl WatermarkLevel {
+    fn as_u8(self) -> u8 {
+        match self {
+            WatermarkLevel::Ok => 0,
+            WatermarkLevel::Low => 1,
+            WatermarkLevel::Panic => 2,
+        }
+    }
+    fn from_u8(v: u8) -> Self {
+        match v {
+            0 => WatermarkLevel::Ok,
+            1 => WatermarkLevel::Low,
+            _ => WatermarkLevel::Panic,
+        }
+    }
+}
+
+/// Cheap-to-clone shared signal of the current watermark level,
+/// surfaced for the M2.2 Phase 4 cold-read cache: cache jobs read
+/// [`WatermarkSignal::level`] before starting and `select!` on
+/// [`WatermarkSignal::pressure_notified`] mid-stream so an in-flight
+/// rehydrate is cancelled when the disk tips into Low or Panic.
+///
+/// Internally an `AtomicU8` (lock-free read on the hot path) and a
+/// `tokio::sync::Notify` that is `notify_waiters()`-pinged ONLY on
+/// transitions INTO Low or Panic. Recovery transitions are silent —
+/// readers re-check `level()` next time.
+#[derive(Clone, Default)]
+pub struct WatermarkSignal {
+    inner: Arc<WatermarkSignalInner>,
+}
+
+#[derive(Default)]
+struct WatermarkSignalInner {
+    level: std::sync::atomic::AtomicU8,
+    pressure: tokio::sync::Notify,
+}
+
+impl WatermarkSignal {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Current level. Lock-free.
+    pub fn level(&self) -> WatermarkLevel {
+        WatermarkLevel::from_u8(self.inner.level.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// `true` iff the disk is healthy enough to start new cold-read
+    /// cache work. Convenience wrapper.
+    pub fn is_ok(&self) -> bool {
+        matches!(self.level(), WatermarkLevel::Ok)
+    }
+
+    /// Future that resolves the next time the level transitions
+    /// into Low or Panic. Use in `select!` arms to cancel
+    /// long-running cache jobs.
+    pub async fn pressure_notified(&self) {
+        self.inner.pressure.notified().await
+    }
+
+    /// Update the stored level and wake any pressure waiters when
+    /// the new level is Low or Panic. Called by
+    /// [`run_storage_safety`] after every `observe()`. Public
+    /// only because tests construct + drive the signal directly.
+    pub fn set(&self, level: WatermarkLevel) {
+        let prev = self
+            .inner
+            .level
+            .swap(level.as_u8(), std::sync::atomic::Ordering::Release);
+        if level != WatermarkLevel::Ok && WatermarkLevel::from_u8(prev) != level {
+            // Edge-trigger waiters only on Ok→Low, Ok→Panic, or
+            // Low→Panic — repeating the same non-Ok level is a
+            // steady state and shouldn't re-wake.
+            self.inner.pressure.notify_waiters();
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Transition {
     /// No level change this tick.
@@ -259,12 +338,18 @@ pub struct StorageSafetyConfig {
 /// shuts down. Spawned by `nexus-engine::main` once the store +
 /// recorder + bus are wired. Returns only on probe error or when
 /// the runtime is dropped.
+///
+/// `signal` is the shared [`WatermarkSignal`] read by the M2.2
+/// cold-read cache to gate rehydrate jobs. The loop updates it
+/// after every `observe()`; tests that don't care about the signal
+/// can pass `WatermarkSignal::new()` (a fresh, ignored handle).
 pub async fn run_storage_safety(
     cfg: StorageSafetyConfig,
     probe: Arc<dyn FreeSpaceProbe>,
     recorder: Arc<dyn ClipRecorder>,
     store: Arc<Store>,
     bus: Arc<dyn Bus>,
+    signal: WatermarkSignal,
 ) -> Result<()> {
     info!(
         clips_dir = %cfg.clips_dir.display(),
@@ -292,6 +377,11 @@ pub async fn run_storage_safety(
         };
         let trans = controller.observe(free_pct);
         debug!(free_pct, level = ?controller.level(), ?trans, "watermark tick");
+
+        // Mirror the new level into the shared signal for the cold-
+        // read cache. Cheap atomic store; only wakes pressure
+        // waiters on Ok→Low / Ok→Panic / Low→Panic transitions.
+        signal.set(controller.level());
 
         match trans {
             Transition::Entered(WatermarkLevel::Panic) => {
@@ -323,7 +413,7 @@ pub async fn run_storage_safety(
             controller.level(),
             WatermarkLevel::Low | WatermarkLevel::Panic
         ) {
-            if let Err(e) = evict_one(&store, &cfg.clips_dir, &mut rr_cursor).await {
+            if let Err(e) = evict_one(&store, &cfg.clips_dir, &bus, &mut rr_cursor).await {
                 warn!(error = %e, "eviction step failed");
             }
         }
@@ -349,28 +439,40 @@ async fn publish_storage_event(
 }
 
 /// Per-camera round-robin: walk the camera list once, picking the
-/// next camera that still has at least one clip, and evict its
-/// oldest. `rr_cursor` is mutated to advance the round-robin so we
-/// don't always hammer camera 0.
+/// next camera that still has an evictable clip. M2.2 splits this
+/// into a two-pass strategy:
 ///
-/// Returns Ok(()) whether or not a clip was actually evicted; the
+/// **Pass 1 (soft-evict).** For the chosen camera, look up
+/// [`Store::find_soft_evict_candidate`] — the oldest clip that has
+/// BOTH a hot pointer AND a cold pointer. If found, drop the hot
+/// copy: file unlink FIRST (so a crash can never leave the row
+/// pointing at a freed inode that's been reallocated), then
+/// [`Store::clear_hot_pointer`] which uses a WHERE-guard to atomic
+/// update only if `cold_handle IS NOT NULL`. Emit
+/// [`topic::CLIP_HOT_EVICTED`]. The row + cold pointer + linked
+/// motion_events all stay intact — playback keeps working from
+/// cold via the future Phase 4 streaming path.
+///
+/// **Pass 2 (hard-evict, fallback).** If no soft candidate exists
+/// for that camera, fall back to
+/// [`Store::find_hard_evict_candidate`] which yields the oldest
+/// clip that was NEVER cold-replicated. This goes through the M2.1
+/// metadata-FIRST cascade-delete path so motion_events + linked
+/// `events` rows tear down with the clip. Emit
+/// [`topic::CLIP_HARD_EVICTED`].
+///
+/// **Cold-replicated clips are undeletable.** The hard-evict
+/// candidate's `cold_handle IS NULL` guard makes this structural:
+/// once a clip lives on cold, only the soft path can touch it from
+/// the safety floor, and the soft path leaves cold alone. Operator
+/// intervention via the admin API is the only way to reclaim cold.
+///
+/// Returns `Ok(())` whether or not a clip was actually evicted; the
 /// caller logs and tries again next tick.
-///
-/// **Crash-safety: metadata FIRST, file SECOND.** Per
-/// `docs/M2_STORAGE.md`, the only acceptable post-crash state is
-/// "file orphaned, no DB row" — those are picked up by the
-/// retention sweeper's orphan-file scan and unlinked. The reverse
-/// (DB row pointing at a missing file) leaves the playback UI
-/// returning 404s for clips the timeline still advertises, and
-/// 0002's `ON DELETE CASCADE` cannot be replayed against it. So
-/// we delete the row first; if `cascade_delete_clip_metadata`
-/// fails we abort and the clip stays whole. Only after the row is
-/// committed do we unlink the file; if the unlink fails (e.g.
-/// permission error, network mount glitch) the orphan-file scan
-/// reaps it on the next sweep.
 async fn evict_one(
     store: &Arc<Store>,
     clips_dir: &Path,
+    bus: &Arc<dyn Bus>,
     rr_cursor: &mut usize,
 ) -> anyhow::Result<()> {
     let cams: Vec<CameraId> = store.cameras_with_clips().await?;
@@ -381,20 +483,47 @@ async fn evict_one(
     for offset in 0..n {
         let idx = (*rr_cursor + offset) % n;
         let cam = cams[idx];
-        if let Some(clip) = store.oldest_clip_for_camera(cam).await? {
-            // Step 1: remove the metadata. If this fails the clip
-            // stays whole and we'll retry next tick.
-            store.cascade_delete_clip_metadata(clip.id).await?;
 
-            // Step 2: unlink the file. Failures here are logged but
-            // not fatal — the orphan-file scan will reap it later.
-            let abs = clips_dir.join(&clip.path);
+        // ----- Pass 1: soft-evict (hot drop, cold preserved) -----
+        if let Some(clip) = store.find_soft_evict_candidate(cam).await? {
+            let hot_path = match clip.hot_path.as_deref() {
+                Some(p) => p,
+                None => {
+                    // Defensive: the soft-candidate query already
+                    // filters on hot_handle IS NOT NULL, so this
+                    // arm shouldn't fire. Fall through to Pass 2
+                    // for the same camera.
+                    debug!(
+                        camera_id = cam,
+                        clip_id = clip.id,
+                        "soft candidate had no hot_path; skipping"
+                    );
+                    return Ok(());
+                }
+            };
+            let abs = clips_dir.join(hot_path);
+
+            // **File FIRST, DB SECOND.** Inverts the M2.1 ordering
+            // because the row must stay intact (cold pointer + the
+            // motion_events that hang off it). If the row update
+            // fails after the file unlink the next tick re-picks
+            // the same row and the unlink is a no-op (NotFound is
+            // not an error here); the row eventually clears.
             match tokio::fs::remove_file(&abs).await {
                 Ok(()) => {
-                    debug!(camera_id = cam, clip_id = clip.id, path = %abs.display(), "evicted clip file");
+                    debug!(
+                        camera_id = cam,
+                        clip_id = clip.id,
+                        path = %abs.display(),
+                        "soft-evict: hot file removed"
+                    );
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    debug!(camera_id = cam, clip_id = clip.id, "clip file already gone");
+                    debug!(
+                        camera_id = cam,
+                        clip_id = clip.id,
+                        "soft-evict: hot file already gone"
+                    );
                 }
                 Err(e) => {
                     warn!(
@@ -402,16 +531,106 @@ async fn evict_one(
                         clip_id = clip.id,
                         error = %e,
                         path = %abs.display(),
-                        "remove_file failed after metadata delete; orphan-file scan will reap on next sweep"
+                        "soft-evict: remove_file failed; aborting this round (orphan-file scan will reap)"
                     );
+                    *rr_cursor = idx + 1;
+                    return Ok(());
+                }
+            }
+
+            let n_cleared = store.clear_hot_pointer(clip.id).await?;
+            if n_cleared == 0 {
+                // WHERE-guard rejected (cold pointer disappeared
+                // between the find and the clear, or another
+                // soft-evict already ran). The unlink already
+                // happened so the orphan scan is the safety net.
+                warn!(
+                    camera_id = cam,
+                    clip_id = clip.id,
+                    "soft-evict: clear_hot_pointer rejected (cold pointer missing?); not emitting event"
+                );
+            } else {
+                let payload = serde_json::json!({
+                    "clip_id": clip.id,
+                    "camera_id": cam,
+                    "cold_handle": clip.cold_handle,
+                    "cold_path": clip.cold_path,
+                    "freed_bytes": clip.size_bytes,
+                });
+                if let Err(e) = bus.publish(topic::CLIP_HOT_EVICTED, &payload).await {
+                    warn!(error = %e, "publish CLIP_HOT_EVICTED failed");
                 }
             }
             *rr_cursor = idx + 1;
             return Ok(());
         }
+
+        // ----- Pass 2: hard-evict (cascade-delete, no cold copy) -----
+        if let Some(clip) = store.find_hard_evict_candidate(cam).await? {
+            // Metadata FIRST (M2.1 ordering preserved for hard path).
+            store.cascade_delete_clip_metadata(clip.id).await?;
+
+            // Then unlink the hot file. Hard-evict candidates always
+            // have a hot pointer because cold_handle IS NULL → they
+            // were never replicated → they must still be hot (the
+            // schema CHECK forbids "neither pointer set").
+            if let Some(hot_path) = clip.hot_path.as_deref() {
+                let abs = clips_dir.join(hot_path);
+                match tokio::fs::remove_file(&abs).await {
+                    Ok(()) => {
+                        debug!(
+                            camera_id = cam,
+                            clip_id = clip.id,
+                            path = %abs.display(),
+                            "hard-evict: clip file removed"
+                        );
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        debug!(
+                            camera_id = cam,
+                            clip_id = clip.id,
+                            "hard-evict: clip file already gone"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            camera_id = cam,
+                            clip_id = clip.id,
+                            error = %e,
+                            path = %abs.display(),
+                            "hard-evict: remove_file failed; orphan-file scan will reap"
+                        );
+                    }
+                }
+            } else {
+                debug!(
+                    camera_id = cam,
+                    clip_id = clip.id,
+                    "hard-evict: clip had no hot_path (already soft-evicted but cold gone?)"
+                );
+            }
+
+            let payload = serde_json::json!({
+                "clip_id": clip.id,
+                "camera_id": cam,
+                "freed_bytes": clip.size_bytes,
+            });
+            if let Err(e) = bus.publish(topic::CLIP_HARD_EVICTED, &payload).await {
+                warn!(error = %e, "publish CLIP_HARD_EVICTED failed");
+            }
+            *rr_cursor = idx + 1;
+            return Ok(());
+        }
+
+        // This camera has no soft AND no hard candidate — every
+        // remaining clip is cold-only (undeletable from the safety
+        // floor). Move on to the next camera in the round.
+        debug!(
+            camera_id = cam,
+            "evict_one: camera has no evictable clip (all remaining are cold-only)"
+        );
     }
-    // Nothing to evict (every camera had 0 clips). Advance cursor
-    // to avoid recomputing the same scan immediately.
+    // Nothing to evict (every camera was either empty or cold-only).
     *rr_cursor = rr_cursor.wrapping_add(1);
     Ok(())
 }
@@ -576,10 +795,10 @@ mod tests {
             .open_clip(&NewClip {
                 camera_id: 1,
                 started_at: chrono::Utc::now() - chrono::Duration::minutes(10),
-                path: "cam1/oldest.mp4".into(),
+                hot_path: "cam1/oldest.mp4".into(),
                 codec: "stub".into(),
                 container: "mp4".into(),
-                backend_id: "local".into(),
+                hot_handle: "local".into(),
             })
             .await
             .unwrap();
@@ -587,10 +806,10 @@ mod tests {
             .open_clip(&NewClip {
                 camera_id: 1,
                 started_at: chrono::Utc::now() - chrono::Duration::minutes(5),
-                path: "cam1/newer.mp4".into(),
+                hot_path: "cam1/newer.mp4".into(),
                 codec: "stub".into(),
                 container: "mp4".into(),
-                backend_id: "local".into(),
+                hot_handle: "local".into(),
             })
             .await
             .unwrap();
@@ -621,8 +840,15 @@ mod tests {
         let store_for_loop = store.clone();
         let bus_for_loop = bus.clone();
         let handle = tokio::spawn(async move {
-            let _ = run_storage_safety(cfg, probe, recorder_for_loop, store_for_loop, bus_for_loop)
-                .await;
+            let _ = run_storage_safety(
+                cfg,
+                probe,
+                recorder_for_loop,
+                store_for_loop,
+                bus_for_loop,
+                WatermarkSignal::new(),
+            )
+            .await;
         });
 
         // Wait for at least the panic tick to land. Recorder panic
@@ -722,10 +948,10 @@ mod tests {
                         // Older i = older started_at; oldest_clip_for_camera
                         // returns the smallest started_at first.
                         started_at: now - chrono::Duration::seconds((count - i) as i64 * 60),
-                        path: path_rel.clone(),
+                        hot_path: path_rel.clone(),
                         codec: "stub".into(),
                         container: "mp4".into(),
-                        backend_id: "local".into(),
+                        hot_handle: "local".into(),
                     })
                     .await
                     .unwrap();
@@ -766,9 +992,12 @@ mod tests {
         assert_eq!(before, [10, 5, 20]);
 
         // Three eviction calls = one full round.
+        let bus: Arc<dyn Bus> = Arc::new(nexus_bus::BroadcastBus::new(64));
         let mut cursor = 0usize;
         for _ in 0..3 {
-            evict_one(&store, &clips_dir, &mut cursor).await.unwrap();
+            evict_one(&store, &clips_dir, &bus, &mut cursor)
+                .await
+                .unwrap();
         }
         let after = [
             count_for(&store, 1).await,
@@ -784,7 +1013,9 @@ mod tests {
         // Run two more full rounds to confirm fairness holds even
         // after the cursor wraps.
         for _ in 0..6 {
-            evict_one(&store, &clips_dir, &mut cursor).await.unwrap();
+            evict_one(&store, &clips_dir, &bus, &mut cursor)
+                .await
+                .unwrap();
         }
         let after_three = [
             count_for(&store, 1).await,
@@ -811,7 +1042,7 @@ mod tests {
         // simulate an externally-deleted clip whose row outlived
         // the bytes.
         let oldest = store.oldest_clip_for_camera(1).await.unwrap().unwrap();
-        let abs = clips_dir.join(&oldest.path);
+        let abs = clips_dir.join(oldest.hot_path.as_deref().unwrap());
         assert!(abs.exists(), "fixture clip file must exist before nuke");
         tokio::fs::remove_file(&abs).await.unwrap();
         assert!(!abs.exists());
@@ -819,8 +1050,11 @@ mod tests {
         // Run one eviction. The file-unlink will return NotFound
         // (logged at debug, swallowed). The metadata MUST be gone
         // regardless.
+        let bus: Arc<dyn Bus> = Arc::new(nexus_bus::BroadcastBus::new(64));
         let mut cursor = 0usize;
-        evict_one(&store, &clips_dir, &mut cursor).await.unwrap();
+        evict_one(&store, &clips_dir, &bus, &mut cursor)
+            .await
+            .unwrap();
 
         // Row is GONE.
         assert!(
@@ -955,6 +1189,7 @@ mod tests {
                 recorder_for_loop,
                 store_for_loop,
                 bus_for_loop,
+                WatermarkSignal::new(),
             )
             .await;
         });
@@ -1038,5 +1273,272 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+    }
+
+    // ===================================================================
+    // M2.2 — soft / hard eviction fork
+    // ===================================================================
+
+    use nexus_store::ClipColdMark;
+    use tokio_stream::StreamExt as _;
+
+    /// Helper: build a store + clips_dir, register a `lan-test`
+    /// backend in `storage_backends`, then for `cam` open `count`
+    /// clips. The first `cold_count` of them get a cold pointer
+    /// stamped via `mark_cold_replicated` so they are eligible for
+    /// soft-evict; the rest are hot-only and only the hard-evict
+    /// path can touch them.
+    async fn build_store_with_mixed_clips(
+        cam: CameraId,
+        cold_count: usize,
+        hot_only_count: usize,
+    ) -> (Arc<Store>, tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("nexus.db");
+        let store = Arc::new(
+            Store::open(&StoreConfig {
+                url: format!("sqlite:{}?mode=rwc", db_path.display()),
+                seed_from_config: false,
+                duckdb_attach: false,
+                duckdb_path: PathBuf::from("/tmp/unused.duckdb"),
+            })
+            .await
+            .unwrap(),
+        );
+        let clips_dir = dir.path().join("clips");
+        tokio::fs::create_dir_all(&clips_dir).await.unwrap();
+        store
+            .upsert_camera(&CameraConfig {
+                id: cam,
+                name: format!("cam{cam}"),
+                url: Url::parse(&format!("rtsp://127.0.0.1/stream{cam}")).unwrap(),
+                enabled: true,
+                prompts: vec![],
+                model_override: None,
+                zones: vec![],
+                max_fps: 0,
+                parking_lot_mode: false,
+            })
+            .await
+            .unwrap();
+        store
+            .upsert_storage_backend("lan-test", "lan", "{\"root\":\"/tmp/unused\"}")
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(clips_dir.join(format!("{cam}")))
+            .await
+            .unwrap();
+        let now = chrono::Utc::now();
+        let total = cold_count + hot_only_count;
+        // Order them oldest-first so the cold-replicated ones are
+        // the OLDEST — matching the natural replicator ordering
+        // where older clips get cold-stamped first.
+        for i in 0..total {
+            let path_rel = format!("{cam}/clip_{i:04}.mp4");
+            let clip_id = store
+                .open_clip(&NewClip {
+                    camera_id: cam,
+                    started_at: now - chrono::Duration::seconds((total - i) as i64 * 60),
+                    hot_path: path_rel.clone(),
+                    codec: "stub".into(),
+                    container: "mp4".into(),
+                    hot_handle: "local".into(),
+                })
+                .await
+                .unwrap();
+            tokio::fs::write(clips_dir.join(&path_rel), b"x")
+                .await
+                .unwrap();
+            // Close so ended_at is set (clips_pending_cold_upload
+            // filters on ended_at IS NOT NULL — same gate the
+            // replicator uses).
+            store
+                .close_clip(
+                    clip_id,
+                    &nexus_store::ClipClose {
+                        ended_at: now,
+                        duration_ms: 1000,
+                        size_bytes: 1,
+                        hot_path: Some(path_rel.clone()),
+                        sha256: Some(format!("{:064x}", i)),
+                    },
+                )
+                .await
+                .unwrap();
+            if i < cold_count {
+                store
+                    .mark_cold_replicated(
+                        clip_id,
+                        &ClipColdMark {
+                            cold_handle: "lan-test".into(),
+                            cold_path: path_rel.clone(),
+                            cold_uploaded_at: now,
+                        },
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+        (store, dir, clips_dir)
+    }
+
+    /// Soft-evict prefers cold-replicated clips: file is removed,
+    /// the row + its motion_events stay (none here) and `hot_path`
+    /// is cleared. The matching CLIP_HOT_EVICTED bus event fires
+    /// exactly once.
+    #[tokio::test]
+    async fn evict_one_soft_evicts_cold_replicated_first() {
+        let (store, _dir, clips_dir) = build_store_with_mixed_clips(1, 2, 1).await;
+        let bus: Arc<dyn Bus> = Arc::new(nexus_bus::BroadcastBus::new(64));
+        let mut sub = bus
+            .subscribe::<serde_json::Value>(topic::CLIP_HOT_EVICTED)
+            .await
+            .unwrap();
+
+        // Snapshot file paths and ids BEFORE the evict.
+        let stats_before = store.per_camera_clip_stats().await.unwrap();
+        let total_before = stats_before
+            .iter()
+            .find(|s| s.camera_id == 1)
+            .unwrap()
+            .clip_count;
+        assert_eq!(total_before, 3, "fixture must seed 3 clips total");
+
+        let mut cursor = 0usize;
+        evict_one(&store, &clips_dir, &bus, &mut cursor)
+            .await
+            .unwrap();
+
+        // The OLDEST cold-replicated clip (0) had its file removed.
+        let oldest_path = clips_dir.join("1/clip_0000.mp4");
+        assert!(
+            !oldest_path.exists(),
+            "soft-evict should have unlinked the oldest cold-replicated clip's file"
+        );
+
+        // Row count UNCHANGED — soft-evict preserves the row.
+        let stats_after = store.per_camera_clip_stats().await.unwrap();
+        let total_after = stats_after
+            .iter()
+            .find(|s| s.camera_id == 1)
+            .unwrap()
+            .clip_count;
+        assert_eq!(
+            total_after, total_before,
+            "soft-evict must NOT delete the row"
+        );
+
+        // The row's hot_path is now NULL.
+        let clip_after = store
+            .find_hard_evict_candidate(1)
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("the hot-only clip should still be hard-evict eligible"));
+        // The hard-evict candidate is the one we did NOT cold-replicate
+        // (clip index 2 — the newest hot-only one), NOT the
+        // soft-evicted clip.
+        assert_eq!(
+            clip_after.hot_path.as_deref(),
+            Some("1/clip_0002.mp4"),
+            "soft-evict shouldn't touch hot-only candidates"
+        );
+
+        // CLIP_HOT_EVICTED fired exactly once.
+        let evt = tokio::time::timeout(Duration::from_millis(500), sub.next())
+            .await
+            .expect("CLIP_HOT_EVICTED should fire within 500ms")
+            .expect("subscriber stream returned None")
+            .expect("subscriber stream returned an Err");
+        assert_eq!(evt.get("camera_id").and_then(|v| v.as_i64()), Some(1));
+    }
+
+    /// When NO cold-replicated clips remain for a camera, the
+    /// safety floor falls back to hard-evict (cascade-delete the
+    /// metadata + unlink the file). CLIP_HARD_EVICTED fires.
+    #[tokio::test]
+    async fn evict_one_falls_back_to_hard_evict_when_no_soft_candidate() {
+        // 0 cold, 2 hot-only — Pass 1 finds nothing, Pass 2 fires.
+        let (store, _dir, clips_dir) = build_store_with_mixed_clips(2, 0, 2).await;
+        let bus: Arc<dyn Bus> = Arc::new(nexus_bus::BroadcastBus::new(64));
+        let mut sub = bus
+            .subscribe::<serde_json::Value>(topic::CLIP_HARD_EVICTED)
+            .await
+            .unwrap();
+
+        let mut cursor = 0usize;
+        evict_one(&store, &clips_dir, &bus, &mut cursor)
+            .await
+            .unwrap();
+
+        // The hard-evicted clip's file is gone.
+        let oldest_path = clips_dir.join("2/clip_0000.mp4");
+        assert!(
+            !oldest_path.exists(),
+            "hard-evict should have unlinked the oldest hot-only clip's file"
+        );
+
+        // Row count DROPS by exactly 1 (cascade-delete).
+        let stats_after = store.per_camera_clip_stats().await.unwrap();
+        let count_after = stats_after
+            .iter()
+            .find(|s| s.camera_id == 2)
+            .map(|s| s.clip_count)
+            .unwrap_or(0);
+        assert_eq!(count_after, 1, "hard-evict must cascade-delete the row");
+
+        let evt = tokio::time::timeout(Duration::from_millis(500), sub.next())
+            .await
+            .expect("CLIP_HARD_EVICTED should fire within 500ms")
+            .expect("subscriber stream returned None")
+            .expect("subscriber stream returned an Err");
+        assert_eq!(evt.get("camera_id").and_then(|v| v.as_i64()), Some(2));
+    }
+
+    /// Cold-only clips (hot pointer cleared, cold pointer set) MUST
+    /// NOT be touched by either eviction pass. This is the
+    /// "hard-evicting a cold-replicated clip is forbidden" invariant
+    /// from the M2.2 plan.
+    #[tokio::test]
+    async fn evict_one_refuses_cold_only_clips() {
+        let (store, _dir, clips_dir) = build_store_with_mixed_clips(3, 1, 0).await;
+        let bus: Arc<dyn Bus> = Arc::new(nexus_bus::BroadcastBus::new(64));
+        let mut cursor = 0usize;
+
+        // First pass: soft-evicts the one cold-replicated clip
+        // (drops hot pointer; row stays).
+        evict_one(&store, &clips_dir, &bus, &mut cursor)
+            .await
+            .unwrap();
+        // Row still there.
+        let count_after_first = store
+            .per_camera_clip_stats()
+            .await
+            .unwrap()
+            .iter()
+            .find(|s| s.camera_id == 3)
+            .map(|s| s.clip_count)
+            .unwrap_or(0);
+        assert_eq!(count_after_first, 1, "soft-evict must not delete the row");
+
+        // Second pass: the only remaining clip is cold-only (no
+        // hot pointer). Pass 1 (soft) finds nothing because
+        // hot_handle is now NULL; Pass 2 (hard) finds nothing
+        // because cold_handle is NOT NULL. evict_one returns Ok
+        // without touching anything.
+        evict_one(&store, &clips_dir, &bus, &mut cursor)
+            .await
+            .unwrap();
+        let count_after_second = store
+            .per_camera_clip_stats()
+            .await
+            .unwrap()
+            .iter()
+            .find(|s| s.camera_id == 3)
+            .map(|s| s.clip_count)
+            .unwrap_or(0);
+        assert_eq!(
+            count_after_second, 1,
+            "cold-only clip MUST survive a second eviction pass"
+        );
     }
 }

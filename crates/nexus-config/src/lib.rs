@@ -208,6 +208,15 @@ pub struct ClipsConfig {
     /// e.g. ~2 MB for a 4 Mbps 1080p camera.
     #[serde(default = "default_pre_roll_secs")]
     pub pre_roll_secs: u32,
+    /// M2.2 Phase 3: when set, the recorder routes new clips to the
+    /// USB volume with this label (e.g. `"NEXUS_VAULT"`) if the
+    /// `usb_watch` task currently sees it attached. When the label
+    /// is unset, missing, or the volume is unmounted, the recorder
+    /// falls back to writing under `clips_dir` (`hot_handle = "local"`).
+    /// In-flight clips never migrate mid-recording — attach/detach
+    /// only takes effect on the next `open()` call.
+    #[serde(default)]
+    pub preferred_usb_label: Option<String>,
 }
 
 impl Default for ClipsConfig {
@@ -222,6 +231,7 @@ impl Default for ClipsConfig {
             watermark_sample_interval_secs: default_watermark_sample_interval_secs(),
             post_roll_secs: default_post_roll_secs(),
             pre_roll_secs: default_pre_roll_secs(),
+            preferred_usb_label: None,
         }
     }
 }
@@ -389,6 +399,15 @@ pub struct AuthConfig {
     /// When `mode = "dev_token"`, requests must include `Authorization: Bearer <token>`.
     #[serde(default)]
     pub dev_token: Option<String>,
+    /// Path to the admin-auth JSON file holding the shared HS256
+    /// signing secret (M2.2 Phase 2 step 12). File shape:
+    /// `{"secret": "..."}`. When set, every write against
+    /// `/api/v1/admin/*` requires a valid HS256 JWT signed with
+    /// that secret; when unset the engine falls back to "loopback
+    /// bind only" + the `NEXUS_ADMIN_BEARER_ALLOW_REMOTE=1` escape
+    /// hatch. See `nexus-engine::admin_auth` for the verifier.
+    #[serde(default)]
+    pub admin_secret_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]

@@ -1,0 +1,44 @@
+[package]
+name = "nexus-storage-cloud"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Cloud cold-storage backends (Google Drive, OneDrive) for the Nexus edge engine."
+
+[dependencies]
+# Trait + token-crypto helpers live in the leaf storage crate.
+nexus-storage = { workspace = true }
+
+# Async
+tokio = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+parking_lot = { workspace = true }
+
+# HTTP + serde
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+url = { workspace = true }
+
+# Errors / time
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+
+# Crypto / encoding for `exists()` checksum spot-check + base64
+# manipulations of OAuth response bodies.
+sha2 = "0.10"
+hex = { workspace = true }
+base64 = { workspace = true }
+
+[dev-dependencies]
+wiremock = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = [
+    "macros",
+    "rt-multi-thread",
+    "test-util",
+] }

@@ -1,0 +1,31 @@
+[package]
+name = "nexus-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# M2.2 cold-mirror replication: defines the `ColdBackend` trait and
+# the local-filesystem (`LanFsBackend`) impl. Cloud impls (Drive,
+# OneDrive) live in a separate `nexus-storage-cloud` crate per the
+# M3.1 split between core and add-on.
+
+[dependencies]
+async-trait = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+parking_lot = { workspace = true }
+sha2 = "0.10"
+
+# M2.2 Phase 2 — OAuth refresh-token encryption at rest.
+aes-gcm = { workspace = true }
+hkdf = { workspace = true }
+base64 = { workspace = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

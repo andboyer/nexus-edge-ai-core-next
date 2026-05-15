@@ -548,3 +548,163 @@ textarea {
   padding: 6px 0;
   font-size: 13px;
 }
+
+/* M2.2 Phase 5 — Storage Admin tab. */
+.admin-section {
+  margin: 16px 0 24px 0;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.admin-section h3 {
+  margin: 0;
+  font-size: 14px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+
+.admin-section h4 {
+  margin: 0;
+  font-size: 13px;
+}
+
+.admin-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.admin-table th,
+.admin-table td {
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--line);
+  text-align: left;
+  vertical-align: middle;
+}
+
+.admin-table th {
+  font-weight: 600;
+  color: var(--text-dim);
+  background: var(--bg-elev);
+}
+
+.admin-table tbody tr:hover {
+  background: var(--bg-elev-2);
+}
+
+.admin-table td button + button {
+  margin-left: 6px;
+}
+
+.admin-form {
+  background: var(--bg-elev);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  font-size: 13px;
+}
+
+.admin-form label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.admin-form input[type="text"],
+.admin-form input[type="number"],
+.admin-form select {
+  background: var(--bg);
+  border: 1px solid var(--line);
+  color: var(--text);
+  padding: 4px 8px;
+  border-radius: 3px;
+  font-size: 12px;
+  font-family: inherit;
+}
+
+.admin-form input[type="range"] {
+  flex: 1 1 200px;
+  max-width: 320px;
+}
+
+.admin-form .form-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.admin-form .form-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.admin-form .radio-group {
+  display: inline-flex;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.admin-form .radio-group label {
+  gap: 4px;
+}
+
+.admin-form .config-host {
+  border-top: 1px dashed var(--line);
+  padding-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.admin-form button.primary {
+  background: var(--accent-dim);
+  color: var(--text);
+  border: 1px solid var(--accent);
+  padding: 5px 12px;
+  border-radius: 3px;
+  cursor: pointer;
+}
+
+.admin-form button.primary[disabled] {
+  opacity: 0.6;
+  cursor: progress;
+}
+
+button.ghost.danger {
+  color: var(--crit);
+  border-color: rgba(239, 71, 111, 0.4);
+}
+
+.health-pill {
+  display: inline-block;
+  padding: 1px 6px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  border-radius: 3px;
+  margin-left: 6px;
+}
+
+.health-pill.health-ok {
+  background: rgba(46, 204, 113, 0.15);
+  color: var(--ok);
+  border: 1px solid var(--ok);
+}
+
+.health-pill.health-warn {
+  background: rgba(255, 200, 87, 0.12);
+  color: var(--warn);
+  border: 1px solid var(--warn);
+}
+
+.health-pill.health-crit {
+  background: rgba(239, 71, 111, 0.12);
+  color: var(--crit);
+  border: 1px solid var(--crit);
+}

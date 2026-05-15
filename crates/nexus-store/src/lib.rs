@@ -10,8 +10,9 @@
 
 pub mod motion;
 pub use motion::{
-    ClipClose, ClipId, ClipRow, MotionEventId, MotionEventKind, MotionEventRow,
-    MotionHistogramBucket, NewClip, NewMotionEvent, PerCameraClipStats,
+    ClipClose, ClipColdMark, ClipId, ClipRow, ColdReplicaRow, ColdReplicaStats, DeleteBackendError,
+    MotionEventId, MotionEventKind, MotionEventRow, MotionHistogramBucket, NewClip, NewMotionEvent,
+    PerCameraClipStats, StorageBackendRow,
 };
 
 use std::sync::Arc;
@@ -44,6 +45,14 @@ const MIGRATIONS: &[(&str, &str)] = &[
     (
         "0003_events_clip_cascade",
         include_str!("../migrations/0003_events_clip_cascade.sql"),
+    ),
+    (
+        "0004_storage_backends",
+        include_str!("../migrations/0004_storage_backends.sql"),
+    ),
+    (
+        "0005_runtime_settings",
+        include_str!("../migrations/0005_runtime_settings.sql"),
     ),
 ];
 
@@ -127,25 +136,61 @@ impl Store {
             if Self::migration_applied(pool, id).await? {
                 continue;
             }
-            let mut tx = pool.begin().await?;
+            // A migration may opt out of the wrapping transaction so it
+            // can perform a parent-table rebuild safely. The official
+            // SQLite recipe for that requires `PRAGMA foreign_keys=OFF`
+            // OUTSIDE any transaction (the pragma is a no-op inside
+            // one), and DROP TABLE under foreign_keys=ON does an
+            // implicit `DELETE FROM` that fires every `ON DELETE
+            // CASCADE` referencing the table — silently nuking child
+            // rows on upgrade. To opt out, place the literal marker
+            // `-- nexus:no-transaction` somewhere in the file. The
+            // migration is still atomic on success because we record
+            // it in `schema_migrations` only after every statement
+            // succeeded; on partial failure the operator restarts the
+            // engine and the migration retries from the top.
+            let no_tx = sql.contains("-- nexus:no-transaction");
             // Strip `--` line comments BEFORE splitting on `;` — otherwise
             // a `;` inside a comment fragments the comment text and
             // sqlite then tries to parse the leftover prose as SQL.
             // (Migration files MUST NOT contain `;` inside string
             // literals or trigger bodies — keep them plain DDL.)
             let stripped = strip_sql_line_comments(sql);
-            for stmt in stripped.split(';') {
-                let s = stmt.trim();
-                if s.is_empty() {
-                    continue;
+
+            if no_tx {
+                // Run all statements on the SAME connection so the
+                // file's `PRAGMA foreign_keys=OFF` (must be issued
+                // outside any transaction) actually applies to every
+                // subsequent statement. The migration body is
+                // responsible for its own BEGIN/COMMIT and the
+                // matching `PRAGMA foreign_keys=ON`.
+                let mut conn = pool.acquire().await?;
+                for stmt in stripped.split(';') {
+                    let s = stmt.trim();
+                    if s.is_empty() {
+                        continue;
+                    }
+                    sqlx::query(s).execute(&mut *conn).await?;
                 }
-                sqlx::query(s).execute(&mut *tx).await?;
+                sqlx::query("INSERT INTO schema_migrations (id) VALUES (?)")
+                    .bind(*id)
+                    .execute(&mut *conn)
+                    .await?;
+            } else {
+                let mut tx = pool.begin().await?;
+                for stmt in stripped.split(';') {
+                    let s = stmt.trim();
+                    if s.is_empty() {
+                        continue;
+                    }
+                    sqlx::query(s).execute(&mut *tx).await?;
+                }
+                sqlx::query("INSERT INTO schema_migrations (id) VALUES (?)")
+                    .bind(*id)
+                    .execute(&mut *tx)
+                    .await?;
+                tx.commit().await?;
             }
-            sqlx::query("INSERT INTO schema_migrations (id) VALUES (?)")
-                .bind(*id)
-                .execute(&mut *tx)
-                .await?;
-            tx.commit().await?;
             info!(migration = %id, "applied schema migration");
         }
         Ok(())
