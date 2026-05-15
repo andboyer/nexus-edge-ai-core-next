@@ -11,7 +11,10 @@
 > [DEV_NOTES.md](DEV_NOTES.md) instead — it covers the macOS dev
 > toolchain and the per-change `cargo` loop.
 >
-> **Last reviewed:** 2026-05-14. The kernel, driver, ORT, and CUDA
+> **Last reviewed:** 2026-05-15 (post M-Install Checkpoint 2 — auth
+> defaults flipped to `dev_token`, `mode = "none"` now requires
+> loopback bind, missing `[auth]` blocks are grandfathered for 7 days
+> with a deprecation WARN). The kernel, driver, ORT, and CUDA
 > versions cited here drift over time. Re-validate against the
 > Appendix B transcript on a fresh Multipass VM at every minor
 > release before relying on the published commands.
@@ -300,6 +303,7 @@ sudo chmod 755 /etc/nexus
 | `/var/lib/nexus/nexus.db`     | SQLite DB (cameras, rules, events, motion)  |
 | `/var/lib/nexus/clips/`       | Recorded mp4 clips (M2.1 watermark applies) |
 | `/var/lib/nexus/models/`      | ONNX model files + `models-manifest.json`   |
+| `/var/lib/nexus/state/`       | Per-camera static-object registries; auto-provisioned `dev-token` (mode 0600). Created on demand by the engine — `runtime.state_dir` in [config/nexus.example.toml](../config/nexus.example.toml) overrides the path. |
 | `/var/lib/nexus/device-manifest.json` | Last `nexus-probe` output           |
 
 ### 4.4 Firewall (`ufw`)
@@ -821,16 +825,20 @@ sudo -u nexus-admin bash <<'EOF'
 cd /opt/nexus
 source $HOME/.cargo/env
 
-# Pick the cargo features for your tier:
+# Pick the cargo features for your tier. The seven proxy features on
+# `nexus-engine` (M-Install Checkpoint 2) forward into
+# `nexus-inference`; the ones you don't pick stay zero-cost.
 #   T10 / T24 / T36     →  ort,ep-cpu,ep-openvino
-#   T36-S               →  ort,ep-cpu,ep-openvino,ep-npu
+#   T36-S               →  ort,ep-cpu,ep-openvino   # NPU dispatched via OpenVINO; no separate ep-npu feature
 #   T64 (post-beta)     →  ort,ep-cpu,ep-cuda,ep-tensorrt
 FEATURES="ort,ep-cpu,ep-openvino"   # T24 example
 
-cargo build --release \
-    --features "$FEATURES" \
-    --bin nexus-engine \
-    --bin nexus-probe
+# Two cargo invocations because workspace-level `--features` requires
+# `-p` — same pattern the Dockerfile uses (deploy/Dockerfile, stage 2).
+# `nexus-probe` carries no EP-relevant features so it builds with
+# workspace defaults.
+cargo build --release -p nexus-engine --features "$FEATURES" --bin nexus-engine
+cargo build --release -p nexus-probe  --bin nexus-probe
 
 (cd ui && npm ci && npm run build)
 EOF
@@ -979,23 +987,40 @@ manually).
 
 ### 8.3 Authentication
 
-The shipping default in [config/nexus.example.toml](../config/nexus.example.toml)
-is `auth.mode = "none"` — fine for an isolated VLAN, **dangerous on
-anything reachable from the corporate LAN**. For LAN-reachable
-deployments add an OIDC issuer:
+M-Install Checkpoint 2 made the engine secure-by-default. Three modes
+are supported; pick the one that matches the deployment posture.
+
+| `auth.mode`   | When to use it                                                                  | Behaviour |
+| ------------- | ------------------------------------------------------------------------------- | --------- |
+| `"dev_token"` | **Default.** Single-box / single-operator install on a trusted LAN.             | On first boot the engine generates a 32-byte URL-safe random token, persists it to `/var/lib/nexus/state/dev-token` (mode 0600), and prints it once at WARN. Clients send `Authorization: Bearer <token>`. Rotate by stopping the engine, deleting the file, and restarting. |
+| `"none"`      | Closed-lab / regression rigs that bind only to loopback.                        | Engine **refuses to boot** unless `[server].api_bind` is `127.0.0.1:*`, `[::1]:*`, or `localhost:*`. Use this only when an upstream reverse proxy / SSH tunnel is doing the auth. |
+| `"oidc"`      | Multi-operator deployments behind a corporate IdP.                              | OIDC bearer tokens validated against the issuer's JWKS at every request. |
+
+Tier configs in [config/tiers/](../config/tiers/) intentionally omit
+the `[auth]` block; the engine grandfathers a missing block to
+`mode = "none"` for 7 days at boot, with a WARN that names the
+deprecation deadline. Add an explicit `[auth]` block to
+`/etc/nexus/nexus.toml` before the deadline:
 
 ```toml
+# Most installs — auth.mode = "dev_token".
+[auth]
+mode = "dev_token"
+# dev_token is auto-provisioned at /var/lib/nexus/state/dev-token
+# unless you pin it explicitly here.
+
+# Multi-operator deployments behind an IdP — auth.mode = "oidc".
 [auth]
 mode = "oidc"
-
 [auth.oidc]
 issuer   = "https://auth.example.com/application/o/nexus"
 audience = "nexus-engine"
 jwks_uri = "https://auth.example.com/application/o/nexus/jwks/"
 ```
 
-`dev_token = "..."` is acceptable as a shared secret in a closed
-lab but never in production.
+`dev_token = "..."` pinned in TOML is acceptable as a shared secret
+in a closed lab but never in production. Always prefer the
+auto-provisioned on-disk file.
 
 ---
 
@@ -1023,10 +1048,12 @@ every `[[cameras]]` block / API-added camera from §8.1.
 ### 9.3 Cameras connect
 
 In the UI, each enabled camera should transition to **`connected`**
-within ~60 s. From the CLI:
+within ~60 s. The `/api/cameras` endpoint returns the configured
+rows (it does not include runtime state — the UI subscribes to
+`/api/stream/metadata` for that):
 
 ```bash
-curl -fsS http://localhost:8089/api/cameras | jq '.[] | {id, name, state}'
+curl -fsS http://localhost:8089/api/cameras | jq '.[] | {id, name, enabled}'
 ```
 
 If a camera is stuck on `connecting` for > 2 min, jump to §11
@@ -1067,19 +1094,23 @@ logs — the most common cause is a missing model file at
 ### 9.6 Storage safety floor reports healthy
 
 ```bash
-curl -fsS http://localhost:8089/api/v1/storage/local | jq
-# Expect:
+curl -fsS http://localhost:8089/api/v1/storage/local | jq '{recorder_kind, panic, free_pct, clips_dir, watermark_state}'
+# Expect (subset — full body also includes fs_total_bytes,
+# fs_used_bytes, fs_free_bytes, watermark_low_pct,
+# watermark_panic_pct, per_camera[] — all sourced from statvfs +
+# the watermark FSM):
 # {
 #   "recorder_kind": "gstreamer" | "stub",
 #   "panic": false,
 #   "free_pct": <high number>,
-#   "clips_dir": "/var/lib/nexus/clips"
+#   "clips_dir": "/var/lib/nexus/clips",
+#   "watermark_state": "ok"
 # }
 ```
 
-If `panic: true` you're already below 5 % free on the clips
-filesystem. `df -h /var/lib/nexus/clips` to see what's eating the
-space and drop into §11.
+If `panic: true` (or `watermark_state == "panic"`) you're already
+below 5 % free on the clips filesystem. `df -h /var/lib/nexus/clips`
+to see what's eating the space and drop into §11.
 
 ### 9.7 Motion → clip → Timeline
 
@@ -1172,10 +1203,15 @@ docker compose -f deploy/docker-compose.yml \
 ```bash
 cd /opt/nexus
 sudo -u nexus-admin git pull
-sudo -u nexus-admin bash -c '. $HOME/.cargo/env && cargo build --release --features ort,ep-cpu,ep-openvino --bin nexus-engine --bin nexus-probe'
+# Same two-step build as §7.5 (workspace-level --features needs -p).
+sudo -u nexus-admin bash -c '. $HOME/.cargo/env && \
+    cargo build --release -p nexus-engine --features ort,ep-cpu,ep-openvino --bin nexus-engine && \
+    cargo build --release -p nexus-probe  --bin nexus-probe'
 sudo cp /usr/local/bin/nexus-engine /usr/local/bin/nexus-engine.bak
 sudo install -o root -g root -m 0755 \
     /opt/nexus/target/release/nexus-engine /usr/local/bin/nexus-engine
+sudo install -o root -g root -m 0755 \
+    /opt/nexus/target/release/nexus-probe  /usr/local/bin/nexus-probe
 sudo systemctl restart nexus-engine
 ```
 
@@ -1211,8 +1247,8 @@ This guide will grow §6.7 / §10 sections for both once they ship.
 | Symptom | Likely cause | Fix |
 | ------- | ------------ | --- |
 | `curl /api/health` returns connection refused | Engine isn't up. | `systemctl status nexus-engine` or `docker compose ps`; check logs (§10.1). |
-| Engine refuses to start with `auth.mode = "none" is only allowed when server.api_bind is on loopback` | Since M-Install Checkpoint 2 the engine refuses to bind unauthenticated APIs onto a LAN. | Either change `[server].api_bind` to `127.0.0.1:8089` (LAN-only deployments), or set `[auth].mode = "dev_token"` and read the auto-generated token from `/var/lib/nexus/dev-token` (mode 0600). |
-| Engine logs `auth: generated new dev token` at boot | First boot under `mode = "dev_token"` (the default since M-Install Checkpoint 2). The token is the credential clients send as `Authorization: Bearer <token>`. | Copy the token from the WARN line *or* from `/var/lib/nexus/dev-token`. To rotate: stop the engine, delete the file, restart. |
+| Engine refuses to start with `auth.mode = "none" is only allowed when server.api_bind is on loopback` | Since M-Install Checkpoint 2 the engine refuses to bind unauthenticated APIs onto a LAN. | Either change `[server].api_bind` to `127.0.0.1:8089` (LAN-only deployments), or set `[auth].mode = "dev_token"` and read the auto-generated token from `/var/lib/nexus/state/dev-token` (mode 0600). |
+| Engine logs `auth: generated new dev token` at boot | First boot under `mode = "dev_token"` (the default since M-Install Checkpoint 2). The token is the credential clients send as `Authorization: Bearer <token>`. | Copy the token from the WARN line *or* from `/var/lib/nexus/state/dev-token`. To rotate: stop the engine, delete the file, restart. The path follows `runtime.state_dir` from `nexus.toml` (default `/var/lib/nexus/state`). |
 | Engine logs `nexus.toml has no [auth] section` at boot | Pre-Checkpoint-2 config; the engine grandfathers it to `mode = "none"` for 7 days. | Add an explicit `[auth]` block (see [config/nexus.example.toml](../config/nexus.example.toml)) before the deadline printed in the WARN line. |
 | UI loads but `/` returns 404 | `ui_root` mismatch — engine pointing at a path that doesn't exist. | Container: image build incomplete; rebuild. Bare-metal: `ls /usr/share/nexus/ui` should list `index.html`. Update `[server].ui_root` in `/etc/nexus/nexus.toml` to match. |
 | Camera stuck on `connecting` for > 2 min | RTSP transport mismatch (camera serves UDP, engine asks TCP), bad credentials, blocked port. | Test with `gst-launch-1.0 -v rtspsrc location=<url> ! fakesink` from the host. If the password contains `!`, run `set +H` first and single-quote the URL (zsh history expansion). |

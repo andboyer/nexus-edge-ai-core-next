@@ -12,12 +12,12 @@ gstreamer = ["nexus-pipeline/gstreamer"]
 # nexus-inference. The release pipeline (and the kitchen-sink Docker
 # image) selects `ort,ep-cpu,ep-openvino,ep-cuda,ep-tensorrt`; lighter
 # builds (LAN dev box, CI smoke) leave them off and pay zero cost.
-ort         = ["nexus-inference/ort"]
-ep-cpu      = ["nexus-inference/ep-cpu"]
+ort = ["nexus-inference/ort"]
+ep-cpu = ["nexus-inference/ep-cpu"]
 ep-openvino = ["nexus-inference/ep-openvino"]
-ep-cuda     = ["nexus-inference/ep-cuda"]
+ep-cuda = ["nexus-inference/ep-cuda"]
 ep-tensorrt = ["nexus-inference/ep-tensorrt"]
-ep-coreml   = ["nexus-inference/ep-coreml"]
+ep-coreml = ["nexus-inference/ep-coreml"]
 ep-directml = ["nexus-inference/ep-directml"]
 
 [[bin]]

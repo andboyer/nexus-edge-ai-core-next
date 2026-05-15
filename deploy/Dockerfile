@@ -78,7 +78,7 @@ COPY crates crates
 # Two separate `cargo build` calls because `--features` at workspace
 # root requires `-p` or a single-package selection.
 RUN cargo build --release -p nexus-engine --features "${FEATURES}" --bin nexus-engine \
- && cargo build --release -p nexus-probe --bin nexus-probe
+    && cargo build --release -p nexus-probe --bin nexus-probe
 
 # ----------------------- stage 3: runtime --------------------------
 FROM debian:bookworm-slim AS runtime

@@ -51,8 +51,13 @@ json_logs = false
 # sample_ratio = 0.05
 
 [auth]
-mode = "none"             # none | dev_token | oidc
-# dev_token = "change-me"
+# Default since M-Install Checkpoint 2. The engine auto-provisions a
+# 32-byte URL-safe token at `<runtime.state_dir>/dev-token` (mode 0600)
+# on first boot and prints it once at WARN. Clients send
+# `Authorization: Bearer <token>`. See INSTALL.md §8.3 for the
+# `mode = "none"` (loopback-only) and `mode = "oidc"` alternatives.
+mode = "dev_token"        # none | dev_token | oidc
+# dev_token = "change-me"  # pin a value here to skip auto-provisioning
 # [auth.oidc]
 # issuer   = "https://auth.example.com/application/o/nexus"
 # audience = "nexus-engine"
