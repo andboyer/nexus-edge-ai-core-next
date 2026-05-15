@@ -296,7 +296,7 @@ function renderUsbPreferredEditor(usb: UsbSection): HTMLElement {
     type: "text",
     name: "usb_preferred_text",
     placeholder: "e.g. NEXUS_VAULT_42",
-    style: "display: none;",
+    style: { display: "none" },
   }) as HTMLInputElement;
 
   select.addEventListener("change", () => {
