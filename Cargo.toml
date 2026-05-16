@@ -154,6 +154,14 @@ reqwest = { version = "0.12", default-features = false, features = [
 # Hex encoding for sha256 round-trip in cloud `exists()` checks.
 hex = "0.4"
 
+# M-Admin Phase 1B — camera discovery. `ipnet` parses CIDR strings
+# and enumerates host iterators for the bounded-concurrency LAN
+# sweep; `dashmap` backs the lock-free `Arc<DashMap<Uuid, Session>>`
+# session registry the discovery handlers share with the
+# eviction sweep. Both are pure Rust, dependency-light.
+ipnet = "2"
+dashmap = "6"
+
 # HTTP mocking — only pulled in by `nexus-storage-cloud` tests so
 # the Drive / OneDrive integration tests don't need real cloud
 # accounts. Lives under [workspace.dependencies] so the version

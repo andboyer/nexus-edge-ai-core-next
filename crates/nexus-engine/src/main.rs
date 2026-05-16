@@ -17,6 +17,7 @@ mod api;
 mod auth_bootstrap;
 mod cold_read_cache;
 mod cold_replicator;
+mod discovery;
 mod oauth_sessions;
 mod retention;
 mod storage_safety;
@@ -413,7 +414,17 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
             admin_auth::AdminAuthState::from_config(&cfg.auth)
                 .context("building admin-auth state")?,
         ),
+        // M-Admin Phase 1B — empty registry at boot; populated by
+        // the four `/api/v1/admin/discovery/*` handlers. The
+        // eviction sweep spawned below drops stale sessions on a
+        // 60 s tick.
+        discovery_sessions: discovery::DiscoverySessions::new(),
     };
+
+    // M-Admin Phase 1B — start the registry eviction sweep. Holds
+    // its own Arc on the DashMap; no shutdown signal needed because
+    // the task does pure read-then-remove work on a 60 s tick.
+    discovery::spawn_eviction_sweep(api_state.discovery_sessions.clone());
 
     if !cli.no_api {
         let bind = cfg.server.api_bind.clone();

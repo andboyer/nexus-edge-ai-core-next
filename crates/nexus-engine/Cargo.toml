@@ -99,6 +99,12 @@ getrandom = "0.3"
 # URL-safe base64 encoding for that token.
 base64 = { workspace = true }
 
+# M-Admin Phase 1B — camera discovery. CIDR parsing + host
+# enumeration for the LAN sweep, and lock-free session registry
+# shared with the eviction task.
+ipnet = { workspace = true }
+dashmap = { workspace = true }
+
 # statvfs for the watermark sampler. Unix-only — non-unix builds
 # fall back to a never-panic probe (see storage_safety.rs).
 [target.'cfg(unix)'.dependencies]

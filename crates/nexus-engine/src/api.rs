@@ -44,6 +44,7 @@ use tower_http::trace::TraceLayer;
 
 use crate::admin_auth::{self, AdminAuthState};
 use crate::cold_read_cache::CacheJobs;
+use crate::discovery::{self, DiscoverySessions};
 
 #[derive(Clone)]
 pub struct ApiState {
@@ -108,6 +109,13 @@ pub struct ApiState {
     /// the three-leg consent flow can hand state between requests
     /// without ever putting a refresh token in the browser.
     pub oauth_sessions: crate::oauth_sessions::OAuthSessions,
+    /// M-Admin Phase 1B — in-memory registry of camera-discovery
+    /// sessions (ONVIF WS-Discovery + CIDR sweep). The four
+    /// `/api/v1/admin/discovery/*` handlers all read from this;
+    /// a background sweep evicts entries older than
+    /// [`crate::discovery::SESSION_TTL`]. Cheap to clone — wraps
+    /// an `Arc<DashMap<Uuid, _>>` internally.
+    pub discovery_sessions: DiscoverySessions,
 }
 
 pub fn router(state: ApiState) -> Router {
@@ -138,6 +146,25 @@ pub fn router(state: ApiState) -> Router {
             axum::routing::post(start_oauth),
         )
         .route("/v1/admin/oauth/status", get(oauth_status))
+        // M-Admin Phase 1B — camera discovery (ONVIF + CIDR sweep).
+        // All four routes spawn / read from the shared
+        // `discovery_sessions` registry on `ApiState`.
+        .route(
+            "/v1/admin/discovery/onvif",
+            axum::routing::post(discovery::post_discovery_onvif),
+        )
+        .route(
+            "/v1/admin/discovery/scan",
+            axum::routing::post(discovery::post_discovery_scan),
+        )
+        .route(
+            "/v1/admin/discovery/{session_id}",
+            get(discovery::get_discovery_session),
+        )
+        .route(
+            "/v1/admin/discovery/{session_id}/probe-rtsp",
+            axum::routing::post(discovery::post_probe_rtsp),
+        )
         .route_layer(axum::middleware::from_fn_with_state(
             state.admin_auth.clone(),
             admin_auth::admin_auth_layer,
@@ -194,7 +221,7 @@ pub fn router(state: ApiState) -> Router {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug)]
-struct ApiError(StatusCode, String);
+pub(crate) struct ApiError(pub(crate) StatusCode, pub(crate) String);
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
@@ -2770,6 +2797,7 @@ mod tests {
             preferred_usb_label,
             admin_auth,
             oauth_sessions: crate::oauth_sessions::OAuthSessions::new(),
+            discovery_sessions: crate::discovery::DiscoverySessions::new(),
         };
         let app = super::router(state);
         (app, store, dir)
