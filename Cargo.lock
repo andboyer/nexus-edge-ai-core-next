@@ -1953,6 +1953,7 @@ dependencies = [
  "image",
  "ipnet",
  "jsonwebtoken",
+ "md-5",
  "nexus-bus",
  "nexus-config",
  "nexus-inference",

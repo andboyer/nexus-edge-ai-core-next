@@ -106,6 +106,8 @@ ipnet = { workspace = true }
 dashmap = { workspace = true }
 # WS-Discovery ProbeMatch parser (M-Admin Phase 1B Step C).
 quick-xml = { workspace = true }
+# RTSP Digest auth (M-Admin Phase 1B Step D).
+md-5 = { workspace = true }
 
 # statvfs for the watermark sampler. Unix-only — non-unix builds
 # fall back to a never-panic probe (see storage_safety.rs).

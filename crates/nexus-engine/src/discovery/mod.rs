@@ -153,7 +153,6 @@ pub struct DiscoverySessionView {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)] // `username`/`password` are wired up in M-Admin Phase 1B Step D.
 pub struct ProbeRtspReq {
     pub host: String,
     pub port: u16,
