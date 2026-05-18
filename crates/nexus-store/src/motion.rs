@@ -605,6 +605,64 @@ impl Store {
         rows.into_iter().map(motion_event_row_from_row).collect()
     }
 
+    /// Cross-camera timeline lookup. Powers the rule-preview endpoint
+    /// (`POST /v1/admin/rules/preview`) — operators need to see "what
+    /// past detections would my new rule have matched", regardless of
+    /// camera. The per-camera variant above can't satisfy that without
+    /// O(N) round-trips; this one fans out a single SQL query against
+    /// an optional `IN (…)` filter.
+    ///
+    /// `camera_ids = None` ⇒ all cameras. Order is most-recent-first
+    /// (DESC) so the preview UI shows what the operator is most likely
+    /// to recognise; the per-camera variant uses ASC because it's
+    /// scrolling through a fixed window. Limit is a hard cap, not a
+    /// pagination cursor — the UI shows "stopped at N; widen the
+    /// window to see more" rather than implementing pagination here.
+    pub async fn list_motion_events_across_cameras(
+        &self,
+        camera_ids: Option<&[CameraId]>,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+        limit: i64,
+    ) -> Result<Vec<MotionEventRow>, StoreError> {
+        // sqlx doesn't bind a slice to `IN (?)`, so we either build
+        // the placeholders inline or fall back to "no filter" when
+        // the caller passes None. Building inline is safe here
+        // because every value is a `CameraId` (i64) — never user
+        // text — and we cap the list at 1000 to keep the SQL string
+        // well under the default sqlite parser limit.
+        let mut sql = String::from(
+            "SELECT id, camera_id, clip_id, track_id, kind, captured_at,
+                    bbox_x1, bbox_y1, bbox_x2, bbox_y2,
+                    label, confidence, attributes_json
+               FROM motion_events
+              WHERE captured_at BETWEEN ? AND ?",
+        );
+        if let Some(ids) = camera_ids {
+            if !ids.is_empty() {
+                let truncated = if ids.len() > 1000 { &ids[..1000] } else { ids };
+                sql.push_str(" AND camera_id IN (");
+                for (i, id) in truncated.iter().enumerate() {
+                    if i > 0 {
+                        sql.push(',');
+                    }
+                    // i64 literal — no quoting / escaping needed.
+                    sql.push_str(&id.to_string());
+                }
+                sql.push(')');
+            }
+        }
+        sql.push_str(" ORDER BY captured_at DESC LIMIT ?");
+
+        let rows = sqlx::query(&sql)
+            .bind(from.to_rfc3339())
+            .bind(to.to_rfc3339())
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter().map(motion_event_row_from_row).collect()
+    }
+
     /// Bucketed motion-event counts for the per-camera Timeline UI
     /// (M2.1 Stage B B7). Powers
     /// `GET /api/v1/cameras/:id/motion/histogram`.

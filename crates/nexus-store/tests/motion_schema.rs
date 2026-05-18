@@ -353,6 +353,107 @@ async fn list_motion_events_for_camera_window_and_order() {
 }
 
 #[tokio::test]
+async fn list_motion_events_across_cameras_filters_window_and_scope() {
+    // Powers `POST /api/rules/preview` — must:
+    //   * span multiple cameras when no filter is set,
+    //   * apply IN(...) filter when the rule has a camera_filter,
+    //   * order DESC by captured_at,
+    //   * honour the limit cap.
+    let (store, _dir) = fresh_store().await;
+    store
+        .upsert_camera(&sample_camera(1, "front"))
+        .await
+        .unwrap();
+    store
+        .upsert_camera(&sample_camera(2, "back"))
+        .await
+        .unwrap();
+    let now = Utc::now();
+    let clip_a = store
+        .open_clip(&sample_clip(1, now - Duration::minutes(10)))
+        .await
+        .unwrap();
+    let clip_b = store
+        .open_clip(&sample_clip(2, now - Duration::minutes(10)))
+        .await
+        .unwrap();
+
+    // 3 events on cam 1, 2 events on cam 2, all within window.
+    for i in 0..3 {
+        store
+            .insert_motion_event(&sample_motion_event(
+                1,
+                clip_a,
+                10 + i as u64,
+                MotionEventKind::Born,
+                now - Duration::seconds(i * 10),
+            ))
+            .await
+            .unwrap();
+    }
+    for i in 0..2 {
+        store
+            .insert_motion_event(&sample_motion_event(
+                2,
+                clip_b,
+                20 + i as u64,
+                MotionEventKind::Born,
+                now - Duration::seconds(i * 10),
+            ))
+            .await
+            .unwrap();
+    }
+    // One stale event well outside the window — must NOT appear.
+    store
+        .insert_motion_event(&sample_motion_event(
+            1,
+            clip_a,
+            99,
+            MotionEventKind::Born,
+            now - Duration::hours(48),
+        ))
+        .await
+        .unwrap();
+
+    let from = now - Duration::minutes(1);
+    let to = now + Duration::seconds(1);
+
+    // No filter ⇒ all 5 in-window rows.
+    let all = store
+        .list_motion_events_across_cameras(None, from, to, 100)
+        .await
+        .unwrap();
+    assert_eq!(all.len(), 5);
+    // DESC by captured_at.
+    for w in all.windows(2) {
+        assert!(w[0].captured_at >= w[1].captured_at);
+    }
+
+    // Filter to camera 2 only ⇒ exactly 2 rows.
+    let cam2 = store
+        .list_motion_events_across_cameras(Some(&[2]), from, to, 100)
+        .await
+        .unwrap();
+    assert_eq!(cam2.len(), 2);
+    assert!(cam2.iter().all(|r| r.camera_id == 2));
+
+    // Empty filter slice ⇒ treat as "all" (matches None semantics).
+    let empty_scope = store
+        .list_motion_events_across_cameras(Some(&[]), from, to, 100)
+        .await
+        .unwrap();
+    assert_eq!(empty_scope.len(), 5);
+
+    // Limit cap honoured — DESC order means we keep the newest.
+    let limited = store
+        .list_motion_events_across_cameras(None, from, to, 2)
+        .await
+        .unwrap();
+    assert_eq!(limited.len(), 2);
+    assert_eq!(limited[0].captured_at, all[0].captured_at);
+}
+
+#[tokio::test]
 async fn list_motion_histogram_for_camera_buckets_by_seconds() {
     // M2.1 Stage B B7 — Timeline UI grid wants per-hour bars.
     // Verify the SQL bucket math: events scattered across a 3h
