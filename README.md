@@ -1,7 +1,13 @@
 # nexus-edge-ai-core-next
 
-> **Status:** v2 architectural rewrite. Pre-alpha. Not yet at parity with
-> `nexus-edge-ai-core`; do not deploy.
+> **Status:** v2 architectural rewrite, beta. M0–M4 + M-Install
+> Checkpoints 1–2 + M-Admin Phases 0–6 all complete. Suitable for
+> dogfooding on the reference hardware tiers; production deployment
+> blocked on M7 (alert delivery) + M8 (first customer trial) per
+> [`docs/ROADMAP.md`](docs/ROADMAP.md). Full operator CRUD UI shipped:
+> cameras (ONVIF + CIDR discovery), rules (visual + raw CEL),
+> polygon zones, storage backends. The shell is at
+> `http://<engine-host>:8089/` — see [`docs/INSTALL.md`](docs/INSTALL.md) §10.0.
 
 A streaming-DAG edge-AI pipeline for surveillance video.
 
@@ -98,7 +104,10 @@ docker compose -f deploy/docker-compose.yml up
 ./target/release/nexus-probe --out data/device-manifest.json
 # Probe writes recommended_tier; pick the matching config/tiers/*.toml.
 ./target/release/nexus-engine --config config/tiers/t24.toml
-# Engine listens on :8089 — UI is at /, API is at /api/*
+# Engine listens on :8089 — the SPA at / hosts Viewer (live), Timeline (clips),
+# Events (alerts) plus an admin console (Cameras CRUD + ONVIF/CIDR discovery,
+# Rules CRUD + visual CEL builder, polygon Zones, Storage backends, Backends
+# pool, Health). REST API is mounted under /api/*.
 ```
 
 Single binary, single port, single container. Admin and viewer are routes in
@@ -106,9 +115,12 @@ the same SPA. Python sidecars are gone.
 
 ## Status
 
-Pre-alpha. Crates compile in isolation; full workspace compile requires
-`gstreamer-1.0` and `onnxruntime` system libs. No real frame has flowed through
-end-to-end yet — that's M1.
+Beta. Cores **M0–M4** + **M-Install Checkpoints 1–2** + **M-Admin Phases 0–6**
+all shipped. Full workspace compile + tests pass on macOS (`brew install
+gstreamer onnxruntime node@22`) and on the Docker reference image. Production
+deployment is still blocked on **M7** (alert delivery — webhook + SureView)
+and **M8** (first customer trial). See [`docs/ROADMAP.md`](docs/ROADMAP.md)
+for the milestone tracker.
 
 ## License
 

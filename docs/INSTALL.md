@@ -1,20 +1,22 @@
 # Installation guide — `nexus-edge-ai-core-next`
 
-> **Status: pre-alpha.** Not yet at parity with `nexus-edge-ai-core`;
-> **do not deploy to production.** This guide is published so the boxes
-> we have on the desk can be brought up reproducibly while the v2
-> rewrite stabilises. Follow the verification gate in §9 before
-> declaring an install "done".
+> **Status: beta.** Cores M0–M4 + M-Install Checkpoints 1–2 + M-Admin
+> Phases 0–6 are complete; the engine + admin UI are usable
+> end-to-end on the reference hardware tiers. Production deployment
+> is still blocked on M7 (alert delivery) + M8 (first customer
+> trial) per [`ROADMAP.md`](ROADMAP.md). Follow the verification
+> gate in §9 before declaring an install "done", and start with
+> §10.0 for the admin UI quickstart.
 >
 > **Audience:** an operator bringing up the engine on a fresh
 > tier-target box. If you're contributing to the codebase, follow
 > [DEV_NOTES.md](DEV_NOTES.md) instead — it covers the macOS dev
 > toolchain and the per-change `cargo` loop.
 >
-> **Last reviewed:** 2026-05-15 (post M-Install Checkpoint 2 — auth
-> defaults flipped to `dev_token`, `mode = "none"` now requires
-> loopback bind, missing `[auth]` blocks are grandfathered for 7 days
-> with a deprecation WARN). The kernel, driver, ORT, and CUDA
+> **Last reviewed:** 2026-05-17 (post M-Admin Phase 6 — full CRUD
+> admin console shipped: cameras with ONVIF + CIDR discovery,
+> rules with visual CEL builder + inline validation, polygon
+> zones, storage backends). The kernel, driver, ORT, and CUDA
 > versions cited here drift over time. Re-validate against the
 > Appendix B transcript on a fresh Multipass VM at every minor
 > release before relying on the published commands.
@@ -1149,6 +1151,65 @@ the prompt list).
 ---
 
 ## 10. Operating + day-2 essentials
+
+### 10.0 Admin UI quickstart
+
+The operator console is a single-page web app served by the engine
+binary itself at **`http://<engine-host>:8089/`** — no separate
+admin process, no `/ui` path. Sidebar groups three operational
+modes:
+
+- **Operations** (read-only, live)
+  - *Viewer* — live camera feed + tracked-object overlay.
+  - *Timeline* — hourly motion clips with inline playback.
+  - *Events* — alert history (filterable by rule / camera / severity).
+
+- **Configuration** (CRUD; saves are inline, no full reload)
+  - *Cameras* — `+ New camera` opens a form covering every
+    `CameraConfig` field including parking-lot mode and an
+    Advanced JSON editor for `model_override`. The `🔍 Discover`
+    button opens a modal that runs ONVIF WS-Discovery and a CIDR
+    sweep in parallel; results stream in live. Per-row **Verify**
+    issues an RTSP `OPTIONS`/`DESCRIBE` (Digest auth supported) and
+    shows the SDP streams; **Add** prefills the camera form with
+    the guessed RTSP URL.
+  - *Rules* — `+ New rule` opens a form for id / name / severity /
+    `camera_filter` (multi-select chips) / track-age / consecutive
+    frames / cooldown / enabled. The `when` field has two modes:
+    a row-based **visual CEL builder** (subject ▸ operator ▸ value,
+    AND/OR joiner) and a **raw text** escape hatch. Raw mode calls
+    `POST /api/rules/validate` on blur and shows the parser error
+    inline before save.
+  - *Zones* (per camera, inside the camera form) — polygon editor
+    overlaid on the latest snapshot. Click to add vertices, drag
+    to move, right-click to delete. Green polygons are inclusion
+    zones, red are exclusion; coords are stored normalized
+    `[0..1]` so they survive resolution changes.
+
+- **System**
+  - *Storage* — local clips usage, cold-backend registry (LAN /
+    Google Drive / OneDrive), watermark + throttle settings,
+    replication stats. OAuth for Drive/OneDrive is end-to-end
+    in-engine; the refresh token never reaches the browser.
+  - *Backends* — detector-pool slot/state/generation telemetry.
+  - *Health* — engine vitals, version, uptime.
+
+#### Bearer-token auth (LAN / Tailscale access)
+
+Loopback (`127.0.0.1`) requires no token. Over LAN or Tailscale,
+paste a bearer token into the topbar field — the SPA stores it in
+`localStorage` and adds `Authorization: Bearer …` to every gated
+write. The token value depends on the `[auth]` config block:
+
+- `mode = "dev_token"` (default per §8.3) — read the
+  auto-generated token from `data/state/dev-token` (or the path
+  configured under `state_dir`) on the engine host. The engine
+  prints it once at WARN level on first boot.
+- `mode = "oidc"` — use an access token from your IdP (see §8.3.2
+  for the discovery URL setup).
+
+Any 401 from a gated write will surface as a toast; clearing the
+token field and refreshing reverts to loopback-only mode.
 
 ### 10.1 Logs
 
