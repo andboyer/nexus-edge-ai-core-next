@@ -31,6 +31,7 @@ import type {
   ModelConfig,
   ZoneConfig,
 } from "../api/types.js";
+import { COCO_DOMAIN_LABELS } from "../api/labels.js";
 import { openZonesEditor } from "./zones-editor.js";
 
 export interface OpenCameraFormOpts {
@@ -259,15 +260,7 @@ function buildForm(
     ),
     FormSection(
       "Detection",
-      ChipsInput({
-        label: "Prompts",
-        value: state.prompts,
-        placeholder: "person, car, package…",
-        helpText: "Open-vocab prompts (yolo_world) or labels-of-interest (ensemble).",
-        onChange: (next) => {
-          state.prompts = next;
-        },
-      }),
+      promptsField(state),
       NumberField({
         label: "Max FPS",
         value: state.max_fps,
@@ -282,6 +275,99 @@ function buildForm(
     ),
     zonesSection(state, opts, rerender),
     advancedExpander(state, errors),
+  );
+}
+
+/// Prompts field + COCO label chooser.
+///
+/// The free-text `ChipsInput` is preserved so yolo_world open-vocab
+/// pipelines (which can accept arbitrary prompts) still work, but a
+/// click-to-add catalogue of the 12 COCO domain labels the bundled
+/// detector actually emits is rendered beneath it. Clicking a chip
+/// adds the label to `state.prompts`; the chip dims out (`chip-on`)
+/// once it's already in the list to avoid duplicates. Subtree
+/// rerender is local — we don't kick the whole form because that
+/// would scroll the dialog and steal focus from the (likely empty)
+/// chip-input the operator is about to type into next.
+function promptsField(state: FormState): HTMLElement {
+  const host = h("div", { class: "prompts-field-host" });
+
+  function paint(): void {
+    while (host.firstChild) host.removeChild(host.firstChild);
+    host.append(
+      ChipsInput({
+        label: "Prompts",
+        value: state.prompts,
+        placeholder: "person, car, package…",
+        helpText:
+          "Open-vocab prompts (yolo_world) or labels-of-interest (ensemble).",
+        onChange: (next) => {
+          state.prompts = next;
+          paint();
+        },
+      }),
+      cocoChooser(state, paint),
+    );
+  }
+  paint();
+  return host;
+}
+
+function cocoChooser(state: FormState, onChange: () => void): HTMLElement {
+  // Group COCO labels by category so the chip strip reads as
+  // People / Vehicles / Animals / Carried — easier to scan than
+  // a flat 12-chip line.
+  const groups = new Map<string, typeof COCO_DOMAIN_LABELS>();
+  for (const l of COCO_DOMAIN_LABELS) {
+    const arr = groups.get(l.group);
+    if (arr) (arr as Array<(typeof COCO_DOMAIN_LABELS)[number]>).push(l);
+    else groups.set(l.group, [l] as typeof COCO_DOMAIN_LABELS);
+  }
+
+  const sel = new Set(state.prompts);
+  const groupNodes: HTMLElement[] = [];
+  for (const [name, labels] of groups) {
+    const chips = labels.map((l) => {
+      const isOn = sel.has(l.label);
+      return h(
+        "button",
+        {
+          type: "button",
+          class: "chip combobox-chip" + (isOn ? " chip-on" : ""),
+          title: isOn
+            ? `Click to remove ${l.label} (COCO id ${l.cocoId})`
+            : `Click to add ${l.label} (COCO id ${l.cocoId})`,
+          on: {
+            click: () => {
+              const idx = state.prompts.indexOf(l.label);
+              if (idx >= 0) state.prompts.splice(idx, 1);
+              else state.prompts.push(l.label);
+              onChange();
+            },
+          },
+        },
+        l.label,
+      );
+    });
+    groupNodes.push(
+      h(
+        "div",
+        { class: "coco-chooser-group" },
+        h("span", { class: "coco-chooser-group-name" }, name),
+        h("div", { class: "coco-chooser-group-chips" }, ...chips),
+      ),
+    );
+  }
+
+  return h(
+    "div",
+    { class: "coco-chooser" },
+    h(
+      "div",
+      { class: "coco-chooser-head" },
+      h("span", { class: "field-help" }, "Quick add — COCO labels emitted by the bundled YOLO detector. Click to add/remove."),
+    ),
+    ...groupNodes,
   );
 }
 
@@ -303,7 +389,7 @@ function zonesSection(
     "button",
     {
       type: "button",
-      class: "btn",
+      class: "ghost",
       on: {
         click: () => {
           // Build a transient CameraConfig stand-in for the editor;
@@ -318,7 +404,7 @@ function zonesSection(
         },
       },
     },
-    state.zones.length === 0 ? "Add zones\u2026" : "Edit zones\u2026",
+    state.zones.length === 0 ? "Add zones" : "Edit zones",
   );
   return FormSection(
     "Zones",

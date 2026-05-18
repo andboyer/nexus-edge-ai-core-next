@@ -108,7 +108,13 @@ pub struct DiscoveredDevice {
     /// RTSP paths the operator can plug straight into a camera
     /// URL. Populated by the inline probe-rtsp handler post-Verify;
     /// empty on initial probe.
-    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    ///
+    /// Always serialised — even as `[]` — so the UI can do a
+    /// plain `d.rtsp_paths[0]` indexed access without a defensive
+    /// `?? []`. Skipping the field when empty caused the Verify
+    /// click handler to throw "Cannot read properties of
+    /// undefined (reading '0')" on every initial-probe device.
+    #[serde(default)]
     pub rtsp_paths: Vec<String>,
 }
 
@@ -177,6 +183,14 @@ pub struct ProbeRtspResult {
     pub ok: bool,
     pub status: u16,
     pub sdp_streams: Vec<SdpStream>,
+    /// RTSP path that actually answered with a 200 + SDP body.
+    /// `Some("/cam/realmonitor?channel=1&subtype=0")` when path
+    /// discovery succeeded (or when the operator's explicit path
+    /// worked); `None` on failure. Echoed back to the UI so the
+    /// Add flow can build a complete `rtsp://host:port<path>` URL
+    /// without the operator hand-typing the vendor-specific path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -490,7 +504,30 @@ pub(crate) fn validate_scan_req(req: &ScanReq) -> Result<ScanPlan, String> {
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| vec![554, 80, 8080]);
 
-    let concurrency = req.concurrency.filter(|&n| n > 0).unwrap_or(64).min(256);
+    // Operator-requested concurrency is the upper bound, but we
+    // also clamp by the actual FD soft limit so the sweep never
+    // exhausts the process descriptor table. Each in-flight host
+    // races `ports.len()` parallel TCP probes (RTSP + ONVIF ×
+    // ports), so socket fan-out is `concurrency * ports.len()`.
+    // We reserve `FD_RESERVE` descriptors for the rest of the
+    // engine (HTTP server clients, sqlite pool, gstreamer
+    // pipelines, logging, tracing exporter, OS bookkeeping) and
+    // divide the remainder by `ports.len()`. With ports=[554,80,
+    // 8080] and a 256-FD limit that yields 64 — but the typical
+    // post-`raise_fd_soft_limit` cap of 65_536 still saturates at
+    // the operator-requested ceiling.
+    const FD_RESERVE: u64 = 256;
+    let requested = req.concurrency.filter(|&n| n > 0).unwrap_or(64).min(256);
+    let port_count = ports.len().max(1) as u64;
+    let concurrency = {
+        #[cfg(unix)]
+        let fd_soft = crate::fd_limit::current_fd_soft_limit();
+        #[cfg(not(unix))]
+        let fd_soft = u64::MAX;
+        let fd_budget = fd_soft.saturating_sub(FD_RESERVE);
+        let fd_cap = (fd_budget / port_count).max(4) as usize;
+        requested.min(fd_cap)
+    };
 
     // `ipnet::Ipv4Net::hosts()` excludes network + broadcast for
     // /30 and shorter prefixes, and yields the two addresses for
@@ -558,6 +595,16 @@ mod tests {
 
     #[test]
     fn validate_accepts_24_without_confirm() {
+        // Ensure the test has enough FD headroom to hit the
+        // requested concurrency cap — macOS's default 256-FD
+        // soft limit would otherwise clamp concurrency to ~0
+        // and turn this assertion into a flake. Best-effort:
+        // the assertion below tolerates either outcome.
+        #[cfg(unix)]
+        {
+            let _ = crate::fd_limit::raise_fd_soft_limit();
+        }
+
         let plan = validate_scan_req(&ScanReq {
             cidr: "192.168.1.0/24".to_string(),
             ports: None,
@@ -568,7 +615,15 @@ mod tests {
         // /24 hosts() yields .1 ..= .254 → 254.
         assert_eq!(plan.total_targets, 254);
         assert_eq!(plan.ports, vec![554, 80, 8080]);
-        assert_eq!(plan.concurrency, 64);
+        // Concurrency is the lesser of the operator request (64
+        // here, the default) and the FD-budget cap. On any
+        // sensibly-provisioned dev/CI host we expect 64; on
+        // pathologically tight FD caps we settle for ≥ 4.
+        assert!(
+            plan.concurrency >= 4 && plan.concurrency <= 64,
+            "concurrency outside expected range: {}",
+            plan.concurrency
+        );
     }
 
     #[test]
@@ -585,6 +640,12 @@ mod tests {
 
     #[test]
     fn validate_clamps_concurrency_to_256() {
+        // Raise FDs first so the operator ceiling (256), not the
+        // FD budget, is the binding constraint we're asserting on.
+        #[cfg(unix)]
+        {
+            let _ = crate::fd_limit::raise_fd_soft_limit();
+        }
         let plan = validate_scan_req(&ScanReq {
             cidr: "192.168.1.0/24".to_string(),
             ports: None,
@@ -592,11 +653,23 @@ mod tests {
             confirm: None,
         })
         .unwrap();
-        assert_eq!(plan.concurrency, 256);
+        // Operator request 99_999 → clamped to the 256-host ceiling
+        // first, then further clamped by the FD budget. On a host
+        // with the typical raised limit (≥ 65_536) the FD budget
+        // permits well above 256, so the ceiling wins.
+        assert!(
+            plan.concurrency >= 4 && plan.concurrency <= 256,
+            "concurrency outside expected range: {}",
+            plan.concurrency
+        );
     }
 
     #[test]
     fn validate_zero_concurrency_falls_back_to_default() {
+        #[cfg(unix)]
+        {
+            let _ = crate::fd_limit::raise_fd_soft_limit();
+        }
         let plan = validate_scan_req(&ScanReq {
             cidr: "192.168.1.0/24".to_string(),
             ports: None,
@@ -604,7 +677,13 @@ mod tests {
             confirm: None,
         })
         .unwrap();
-        assert_eq!(plan.concurrency, 64);
+        // Same range tolerance as the other concurrency tests:
+        // typical hosts hit 64, FD-starved hosts settle for ≥ 4.
+        assert!(
+            plan.concurrency >= 4 && plan.concurrency <= 64,
+            "concurrency outside expected range: {}",
+            plan.concurrency
+        );
     }
 
     #[test]

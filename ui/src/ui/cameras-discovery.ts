@@ -50,6 +50,17 @@ export function openDiscoveryDialog(opts: OpenDiscoveryOpts): Promise<boolean> {
   let auditSessionId: string | null = null;
   let anyAdded = false;
 
+  /// Shared credentials applied to every Verify probe (sent as
+  /// Digest auth) and embedded into every Add URL
+  /// (`rtsp://user:pass@host:port/path`). Most consumer-camera
+  /// fleets share one admin password across the whole site, so
+  /// asking for it once per Discover session is the right UX. The
+  /// values never leave this dialog instance — they're not
+  /// persisted to the engine, only used to build the per-camera
+  /// URL passed to `cameras-form.ts`.
+  let usernameInput = "";
+  let passwordInput = "";
+
   // Per-session snapshot map keyed by session id. Polling tasks
   // mutate this map then call `renderResults()`. The map outlives
   // the polling tasks because we leave finished sessions visible.
@@ -60,6 +71,12 @@ export function openDiscoveryDialog(opts: OpenDiscoveryOpts): Promise<boolean> {
     string,
     { text: string; ok: boolean | null }
   >();
+  /// Path returned by the most recent successful Verify per device
+  /// key. Threaded into `onAdd()` so the camera URL embeds the
+  /// vendor-specific path the backend just confirmed works
+  /// (`/Streaming/Channels/101`, `/cam/realmonitor?...`, …) rather
+  /// than the bare `/` the operator would otherwise get.
+  const verifiedPaths = new Map<string, string>();
 
   const body = h("div", { class: "discovery-body" });
   const controlsHost = h("div", { class: "discovery-controls" });
@@ -126,11 +143,48 @@ export function openDiscoveryDialog(opts: OpenDiscoveryOpts): Promise<boolean> {
       scanBtn,
     );
 
+    // Shared credentials block. Intentionally on the *outside* of
+    // the controls so the operator can type creds before clicking
+    // Verify on any of the found devices (most consumer cameras
+    // gate DESCRIBE behind Digest auth — without these the Verify
+    // button always reports 401). The block does NOT trigger a
+    // rebuild on input — that would steal focus on every keystroke
+    // and erase the typed-in password mid-character. Instead we
+    // capture the value via the input handler and read it lazily.
+    const usernameField = TextField({
+      label: "Camera username",
+      value: usernameInput,
+      placeholder: "admin",
+      autocomplete: "username",
+      helpText:
+        "Optional. Applied to every Verify and embedded into every Add URL.",
+      onChange: (v) => {
+        usernameInput = v;
+      },
+    });
+    const passwordField = TextField({
+      label: "Camera password",
+      value: passwordInput,
+      type: "password",
+      autocomplete: "new-password",
+      reveal: true,
+      onChange: (v) => {
+        passwordInput = v;
+      },
+    });
+    const credsRow = h(
+      "div",
+      { class: "discovery-creds" },
+      usernameField,
+      passwordField,
+    );
+
     const section = h(
       "div",
       { class: "admin-section" },
       cidrField,
       confirmToggle,
+      credsRow,
       actions,
     );
     controlsHost.append(section);
@@ -344,14 +398,38 @@ export function openDiscoveryDialog(opts: OpenDiscoveryOpts): Promise<boolean> {
         {
           host: d.ip,
           port: 554,
-          path: d.rtsp_paths[0] ?? "/",
+          // Empty path triggers the backend's vendor-default
+          // discovery loop (Hikvision / Dahua / Axis / Reolink /
+          // …). Pass the device's path verbatim if the scan
+          // already learned one; otherwise let the backend probe.
+          path: (d.rtsp_paths ?? [])[0] ?? "",
+          // `exactOptionalPropertyTypes` distinguishes "missing key"
+          // from "key: undefined" — spread only when present so the
+          // wire shape matches `ProbeRtspReq`.
+          ...(usernameInput ? { username: usernameInput } : {}),
+          ...(passwordInput ? { password: passwordInput } : {}),
         },
       );
-      const codecs = r.sdp_streams.map((s) => s.codec).join("+");
-      verifyResults.set(key, {
-        text: r.ok ? `✓ ${codecs || "ok"}` : `✗ status ${r.status}`,
-        ok: r.ok,
-      });
+      const codecs = (r.sdp_streams ?? []).map((s) => s.codec).join("+");
+      // Cache the working path so onAdd() can splice it into the
+      // camera URL. Backend sets `path` on auth failures too — we
+      // intentionally do NOT cache those because the path itself
+      // was never confirmed against a 200.
+      if (r.ok && r.path) {
+        verifiedPaths.set(key, r.path);
+      }
+      let text: string;
+      if (r.ok) {
+        const pathLabel = r.path ? ` ${r.path}` : "";
+        text = `✓ ${codecs || "ok"}${pathLabel}`;
+      } else if (r.status === 401 || r.status === 403) {
+        text = `✗ auth required (${r.status}) — set username/password above`;
+      } else if (r.status === 0) {
+        text = "✗ no RTSP response";
+      } else {
+        text = `✗ status ${r.status}`;
+      }
+      verifyResults.set(key, { text, ok: r.ok });
     } catch (e) {
       verifyResults.set(key, {
         text: `✗ ${(e as Error).message}`,
@@ -362,10 +440,19 @@ export function openDiscoveryDialog(opts: OpenDiscoveryOpts): Promise<boolean> {
   }
 
   async function onAdd(d: DiscoveredDevice): Promise<void> {
+    const key = `${d.ip}:${d.port}`;
     const name =
       [d.vendor, d.model].filter(Boolean).join(" ").trim() || `Camera @${d.ip}`;
-    const rtspPath = d.rtsp_paths[0] ?? "/";
-    const url = `rtsp://${d.ip}:554${rtspPath}`;
+    // Prefer the path Verify just confirmed; fall back to anything
+    // the scan happened to report; last resort is `/` (which only
+    // works for a handful of budget cameras and is what the user
+    // would have hand-typed anyway).
+    const rtspPath =
+      verifiedPaths.get(key) ?? (d.rtsp_paths ?? [])[0] ?? "/";
+    const creds = usernameInput
+      ? `${encodeURIComponent(usernameInput)}:${encodeURIComponent(passwordInput)}@`
+      : "";
+    const url = `rtsp://${creds}${d.ip}:554${rtspPath}`;
     const ok = await openCameraForm({
       mode: "create",
       existingIds: opts.existingIds,
@@ -402,7 +489,7 @@ function metadataScore(d: DiscoveredDevice): number {
     (d.hardware ? 1 : 0) +
     (d.firmware ? 1 : 0) +
     (d.mac ? 1 : 0) +
-    (d.rtsp_paths.length > 0 ? 1 : 0)
+    ((d.rtsp_paths ?? []).length > 0 ? 1 : 0)
   );
 }
 
