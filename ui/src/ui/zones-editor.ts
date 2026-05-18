@@ -12,11 +12,13 @@
 //
 // Editing UX:
 //   - "Add zone" → creates a new in-progress polygon. Click on the
-//     canvas to drop vertices. Double-click (or "Close polygon"
-//     button) to finalise once ≥3 vertices exist.
-//   - "Edit" on a finalised zone → drag any vertex to move it,
+//     canvas to drop vertices. Click the FIRST vertex (or double-
+//     click anywhere) to finalise once ≥3 vertices exist; the
+//     "Close polygon" button is still there as a fallback.
+//   - Gear icon on a finalised zone → drag any vertex to move it,
+//     click on an edge to insert a new vertex at that point,
 //     shift-click a vertex to delete it (≥3 must remain).
-//   - "Delete" removes a whole zone.
+//   - Trash icon removes a whole zone.
 //   - Kind dropdown per zone: Inclusion (default, observational —
 //     drives `motion.zone_state`), Exclusion (engine drops any
 //     detection whose bbox centre falls inside), Dwell (reserved).
@@ -30,6 +32,7 @@
 import { h, clear } from "../lib/el.js";
 import { openDialog, dialogFooter, type DialogHandle } from "../lib/dialog.js";
 import { Select } from "../lib/forms.js";
+import { iconButton, icon } from "../lib/icons.js";
 import { api } from "../api/client.js";
 import type { CameraConfig, ZoneConfig } from "../api/types.js";
 
@@ -214,6 +217,48 @@ export function openZonesEditor(
     return null;
   }
 
+  /// Hit-test a click against the polygon's *edges* (line segments
+  /// between consecutive vertices, including the closing segment
+  /// from last → first). Returns the index AFTER which a new vertex
+  /// should be inserted (so `poly[result]` and `poly[result+1]` are
+  /// the two endpoints of the matched edge — modulo wraparound),
+  /// or `null` if no edge is within `HIT_R` CSS pixels of the click.
+  ///
+  /// This is the "click a line to add a vertex" UX from
+  /// `nexus-admin/static/js/zone-editor.js`. Without it, the only
+  /// way to insert a vertex is to delete the polygon and redraw
+  /// from scratch — which is bad UX for fine-tuning a zone you've
+  /// already roughed in.
+  function edgeHitTest(
+    ev: MouseEvent,
+    poly: ReadonlyArray<[number, number]>,
+  ): number | null {
+    if (poly.length < 2) return null;
+    const rect = canvas.getBoundingClientRect();
+    const cx = ev.clientX - rect.left;
+    const cy = ev.clientY - rect.top;
+    const HIT_R = 6;
+    let bestIdx: number | null = null;
+    let bestDist = HIT_R;
+    // Iterate edges; for a finalised polygon the last edge closes
+    // back to vertex 0.
+    const edgeCount = poly.length; // closing edge included
+    for (let i = 0; i < edgeCount; i++) {
+      const a = poly[i]!;
+      const b = poly[(i + 1) % poly.length]!;
+      const ax = a[0] * rect.width;
+      const ay = a[1] * rect.height;
+      const bx = b[0] * rect.width;
+      const by = b[1] * rect.height;
+      const d = pointToSegmentDistance(cx, cy, ax, ay, bx, by);
+      if (d < bestDist) {
+        bestDist = d;
+        bestIdx = i;
+      }
+    }
+    return bestIdx;
+  }
+
   canvas.addEventListener("mousedown", (ev) => {
     if (state.selectedIdx === null) return;
     const zone = state.zones[state.selectedIdx];
@@ -239,10 +284,39 @@ export function openZonesEditor(
         ev.preventDefault();
         return;
       }
+      // No vertex hit — try the edge: a click near a polygon edge
+      // inserts a new vertex at the click point. Lets operators
+      // refine an existing shape without restarting.
+      const ei = edgeHitTest(ev, zone.polygon);
+      if (ei !== null) {
+        const [nx, ny] = clickToNormalized(ev);
+        zone.polygon.splice(ei + 1, 0, [nx, ny]);
+        // Drag-state the freshly-inserted vertex so the operator
+        // can keep refining without releasing the mouse.
+        state.dragVert = ei + 1;
+        rerenderSidebar();
+        redraw();
+        ev.preventDefault();
+        return;
+      }
     }
 
-    // Drafting → add a new vertex at the click position.
+    // Drafting → add a new vertex at the click position. If the
+    // click is on (or very near) the FIRST vertex and we already
+    // have ≥3 verts, auto-close the polygon instead of adding a
+    // duplicate point. Matches operator expectation from every
+    // other polygon editor (PowerPoint, Inkscape, Google Maps).
     if (state.drafting) {
+      if (zone.polygon.length >= 3) {
+        const firstHit = vertexHitTest(ev, zone.polygon.slice(0, 1));
+        if (firstHit !== null) {
+          state.drafting = false;
+          rerenderSidebar();
+          redraw();
+          ev.preventDefault();
+          return;
+        }
+      }
       const [nx, ny] = clickToNormalized(ev);
       zone.polygon.push([nx, ny]);
       rerenderSidebar();
@@ -296,19 +370,21 @@ export function openZonesEditor(
 
   function rerenderSidebar(): void {
     clear(sidebar);
+    const addBtn = h(
+      "button",
+      {
+        type: "button",
+        class: "btn btn-primary btn-sm btn-with-icon",
+        on: { click: () => addZone() },
+      },
+      icon("plus"),
+      "Add zone",
+    );
     const header = h(
       "div",
       { class: "zones-sidebar-head" },
       h("h3", null, "Zones"),
-      h(
-        "button",
-        {
-          type: "button",
-          class: "btn btn-primary btn-sm",
-          on: { click: () => addZone() },
-        },
-        "+ Add zone",
-      ),
+      addBtn,
     );
     sidebar.append(header);
 
@@ -317,7 +393,7 @@ export function openZonesEditor(
         h(
           "p",
           { class: "zones-empty" },
-          "No zones defined. Click + Add zone, then click on the snapshot to drop vertices. Double-click to close the polygon.",
+          "No zones defined. Click + Add zone, then click on the snapshot to drop vertices. Click the first vertex (or double-click) to close the polygon.",
         ),
       );
       return;
@@ -378,27 +454,19 @@ export function openZonesEditor(
         );
       } else {
         actions.append(
-          h(
-            "button",
-            {
-              type: "button",
-              class: "btn btn-sm",
-              on: { click: () => selectZone(i) },
-            },
-            isSelected ? "Editing" : "Edit",
-          ),
+          iconButton("gear", {
+            title: isSelected ? "Currently editing" : `Edit ${z.name || "zone"}`,
+            disabled: isSelected,
+            onClick: () => selectZone(i),
+          }),
         );
       }
       actions.append(
-        h(
-          "button",
-          {
-            type: "button",
-            class: "btn btn-sm btn-danger",
-            on: { click: () => deleteZone(i) },
-          },
-          "Delete",
-        ),
+        iconButton("trash", {
+          title: `Delete ${z.name || "zone"}`,
+          danger: true,
+          onClick: () => deleteZone(i),
+        }),
       );
 
       item.append(nameInput, kindSelect, meta, actions);
@@ -410,7 +478,7 @@ export function openZonesEditor(
       h(
         "p",
         { class: "zones-hints" },
-        "Click on the snapshot to drop vertices · Drag a handle to move · Shift-click a handle to delete it",
+        "Click on the snapshot to drop vertices · Click the first vertex (or double-click) to close · Click an edge to insert a new vertex · Drag a handle to move · Shift-click a handle to delete it",
       ),
     );
   }
@@ -515,6 +583,32 @@ function clamp01(v: number): number {
   if (v < 0) return 0;
   if (v > 1) return 1;
   return v;
+}
+
+/// Perpendicular distance from point `(px, py)` to the line
+/// segment `(ax, ay) → (bx, by)` in CSS pixels. Used by the
+/// edge-hit test that lets operators click on a polygon edge to
+/// insert a new vertex. Uses the classic projection formula and
+/// clamps the parameter `t` to [0,1] so endpoint-near clicks
+/// return the endpoint distance (not the infinite-line distance).
+function pointToSegmentDistance(
+  px: number,
+  py: number,
+  ax: number,
+  ay: number,
+  bx: number,
+  by: number,
+): number {
+  const dx = bx - ax;
+  const dy = by - ay;
+  const lenSq = dx * dx + dy * dy;
+  if (lenSq === 0) return Math.hypot(px - ax, py - ay);
+  let t = ((px - ax) * dx + (py - ay) * dy) / lenSq;
+  if (t < 0) t = 0;
+  else if (t > 1) t = 1;
+  const cx = ax + t * dx;
+  const cy = ay + t * dy;
+  return Math.hypot(px - cx, py - cy);
 }
 
 function newZoneId(): string {
