@@ -137,7 +137,7 @@ pub struct SessionCreatedResp {
     pub total_targets: Option<u32>,
 }
 
-/// Wire shape returned by `GET /api/v1/admin/discovery/:id`.
+/// Wire shape returned by `GET /api/v1/admin/discovery/sessions/:id`.
 #[derive(Debug, Clone, Serialize)]
 pub struct DiscoverySessionView {
     pub session_id: Uuid,
@@ -328,7 +328,8 @@ pub(crate) fn mark_finished(inner: &Mutex<SessionInner>, error: Option<String>) 
 /// `POST /api/v1/admin/discovery/onvif`
 ///
 /// Spawns a 5-second WS-Discovery probe. Returns the session id
-/// immediately; the UI polls `GET /:session_id` for results.
+/// immediately; the UI polls `GET /sessions/:session_id` for
+/// results.
 pub async fn post_discovery_onvif(
     State(s): State<ApiState>,
 ) -> Result<Json<SessionCreatedResp>, ApiError> {
@@ -403,7 +404,7 @@ pub async fn post_discovery_scan(
     }))
 }
 
-/// `GET /api/v1/admin/discovery/:session_id`
+/// `GET /api/v1/admin/discovery/sessions/:session_id`
 pub async fn get_discovery_session(
     State(s): State<ApiState>,
     Path(session_id): Path<Uuid>,
@@ -419,7 +420,7 @@ pub async fn get_discovery_session(
         })
 }
 
-/// `POST /api/v1/admin/discovery/:session_id/probe-rtsp`
+/// `POST /api/v1/admin/discovery/sessions/:session_id/probe-rtsp`
 ///
 /// Runs inline (≤5 s) against the supplied `(host, port, path)`.
 /// Does NOT allocate a new session; the path parameter is only

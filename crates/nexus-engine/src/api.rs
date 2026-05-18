@@ -151,6 +151,17 @@ pub fn router(state: ApiState) -> Router {
         // M-Admin Phase 1B — camera discovery (ONVIF + CIDR sweep).
         // All four routes spawn / read from the shared
         // `discovery_sessions` registry on `ApiState`.
+        //
+        // Path layout note: the session-poll + probe-rtsp routes
+        // live under `…/discovery/sessions/{session_id}` (not
+        // `…/discovery/{session_id}`). With the literals `onvif`
+        // and `scan` as siblings of a same-depth `{session_id}`
+        // param, axum's matchit router treated an incoming
+        // `POST /v1/admin/discovery/onvif` as matching the param
+        // route (which only has GET registered) and returned 405
+        // — silently breaking the Discover dialog. The `sessions/`
+        // prefix removes the overlap; see
+        // `discovery_post_routes_do_not_405()` regression test.
         .route(
             "/v1/admin/discovery/onvif",
             axum::routing::post(discovery::post_discovery_onvif),
@@ -160,11 +171,11 @@ pub fn router(state: ApiState) -> Router {
             axum::routing::post(discovery::post_discovery_scan),
         )
         .route(
-            "/v1/admin/discovery/{session_id}",
+            "/v1/admin/discovery/sessions/{session_id}",
             get(discovery::get_discovery_session),
         )
         .route(
-            "/v1/admin/discovery/{session_id}/probe-rtsp",
+            "/v1/admin/discovery/sessions/{session_id}/probe-rtsp",
             axum::routing::post(discovery::post_probe_rtsp),
         )
         .route_layer(axum::middleware::from_fn_with_state(
@@ -376,6 +387,7 @@ async fn validate_rule(Json(req): Json<ValidateRuleReq>) -> Json<ValidateRuleRes
         id: "__validate__".into(),
         name: "validate".into(),
         camera_filter: None,
+        zones: None,
         when: req.when,
         severity: "low".into(),
         min_track_age_ms: 0,
@@ -3076,6 +3088,88 @@ mod tests {
         assert!(
             rt.get("ct").and_then(|v| v.as_str()).is_some(),
             "EncryptedToken should have a base64 ct (ciphertext) field"
+        );
+    }
+
+    // ===============================================================
+    // M-Admin Phase 1B regression — discovery route layout
+    // ===============================================================
+    //
+    // Pre-fix the four discovery routes lived in a single path
+    // slot under `/v1/admin/discovery/`: two literals (`onvif`,
+    // `scan`) plus a same-depth `{session_id}` GET. axum's matchit
+    // routed `POST /v1/admin/discovery/onvif` to the param entry
+    // (which only had GET) and returned 405, silently breaking the
+    // Discover dialog. Moving the param routes under a `sessions/`
+    // prefix eliminates the overlap; these tests pin that down.
+
+    #[tokio::test]
+    async fn discovery_onvif_post_does_not_405() {
+        const ADMIN_SECRET: &[u8] = b"discovery-route-regression-secret";
+        let (app, _store, _dir) = build_test_router(Some(ADMIN_SECRET)).await;
+        let token = sign_admin_jwt(ADMIN_SECRET);
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/admin/discovery/onvif")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from("{}"))
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+        let res = app.oneshot(req).await.unwrap();
+        // We don't care whether the probe actually starts (it spawns
+        // a multicast socket which may or may not work in the test
+        // sandbox); we ONLY care that the router doesn't 405 us.
+        assert_ne!(
+            res.status(),
+            StatusCode::METHOD_NOT_ALLOWED,
+            "POST /v1/admin/discovery/onvif must not 405 — \
+             the literal `onvif` was being shadowed by a sibling \
+             {{session_id}} param route. See api::router() docs."
+        );
+    }
+
+    #[tokio::test]
+    async fn discovery_scan_post_does_not_405() {
+        const ADMIN_SECRET: &[u8] = b"discovery-route-regression-secret-2";
+        let (app, _store, _dir) = build_test_router(Some(ADMIN_SECRET)).await;
+        let token = sign_admin_jwt(ADMIN_SECRET);
+        let body = serde_json::json!({ "cidr": "192.168.99.0/30" }).to_string();
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/admin/discovery/scan")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from(body))
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+        let res = app.oneshot(req).await.unwrap();
+        assert_ne!(
+            res.status(),
+            StatusCode::METHOD_NOT_ALLOWED,
+            "POST /v1/admin/discovery/scan must not 405"
+        );
+    }
+
+    #[tokio::test]
+    async fn discovery_session_get_is_under_sessions_prefix() {
+        // Just confirm the GET path that the client polls is
+        // reachable. With no such session we expect 404 (not 405).
+        const ADMIN_SECRET: &[u8] = b"discovery-route-regression-secret-3";
+        let (app, _store, _dir) = build_test_router(Some(ADMIN_SECRET)).await;
+        let token = sign_admin_jwt(ADMIN_SECRET);
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/admin/discovery/sessions/00000000-0000-0000-0000-000000000000")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            res.status(),
+            StatusCode::NOT_FOUND,
+            "unknown session id should be NOT_FOUND, not 405/405"
         );
     }
 }

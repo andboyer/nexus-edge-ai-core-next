@@ -248,14 +248,14 @@ export const api = {
     /// Returns 404 once the session is past `SESSION_TTL`.
     getSession: (id: string) =>
       request<DiscoverySession>(
-        `/v1/admin/discovery/${encodeURIComponent(id)}`,
+        `/v1/admin/discovery/sessions/${encodeURIComponent(id)}`,
       ),
     /// Inline Verify probe — RTSP OPTIONS + DESCRIBE with optional
     /// Digest auth. `sessionId` exists purely so the engine can
     /// audit the probe under the same correlation id.
     probeRtsp: (sessionId: string, req: ProbeRtspReq) =>
       request<ProbeRtspResult>(
-        `/v1/admin/discovery/${encodeURIComponent(sessionId)}/probe-rtsp`,
+        `/v1/admin/discovery/sessions/${encodeURIComponent(sessionId)}/probe-rtsp`,
         { method: "POST", body: JSON.stringify(req) },
       ),
   },
