@@ -1255,3 +1255,179 @@ button.chip {
   color: var(--crit, #ef476f);
   font-weight: 500;
 }
+
+
+/* ----- M-Admin Phase 2 Step 2 — polygon zone editor ----- */
+
+.camera-form-zones-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.camera-form-zones-meta {
+  flex: 1;
+  min-width: 0;
+}
+
+.zones-editor {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 320px;
+  gap: 16px;
+  min-height: 480px;
+}
+
+.zones-canvas-host {
+  position: relative;
+  background: #000;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  overflow: hidden;
+  min-height: 320px;
+  display: flex;
+  align-items: stretch;
+  justify-content: stretch;
+}
+
+.zones-snapshot-img {
+  display: block;
+  width: 100%;
+  height: auto;
+  user-select: none;
+  -webkit-user-drag: none;
+}
+
+.zones-canvas-overlay {
+  position: absolute;
+  top: 0;
+  left: 0;
+  cursor: crosshair;
+}
+
+.zones-canvas-no-snapshot .zones-snapshot-img {
+  display: none;
+}
+
+.zones-canvas-no-snapshot {
+  background: repeating-linear-gradient(
+    45deg,
+    #1a1f27,
+    #1a1f27 12px,
+    #11151a 12px,
+    #11151a 24px
+  );
+}
+
+.zones-canvas-hint {
+  position: absolute;
+  bottom: 8px;
+  left: 8px;
+  right: 8px;
+  background: rgba(11, 18, 32, 0.85);
+  color: var(--text-dim);
+  font-size: 12px;
+  padding: 6px 10px;
+  border-radius: 4px;
+  pointer-events: none;
+}
+
+.zones-canvas-hint-error {
+  color: var(--text);
+}
+
+.zones-sidebar {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  overflow-y: auto;
+  max-height: 70vh;
+  padding-right: 4px;
+}
+
+.zones-sidebar-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.zones-sidebar-head h3 {
+  margin: 0;
+  font-size: 15px;
+}
+
+.zones-empty {
+  color: var(--text-dim);
+  font-size: 13px;
+  margin: 0;
+}
+
+.zones-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.zones-list-item {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--bg-elev);
+}
+
+.zones-list-item.is-selected {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent-dim);
+}
+
+.zones-name-input {
+  width: 100%;
+  background: var(--bg-elev-2);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 6px 8px;
+  font-size: 13px;
+}
+
+.zones-list-meta {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.zones-vert-count {
+  font-variant-numeric: tabular-nums;
+}
+
+.zones-drafting-badge {
+  background: var(--accent-dim);
+  color: var(--text);
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.zones-list-actions {
+  display: flex;
+  gap: 6px;
+  justify-content: flex-end;
+}
+
+.zones-hints {
+  color: var(--text-dim);
+  font-size: 12px;
+  margin: 8px 0 0;
+  line-height: 1.5;
+}

@@ -29,7 +29,9 @@ import type {
   CameraConfig,
   CameraId,
   ModelConfig,
+  ZoneConfig,
 } from "../api/types.js";
+import { openZonesEditor } from "./zones-editor.js";
 
 export interface OpenCameraFormOpts {
   /// `"create"` opens a blank form with an auto-suggested id.
@@ -60,6 +62,10 @@ interface FormState {
   /// Raw JSON text in the Advanced expander. Empty string = "no
   /// override" (sent as `null`). Validated on Save.
   model_override_text: string;
+  /// Polygon zones — edited via the zones-editor modal. Always
+  /// round-tripped through the form so an edit of an unrelated
+  /// field does not silently drop zones loaded from TOML.
+  zones: ZoneConfig[];
 }
 
 const URL_HELP =
@@ -84,6 +90,7 @@ export function openCameraForm(opts: OpenCameraFormOpts): Promise<boolean> {
     max_fps: undefined,
     parking_lot_mode: undefined,
     model_override_text: undefined,
+    zones: undefined,
   };
 
   // The form host is rebuilt from scratch on every re-render so we can
@@ -92,7 +99,7 @@ export function openCameraForm(opts: OpenCameraFormOpts): Promise<boolean> {
 
   function rerender(): void {
     while (formHost.firstChild) formHost.removeChild(formHost.firstChild);
-    formHost.append(buildForm(state, errors, opts));
+    formHost.append(buildForm(state, errors, opts, rerender));
   }
 
   async function onSave(): Promise<void> {
@@ -151,6 +158,7 @@ function buildInitialState(opts: OpenCameraFormOpts): FormState {
       model_override_text: opts.existing.model_override
         ? JSON.stringify(opts.existing.model_override, null, 2)
         : "",
+      zones: opts.existing.zones ? opts.existing.zones.map(cloneZone) : [],
     };
   }
   // Create — auto-suggest `max(existing) + 1`, falling back to 1.
@@ -165,6 +173,16 @@ function buildInitialState(opts: OpenCameraFormOpts): FormState {
     max_fps: 0,
     parking_lot_mode: false,
     model_override_text: "",
+    zones: [],
+  };
+}
+
+function cloneZone(z: ZoneConfig): ZoneConfig {
+  return {
+    id: z.id,
+    name: z.name,
+    polygon: z.polygon.map(([x, y]) => [x, y] as [number, number]),
+    ...(z.kind !== undefined ? { kind: z.kind } : {}),
   };
 }
 
@@ -172,6 +190,7 @@ function buildForm(
   state: FormState,
   errors: Record<string, string | undefined>,
   opts: OpenCameraFormOpts,
+  rerender: () => void,
 ): HTMLElement {
   const idField =
     opts.mode === "edit"
@@ -261,7 +280,59 @@ function buildForm(
         },
       }),
     ),
+    zonesSection(state, opts, rerender),
     advancedExpander(state, errors),
+  );
+}
+
+function zonesSection(
+  state: FormState,
+  opts: OpenCameraFormOpts,
+  rerender: () => void,
+): HTMLElement {
+  // In create mode the camera has no live snapshot yet, so the
+  // overlay editor would draft on a placeholder background. We
+  // still allow it — geometry is normalized — but flag the
+  // limitation so the operator knows why the backdrop is blank.
+  const isCreate = opts.mode === "create";
+  const label = `Polygon zones (${state.zones.length})`;
+  const help = isCreate
+    ? "Drafted before the camera streams — backdrop is a placeholder. Save the camera once, then re-open Edit for a live snapshot."
+    : "Inclusion zones drive motion.zone_state for rules. Exclusion zones drop detections on the engine before they hit rules.";
+  const editBtn = h(
+    "button",
+    {
+      type: "button",
+      class: "btn",
+      on: {
+        click: () => {
+          // Build a transient CameraConfig stand-in for the editor;
+          // it only reads `id` and `name` for the snapshot URL +
+          // dialog title.
+          const cam: CameraConfig = toCameraConfig(state);
+          void openZonesEditor(cam, state.zones).then((next) => {
+            if (next === null) return;
+            state.zones = next;
+            rerender();
+          });
+        },
+      },
+    },
+    state.zones.length === 0 ? "Add zones\u2026" : "Edit zones\u2026",
+  );
+  return FormSection(
+    "Zones",
+    h(
+      "div",
+      { class: "camera-form-zones-row" },
+      h(
+        "div",
+        { class: "camera-form-zones-meta" },
+        h("div", { class: "field-label" }, label),
+        h("div", { class: "field-help" }, help),
+      ),
+      editBtn,
+    ),
   );
 }
 
@@ -397,5 +468,6 @@ function toCameraConfig(state: FormState): CameraConfig {
     max_fps: state.max_fps,
     parking_lot_mode: state.parking_lot_mode,
     model_override: modelOverride,
+    zones: state.zones,
   };
 }
