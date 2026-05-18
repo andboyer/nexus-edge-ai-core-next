@@ -50,6 +50,7 @@ import type {
   CameraId,
   RuleConfig,
   RuleId,
+  RulePreviewMatch,
   Severity,
 } from "../api/types.js";
 
@@ -379,6 +380,7 @@ function buildForm(
         }),
       ),
     ),
+    FormSection("Preview", buildPreviewSection(state, opts.cameras)),
   );
 }
 
@@ -622,4 +624,217 @@ function pruneZonesAgainstFilter(
     zoneOptionsForCameras(cameras, cameraFilter).map((o) => o.value),
   );
   return selected.filter((id) => validIds.has(id));
+}
+
+/// "What would this rule have fired on?" — runs the candidate
+/// rule against the last 24h of motion_events (the per-detection
+/// table written by the live pipeline) and lists the matches
+/// inline. Lets the operator tune CEL + zones against real data
+/// before saving the rule.
+///
+/// The preview deliberately bypasses debounce/cooldown gates —
+/// it shows raw predicate matches so those knobs can be tuned
+/// independently. The hint text below the button calls that out.
+function buildPreviewSection(
+  state: FormState,
+  cameras: ReadonlyArray<CameraConfig>,
+): HTMLElement {
+  const cameraNameById = new Map<CameraId, string>(
+    cameras.map((c) => [c.id, c.name]),
+  );
+
+  // Results host — replaced wholesale per run. Keeping a single
+  // container (not a re-render of the whole section) means the
+  // button stays mounted and focused after the click.
+  const resultsHost = h("div", { class: "rule-preview-results" });
+  const summaryHost = h("div", { class: "rule-preview-summary field-help" });
+
+  let inFlight = false;
+  const runBtn = h(
+    "button",
+    {
+      type: "button",
+      class: "btn primary",
+      on: {
+        click: () => {
+          if (inFlight) return;
+          // Validate the current `when` cheaply before sending —
+          // the engine catches it too and returns it as `error`,
+          // but failing fast here saves a round-trip.
+          const when = state.when.trim();
+          if (!when) {
+            summaryHost.textContent =
+              "Add a CEL expression in the Condition section first.";
+            resultsHost.replaceChildren();
+            return;
+          }
+          inFlight = true;
+          runBtn.disabled = true;
+          runBtn.textContent = "Running…";
+          summaryHost.textContent = "";
+          resultsHost.replaceChildren();
+          // Build the rule from current form state. We don't save
+          // it — the engine compiles it transiently per request.
+          const rule = (() => {
+            try {
+              return toPreviewRule(state);
+            } catch {
+              return null;
+            }
+          })();
+          if (rule === null) {
+            inFlight = false;
+            runBtn.disabled = false;
+            runBtn.textContent = "Run preview (last 24h)";
+            summaryHost.textContent = "Rule is incomplete — fill in the form first.";
+            return;
+          }
+          void api.rules
+            .preview({ rule, limit: 500 })
+            .then((resp) => {
+              inFlight = false;
+              runBtn.disabled = false;
+              runBtn.textContent = "Run preview (last 24h)";
+              if (resp.error) {
+                summaryHost.textContent = `CEL error: ${resp.error}`;
+                resultsHost.replaceChildren();
+                return;
+              }
+              const limited = resp.limit_hit
+                ? ` · scan capped at ${resp.scanned} rows — widen the window or narrow the camera filter to see more`
+                : "";
+              summaryHost.textContent =
+                resp.matches.length === 0
+                  ? `No matches in ${resp.matches.length === 0 ? "the last 24h" : ""} (scanned ${resp.scanned} detections).${limited}`
+                  : `${resp.matches.length} match${resp.matches.length === 1 ? "" : "es"} in the last 24h (scanned ${resp.scanned} detections).${limited}`;
+              resultsHost.replaceChildren(
+                renderPreviewMatches(resp.matches, cameraNameById),
+              );
+            })
+            .catch((err: unknown) => {
+              inFlight = false;
+              runBtn.disabled = false;
+              runBtn.textContent = "Run preview (last 24h)";
+              const msg = err instanceof Error ? err.message : String(err);
+              summaryHost.textContent = `Preview failed: ${msg}`;
+              resultsHost.replaceChildren();
+              toast.error(`Preview failed: ${msg}`);
+            });
+        },
+      },
+    },
+    "Run preview (last 24h)",
+  );
+
+  const hint = h(
+    "div",
+    { class: "field-help" },
+    "Replays the current rule against detections from the last 24h. Debounce / cooldown gates are NOT applied — preview shows raw predicate matches so you can tune the CEL + zones in isolation. ",
+    h(
+      "code",
+      null,
+      "object.age_ms",
+    ),
+    " reads as 0 in preview (track age can't be reconstructed from a single past row).",
+  );
+
+  return h(
+    "div",
+    { class: "rule-preview-section" },
+    h("div", { class: "rule-preview-controls" }, runBtn),
+    hint,
+    summaryHost,
+    resultsHost,
+  );
+}
+
+/// Render the matches list as a compact table. `<a>` on each row
+/// deep-links to the existing clips view via the hash route the
+/// rest of the SPA uses.
+function renderPreviewMatches(
+  matches: ReadonlyArray<RulePreviewMatch>,
+  cameraNameById: ReadonlyMap<CameraId, string>,
+): HTMLElement {
+  if (matches.length === 0) {
+    return h("div", null);
+  }
+  const rows = matches.map((m) => {
+    const camName =
+      cameraNameById.get(m.camera_id) ?? `camera ${m.camera_id}`;
+    const ts = formatRelativeTime(m.captured_at);
+    return h(
+      "tr",
+      null,
+      h("td", null, ts),
+      h("td", null, camName),
+      h("td", null, m.label),
+      h("td", null, `${(m.confidence * 100).toFixed(0)}%`),
+      h(
+        "td",
+        null,
+        h(
+          "a",
+          { href: `#/clips/${m.clip_id}`, class: "link" },
+          `clip ${m.clip_id}`,
+        ),
+      ),
+    );
+  });
+  return h(
+    "table",
+    { class: "data-table rule-preview-table" },
+    h(
+      "thead",
+      null,
+      h(
+        "tr",
+        null,
+        h("th", null, "When"),
+        h("th", null, "Camera"),
+        h("th", null, "Label"),
+        h("th", null, "Conf"),
+        h("th", null, "Clip"),
+      ),
+    ),
+    h("tbody", null, ...rows),
+  );
+}
+
+/// "5m ago" / "2h ago" / "3d ago" — falls back to the ISO string
+/// for anything older than a week so the operator still gets
+/// absolute context for stale rows.
+function formatRelativeTime(iso: string): string {
+  const t = Date.parse(iso);
+  if (!Number.isFinite(t)) return iso;
+  const deltaMs = Date.now() - t;
+  const s = Math.max(0, Math.floor(deltaMs / 1000));
+  if (s < 60) return `${s}s ago`;
+  const mins = Math.floor(s / 60);
+  if (mins < 60) return `${mins}m ago`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  if (days < 7) return `${days}d ago`;
+  // Older than a week — show ISO date only.
+  return iso.slice(0, 10);
+}
+
+/// Snapshot of the current FormState into a transient RuleConfig
+/// suitable for the preview endpoint. Mirrors `toRuleConfig` but
+/// tolerates partial state (empty id / name) — the engine doesn't
+/// persist the preview, so blank fields are fine.
+function toPreviewRule(state: FormState): RuleConfig {
+  return {
+    id: state.id.trim() || "__preview__",
+    name: state.name.trim() || "preview",
+    severity: state.severity,
+    camera_filter:
+      state.camera_filter.length === 0 ? null : [...state.camera_filter],
+    zones: state.zones.length === 0 ? null : [...state.zones],
+    when: state.when.trim(),
+    min_track_age_ms: state.min_track_age_ms,
+    consecutive_frames: state.consecutive_frames,
+    cooldown_ms: state.cooldown_ms,
+    enabled: state.enabled,
+  };
 }

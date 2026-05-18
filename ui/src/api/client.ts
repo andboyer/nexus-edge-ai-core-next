@@ -21,6 +21,8 @@ import type {
   PutColdReq,
   RuleConfig,
   RuleId,
+  RulePreviewRequest,
+  RulePreviewResponse,
   RuleValidateResponse,
   ScanReq,
   SessionCreatedResp,
@@ -88,6 +90,15 @@ export const api = {
       request<RuleValidateResponse>("/rules/validate", {
         method: "POST",
         body: JSON.stringify({ when }),
+      }),
+    /// "What would this rule have fired on?" — replays a candidate
+    /// rule against the last 24h (default) of motion_events. Doesn't
+    /// touch the persisted ruleset. See `preview_rule` for semantics
+    /// (no debounce/cooldown applied; raw predicate matches only).
+    preview: (req: RulePreviewRequest) =>
+      request<RulePreviewResponse>("/rules/preview", {
+        method: "POST",
+        body: JSON.stringify(req),
       }),
   },
 

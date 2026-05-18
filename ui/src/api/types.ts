@@ -135,6 +135,45 @@ export interface RuleValidateResponse {
   error?: string;
 }
 
+/// `POST /api/rules/preview` — replays a candidate rule against
+/// the last N hours of `motion_events` and returns the rows whose
+/// synthetic TrackedObject matches the rule's predicate + zone
+/// gate. Debounce / cooldown gates are deliberately NOT applied;
+/// the preview shows raw predicate matches so the operator can
+/// tune the CEL + zones in isolation. See `preview_rule` in
+/// crates/nexus-engine/src/api.rs for full semantics.
+export interface RulePreviewRequest {
+  rule: RuleConfig;
+  /// Window start, ms since Unix epoch. Defaults to until_ms - 24h.
+  since_ms?: number;
+  /// Window end, ms since Unix epoch. Defaults to "now".
+  until_ms?: number;
+  /// Hard cap on rows scanned. Default 500; clamped to [1, 5000].
+  limit?: number;
+}
+
+/// One past detection that would have matched the candidate rule.
+export interface RulePreviewMatch {
+  motion_event_id: number;
+  camera_id: CameraId;
+  clip_id: ClipId;
+  track_id: number;
+  captured_at: string;
+  label: string;
+  confidence: number;
+  bbox: BBox;
+}
+
+export interface RulePreviewResponse {
+  matches: RulePreviewMatch[];
+  scanned: number;
+  window_start: string;
+  window_end: string;
+  limit_hit: boolean;
+  /// CEL compile error, when present. `matches` is empty in that case.
+  error?: string;
+}
+
 // /api/backends shape.
 export type BackendStateString =
   | "initializing"
