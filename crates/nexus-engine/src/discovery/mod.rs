@@ -224,6 +224,10 @@ pub struct DiscoverySessions {
 }
 
 impl DiscoverySessions {
+    /// Construct an empty registry. Equivalent to
+    /// `DiscoverySessions::default()` but provided as a named
+    /// constructor so call sites (e.g. `ApiState` setup in
+    /// `main.rs`) read more clearly.
     pub fn new() -> Self {
         Self::default()
     }

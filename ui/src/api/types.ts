@@ -11,20 +11,11 @@ export type RuleId = string;
 export type EventId = string;
 export type TraceId = string;
 
-export type PixelFormat = "rgb24" | "bgr24" | "nv12" | "i420";
-
 export interface BBox {
   x1: number;
   y1: number;
   x2: number;
   y2: number;
-}
-
-export interface Detection {
-  label: string;
-  confidence: number;
-  bbox: BBox;
-  attributes?: Record<string, unknown>;
 }
 
 export interface TrackedObject {

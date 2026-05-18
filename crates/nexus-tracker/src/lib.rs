@@ -78,6 +78,9 @@ struct IouState {
 }
 
 impl IouNaiveTracker {
+    /// Build a tracker with the supplied IoU threshold and
+    /// track-TTL. Cheap to construct — the only allocation is
+    /// the empty `HashMap` behind the inner `Mutex`.
     pub fn new(cfg: &TrackerConfig) -> Self {
         Self {
             inner: Mutex::new(IouState {

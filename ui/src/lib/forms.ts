@@ -38,22 +38,6 @@ export function TextField(opts: FieldOpts<string>): HTMLElement {
   return wrap(opts.label, input, opts);
 }
 
-export function PasswordField(opts: FieldOpts<string>): HTMLElement {
-  const input = h("input", {
-    type: "password",
-    value: opts.value ?? "",
-    placeholder: opts.placeholder ?? "",
-    required: !!opts.required,
-    autocomplete: "off",
-    on: {
-      input: (ev) => {
-        opts.onChange((ev.currentTarget as HTMLInputElement).value);
-      },
-    },
-  });
-  return wrap(opts.label, input, opts);
-}
-
 export function NumberField(
   opts: FieldOpts<number> & { min?: number; max?: number; step?: number },
 ): HTMLElement {
