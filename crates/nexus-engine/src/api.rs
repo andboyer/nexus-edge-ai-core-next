@@ -751,9 +751,7 @@ async fn preview_rule(
                 .iter()
                 .any(|z| preview_point_in_polygon(nx, ny, &z.polygon));
             if !inside_any {
-                *zone_filtered_by_label
-                    .entry(row.label.clone())
-                    .or_insert(0) += 1;
+                *zone_filtered_by_label.entry(row.label.clone()).or_insert(0) += 1;
                 zone_filtered_total += 1;
                 continue;
             }
@@ -815,12 +813,7 @@ async fn preview_rule(
         window_start: from.to_rfc3339(),
         window_end: to.to_rfc3339(),
         limit_hit,
-        scanned_labels: tally_scanned_labels(
-            &rows,
-            32,
-            &matched_by_label,
-            &zone_filtered_by_label,
-        ),
+        scanned_labels: tally_scanned_labels(&rows, 32, &matched_by_label, &zone_filtered_by_label),
         eval_errors,
         eval_first_error,
         zone_filtered: zone_filtered_total,
@@ -861,8 +854,7 @@ fn tally_scanned_labels(
         .into_iter()
         .map(|(label, count)| {
             let matched = matched_by_label.get(label).copied().unwrap_or(0);
-            let zone_filtered =
-                zone_filtered_by_label.get(label).copied().unwrap_or(0);
+            let zone_filtered = zone_filtered_by_label.get(label).copied().unwrap_or(0);
             // Only attach the byte dump for the genuinely
             // surprising case ("label appears N times, matched
             // 0, AND none were zone-filtered"); when

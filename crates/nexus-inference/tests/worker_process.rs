@@ -33,8 +33,8 @@ fn test_frame() -> Frame {
 
 #[tokio::test]
 async fn worker_process_round_trips_detection() {
-    let backend =
-        WorkerProcessBackend::start_with_program(0, &worker_bin(), "mock").expect("spawn worker");
+    let backend = WorkerProcessBackend::start_with_program(0, &worker_bin(), "mock", &[])
+        .expect("spawn worker");
     assert_eq!(backend.state(), BackendState::Ready);
     assert_eq!(backend.name(), "worker_process");
 
@@ -51,7 +51,8 @@ async fn worker_process_round_trips_detection() {
 #[tokio::test]
 async fn worker_process_handles_multiple_in_flight_requests() {
     let backend = Arc::new(
-        WorkerProcessBackend::start_with_program(0, &worker_bin(), "mock").expect("spawn worker"),
+        WorkerProcessBackend::start_with_program(0, &worker_bin(), "mock", &[])
+            .expect("spawn worker"),
     );
     let mut joins = Vec::new();
     for i in 0..16u64 {
@@ -72,7 +73,7 @@ async fn worker_process_handles_multiple_in_flight_requests() {
 async fn pool_routes_through_worker_process_backends() {
     let mut workers: Vec<Arc<dyn DetectorBackend>> = Vec::new();
     for slot in 0..2 {
-        let b = WorkerProcessBackend::start_with_program(slot, &worker_bin(), "mock")
+        let b = WorkerProcessBackend::start_with_program(slot, &worker_bin(), "mock", &[])
             .expect("spawn worker");
         workers.push(Arc::new(b));
     }
@@ -107,8 +108,8 @@ async fn pool_routes_through_worker_process_backends() {
 async fn pool_fails_soft_when_worker_killed() {
     use std::time::Duration;
 
-    let worker =
-        WorkerProcessBackend::start_with_program(0, &worker_bin(), "mock").expect("spawn worker");
+    let worker = WorkerProcessBackend::start_with_program(0, &worker_bin(), "mock", &[])
+        .expect("spawn worker");
     let pid = worker.child_pid().expect("worker pid");
     let worker: Arc<dyn DetectorBackend> = Arc::new(worker);
 

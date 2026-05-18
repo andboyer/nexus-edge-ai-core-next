@@ -18,6 +18,8 @@
 
 pub mod backends;
 pub mod detectors;
+#[cfg(feature = "ort")]
+pub mod execution_providers;
 pub mod pool;
 pub mod router;
 pub mod worker_proto;
@@ -84,6 +86,7 @@ pub fn build(cfg: &InferenceConfig) -> Result<InferenceLayer, InferenceError> {
                         Arc::new(WorkerProcessBackend::start(
                             slot as i32,
                             cfg.model.kind.as_str(),
+                            &cfg.ep_priority,
                         )?)
                     }
                 };

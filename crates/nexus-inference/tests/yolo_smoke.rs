@@ -72,7 +72,7 @@ async fn yolo_smoke_runs_on_synthetic_frame() {
         return; // skip when model not staged locally
     };
 
-    let det = YoloOrtDetector::open(&model, 640, 640, 0.30).expect("yolo session must open");
+    let det = YoloOrtDetector::open(&model, 640, 640, 0.30, &[]).expect("yolo session must open");
     let frame = synth_frame(1280, 720);
     let dets = det.detect(&frame, &[]).await.expect("detect ok");
 

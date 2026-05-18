@@ -390,10 +390,16 @@ impl WorkerProcessBackend {
     /// Spawn the worker child located at `$NEXUS_INFERENCE_WORKER_BIN`, or
     /// (when unset) a sibling of the current executable named
     /// `nexus-inference-worker`. The model kind is forwarded via the
-    /// `NEXUS_WORKER_MODEL_KIND` env var.
-    pub fn start(slot: i32, model_kind: &str) -> Result<Self, InferenceError> {
+    /// `NEXUS_WORKER_MODEL_KIND` env var, and `ep_priority` (CSV) via
+    /// `NEXUS_WORKER_EP_PRIORITY` so the worker registers the same
+    /// ORT execution providers the engine config requested.
+    pub fn start(
+        slot: i32,
+        model_kind: &str,
+        ep_priority: &[String],
+    ) -> Result<Self, InferenceError> {
         let program = resolve_worker_program()?;
-        Self::start_with_program(slot, &program, model_kind)
+        Self::start_with_program(slot, &program, model_kind, ep_priority)
     }
 
     /// Like [`start`](Self::start) but with an explicit binary path. The
@@ -403,6 +409,7 @@ impl WorkerProcessBackend {
         slot: i32,
         program: &std::path::Path,
         model_kind: &str,
+        ep_priority: &[String],
     ) -> Result<Self, InferenceError> {
         use std::process::Stdio;
         use tokio::process::Command;
@@ -411,6 +418,7 @@ impl WorkerProcessBackend {
 
         let mut cmd = Command::new(program);
         cmd.env("NEXUS_WORKER_MODEL_KIND", model_kind)
+            .env("NEXUS_WORKER_EP_PRIORITY", ep_priority.join(","))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

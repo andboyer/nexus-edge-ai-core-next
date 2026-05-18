@@ -100,6 +100,24 @@ fn build_worker_detector(kind: &str) -> Arc<dyn Detector> {
     }
 }
 
+/// Parse `NEXUS_WORKER_EP_PRIORITY` as a comma-separated list of EP
+/// names (e.g. `"openvino,cpu"` or `"coreml"`). Empty / unset → CPU
+/// fallback only. The engine's `WorkerProcessBackend` sets this env
+/// when spawning the worker so the worker registers the same EPs the
+/// engine config requested.
+#[cfg(feature = "ort")]
+fn parse_ep_priority_env() -> Vec<String> {
+    env::var("NEXUS_WORKER_EP_PRIORITY")
+        .ok()
+        .map(|s| {
+            s.split(',')
+                .map(|p| p.trim().to_string())
+                .filter(|p| !p.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 #[cfg(feature = "ort")]
 fn build_yolo_detector() -> Arc<dyn Detector> {
     use std::path::PathBuf;
@@ -129,7 +147,9 @@ fn build_yolo_detector() -> Arc<dyn Detector> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(0.30);
-    match nexus_inference::yolo::YoloOrtDetector::open(&path, input_w, input_h, score) {
+    let ep_priority = parse_ep_priority_env();
+    match nexus_inference::yolo::YoloOrtDetector::open(&path, input_w, input_h, score, &ep_priority)
+    {
         Ok(d) => Arc::new(d),
         Err(e) => {
             eprintln!("[nexus-inference-worker] yolo open failed: {e}, using mock");
@@ -209,7 +229,13 @@ fn build_yolo_world_detector() -> Arc<dyn Detector> {
             }
         };
     match nexus_inference::yolo_world::YoloWorldDetector::open(
-        &onnx, input_w, input_h, score, nms_iou, vocab,
+        &onnx,
+        input_w,
+        input_h,
+        score,
+        nms_iou,
+        vocab,
+        &parse_ep_priority_env(),
     ) {
         Ok(d) => Arc::new(d),
         Err(e) => {

@@ -40,13 +40,13 @@ use async_trait::async_trait;
 use ndarray::{s, Array2, Array4, Ix2};
 use nexus_config::InferenceConfig;
 use nexus_types::{BBox, Detection, Frame, PixelFormat};
-use ort::execution_providers::CPUExecutionProvider;
 use ort::session::{builder::GraphOptimizationLevel, Session};
 use ort::value::TensorRef;
 use parking_lot::Mutex;
 use tracing::{debug, info, warn};
 
 use crate::detectors::{Detector, InferenceError};
+use crate::execution_providers;
 
 /// Real ORT-backed YOLO detector.
 pub struct YoloOrtDetector {
@@ -78,31 +78,43 @@ impl YoloOrtDetector {
             cfg.model.input_width,
             cfg.model.input_height,
             cfg.model.score_threshold,
+            &cfg.ep_priority,
         )
     }
 
-    /// Open a session against the given ONNX file. Uses CPU EP only — the
-    /// other EPs are wired in via cfg.ep_priority once their feature flags
-    /// are enabled (ep-openvino, ep-cuda, …) which lands per-tier in M5.
+    /// Open a session against the given ONNX file. `ep_priority` is
+    /// the operator-supplied EP list from `[inference]` in nexus.toml
+    /// — see [`crate::execution_providers::selected_for_priority`]
+    /// for how it gets translated to ORT dispatchers. Pass `&[]` for
+    /// CPU-only (the default fallback path).
     pub fn open(
         model_path: &Path,
         input_w: u32,
         input_h: u32,
         score_threshold: f32,
+        ep_priority: &[String],
     ) -> Result<Self, InferenceError> {
+        let (eps, ep_names) = execution_providers::selected_for_priority(ep_priority);
         let session = Session::builder()
             .map_err(|e| InferenceError::ModelLoad(format!("session builder: {e}")))?
             .with_optimization_level(GraphOptimizationLevel::Level3)
             .map_err(|e| InferenceError::ModelLoad(format!("opt level: {e}")))?
-            .with_execution_providers([CPUExecutionProvider::default().build()])
+            .with_execution_providers(eps)
             .map_err(|e| InferenceError::ModelLoad(format!("EP register: {e}")))?
             .commit_from_file(model_path)
             .map_err(|e| {
                 InferenceError::ModelLoad(format!("load {}: {e}", model_path.display()))
             })?;
+        // ORT 2.0 silently skips an EP that fails to attach at runtime
+        // (no .so / no device). `ep_registered` is the list we *asked*
+        // the session builder to register; the actual runtime EP per
+        // node isn't surfaced through the ort 2.0 Session API — if a
+        // silent fallback is suspected, set `RUST_LOG=ort=debug`.
         info!(
             model = %model_path.display(),
             input_w, input_h, score_threshold,
+            ep_requested = ?ep_priority,
+            ep_registered = ?ep_names,
             "yolo ORT detector ready"
         );
         Ok(Self {

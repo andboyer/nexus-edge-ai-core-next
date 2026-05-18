@@ -7,15 +7,20 @@ rust-version.workspace = true
 
 [features]
 default = []
-# Per-EP feature flags. Off by default so the workspace builds without ORT installed.
-ep-cpu      = []
-ep-openvino = []
-ep-cuda     = []
-ep-coreml   = []
-ep-tensorrt = []
-ep-directml = []
-# Wire ORT itself only when at least one EP is selected. M1 enables ep-cpu in
-# the engine's release profile.
+# Per-EP feature flags. Each EP feature implicitly enables the `ort`
+# integration so building with e.g. `--features ep-openvino` is
+# enough — no need to also pass `--features ort`.
+ep-cpu      = ["ort"]
+ep-openvino = ["ort"]
+ep-cuda     = ["ort"]
+ep-coreml   = ["ort"]
+ep-tensorrt = ["ort"]
+ep-directml = ["ort"]
+# Wire ORT itself; selected automatically by any ep-* feature above.
+# Listed separately so `--features ort` (no EPs) still compiles the
+# session-builder code path for diagnostics / dry-runs — that build
+# falls through to CPU at runtime via the fallback in
+# `execution_providers::selected_for_priority`.
 ort         = ["dep:ort", "dep:ndarray"]
 
 [dependencies]

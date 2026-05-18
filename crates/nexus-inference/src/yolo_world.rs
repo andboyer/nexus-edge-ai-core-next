@@ -34,13 +34,13 @@ use async_trait::async_trait;
 use ndarray::{s, Array2, Array4, Ix2};
 use nexus_config::{CameraConfigUpdate, InferenceConfig};
 use nexus_types::{BBox, CameraId, Detection, Frame, PixelFormat};
-use ort::execution_providers::CPUExecutionProvider;
 use ort::session::{builder::GraphOptimizationLevel, Session};
 use ort::value::TensorRef;
 use parking_lot::Mutex;
 use tracing::{debug, info, warn};
 
 use crate::detectors::{Detector, InferenceError};
+use crate::execution_providers;
 
 /// One YOLO-World ONNX session + the prompt vocabulary it was exported
 /// with + a per-camera subset filter.
@@ -86,11 +86,15 @@ impl YoloWorldDetector {
             cfg.model.score_threshold,
             default_nms_iou_threshold(),
             vocab,
+            &cfg.ep_priority,
         )
     }
 
     /// Open a session against the given ONNX and bind the supplied
-    /// vocabulary. CPU EP only — other EPs land in M5.
+    /// vocabulary. `ep_priority` controls which ORT execution
+    /// providers are registered — see
+    /// [`crate::execution_providers::selected_for_priority`]. Pass
+    /// `&[]` for CPU-only (the default fallback path).
     pub fn open(
         model_path: &Path,
         input_w: u32,
@@ -98,6 +102,7 @@ impl YoloWorldDetector {
         score_threshold: f32,
         nms_iou_threshold: f32,
         vocab: Vec<String>,
+        ep_priority: &[String],
     ) -> Result<Self, InferenceError> {
         if vocab.is_empty() {
             return Err(InferenceError::ModelLoad(
@@ -106,11 +111,12 @@ impl YoloWorldDetector {
                     .into(),
             ));
         }
+        let (eps, ep_names) = execution_providers::selected_for_priority(ep_priority);
         let session = Session::builder()
             .map_err(|e| InferenceError::ModelLoad(format!("session builder: {e}")))?
             .with_optimization_level(GraphOptimizationLevel::Level3)
             .map_err(|e| InferenceError::ModelLoad(format!("opt level: {e}")))?
-            .with_execution_providers([CPUExecutionProvider::default().build()])
+            .with_execution_providers(eps)
             .map_err(|e| InferenceError::ModelLoad(format!("EP register: {e}")))?
             .commit_from_file(model_path)
             .map_err(|e| {
@@ -121,6 +127,8 @@ impl YoloWorldDetector {
             model = %model_path.display(),
             input_w, input_h, score_threshold, nms_iou_threshold,
             vocab_len = vocab.len(),
+            ep_requested = ?ep_priority,
+            ep_registered = ?ep_names,
             "yolo-world ORT detector ready"
         );
         Ok(Self {

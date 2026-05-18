@@ -209,8 +209,7 @@ async fn probe_inner(req: &ProbeRtspReq) -> io::Result<ProbeRtspResult> {
                 let Some(params) = parse_digest_challenge(challenge) else {
                     continue;
                 };
-                let auth_header =
-                    build_digest_response(&params, user, pw, "DESCRIBE", &url, 3);
+                let auth_header = build_digest_response(&params, user, pw, "DESCRIBE", &url, 3);
                 let body = build_request(
                     "DESCRIBE",
                     &url,
