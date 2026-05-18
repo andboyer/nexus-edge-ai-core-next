@@ -1,4 +1,10 @@
 // M2.2 Phase 5 — Storage admin tab.
+// M-Admin Phase 6 polish — native browser `alert()` / `confirm()`
+// modals replaced by the shared `toast` + `openDialog` primitives
+// so the destructive-delete UX matches Cameras / Rules. Inline
+// `errorBanner` paragraphs are kept (the operator needs them to
+// stay put while correcting the form); success now also fires a
+// `toast.success` so the action is acknowledged outside the form.
 //
 // Operator surface for the cold-replication policy. Three sections:
 //
@@ -32,6 +38,8 @@
 
 import { api } from "../api/client.js";
 import { clear, h } from "../lib/el.js";
+import { openDialog, dialogFooter, type DialogHandle } from "../lib/dialog.js";
+import { toast } from "../lib/toast.js";
 import type {
   ColdHealthOut,
   ColdStatus,
@@ -880,9 +888,10 @@ async function promoteBackend(
 ): Promise<void> {
   try {
     await api.adminStorage.cold({ handle });
+    toast.success(`Cold replication now targets '${handle}'.`);
     await reload();
   } catch (e) {
-    alert(`Failed to make '${handle}' active: ${(e as Error).message}`);
+    toast.error(`Failed to make '${handle}' active: ${(e as Error).message}`);
   }
 }
 
@@ -890,15 +899,45 @@ async function deleteBackend(
   handle: string,
   reload: () => Promise<void>,
 ): Promise<void> {
-  if (!confirm(`Delete backend '${handle}'? This fails if any clips reference it.`)) {
-    return;
-  }
+  const confirmed = await confirmDeleteBackend(handle);
+  if (!confirmed) return;
   try {
     await api.adminStorage.removeBackend(handle);
+    toast.success(`Backend '${handle}' deleted.`);
     await reload();
   } catch (e) {
-    alert(`Delete failed: ${(e as Error).message}`);
+    toast.error(`Delete failed: ${(e as Error).message}`);
   }
+}
+
+/// Shared confirmation dialog for the destructive backend-delete
+/// action. Matches the cameras.ts / rules.ts pattern (danger-toned
+/// footer, single-paragraph body explaining the precondition the
+/// engine enforces). Resolves true on confirm, false on cancel /
+/// dismiss.
+function confirmDeleteBackend(handle: string): Promise<boolean> {
+  const body = h(
+    "p",
+    null,
+    "Delete cold backend ",
+    h("strong", null, h("code", null, handle)),
+    "? The engine refuses this if any motion_clips row still references the backend \u2014 you'll get an inline error if so.",
+  );
+  let dlg: DialogHandle | null = null;
+  const footer = dialogFooter({
+    cancelLabel: "Cancel",
+    confirmLabel: "Delete",
+    confirmTone: "danger",
+    onCancel: () => dlg?.close(false),
+    onConfirm: () => dlg?.close(true),
+  });
+  dlg = openDialog({
+    title: "Delete cold backend",
+    body,
+    footer,
+    width: "460px",
+  });
+  return dlg.closed;
 }
 
 // ---- Policy section ------------------------------------------------------
