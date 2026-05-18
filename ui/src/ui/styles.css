@@ -1460,3 +1460,81 @@ button.chip {
 .rule-when-cell code {
   font-size: 12px;
 }
+
+
+/* ----- M-Admin Phase 4 — visual CEL builder ----- */
+
+.condition-mode-tabs {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 10px;
+}
+.condition-mode-tab.active {
+  background: var(--accent-dim);
+  color: white;
+  border-color: var(--accent);
+}
+
+.rule-builder {
+  display: flex;
+  flex-direction: column;
+}
+
+.rule-builder-row {
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(0, 1fr) minmax(0, 1.5fr) auto;
+  gap: 8px;
+  align-items: flex-end;
+  margin-bottom: 8px;
+}
+
+.rule-builder-row .field {
+  min-width: 0;
+}
+
+.rule-builder-row .rule-builder-remove {
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  font-size: 18px;
+  line-height: 1;
+  align-self: flex-end;
+  margin-bottom: 4px;
+}
+
+.rule-builder-joiner-wrap {
+  max-width: 260px;
+  margin-bottom: 8px;
+}
+
+.rule-builder-empty {
+  font-style: italic;
+  opacity: 0.7;
+  margin: 8px 0;
+  font-size: 13px;
+}
+
+.rule-builder-actions {
+  margin: 6px 0 10px 0;
+}
+
+.rule-builder-preview {
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  padding: 8px 12px;
+  border-radius: 4px;
+}
+.rule-builder-preview-label {
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  opacity: 0.6;
+  text-transform: uppercase;
+  margin-bottom: 4px;
+}
+.rule-builder-preview-code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  word-break: break-all;
+  display: block;
+  white-space: pre-wrap;
+}

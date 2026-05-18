@@ -9,9 +9,9 @@
 //   - name
 //   - severity (low | medium | high | critical)
 //   - camera_filter (multi-select chips of cameras; empty = all)
-//   - when (raw CEL — Phase 4 will replace this with a visual builder;
-//           Phase 5 will add live syntax validation via
-//           POST /api/rules/validate)
+//   - when (CEL — edited via a visual subject/op/value builder in
+//           Phase 4, with an "Edit as text" escape hatch into the
+//           raw textarea + the Phase 5 blur-validation hook)
 //   - min_track_age_ms
 //   - consecutive_frames
 //   - cooldown_ms
@@ -37,6 +37,14 @@ import {
   FieldRow,
 } from "../lib/forms.js";
 import { toast } from "../lib/toast.js";
+import {
+  compileBuilder,
+  defaultRow,
+  renderBuilder,
+  tryParseBuilder,
+  type BuilderRow,
+  type Joiner,
+} from "./rules-builder.js";
 import type {
   CameraConfig,
   CameraId,
@@ -67,6 +75,13 @@ interface FormState {
   consecutive_frames: number;
   cooldown_ms: number;
   enabled: boolean;
+  // M-Admin Phase 4 — visual builder state. `editor_mode` is
+  // initialised by trying to round-trip `when` through
+  // `tryParseBuilder`; if that fails we stay in raw mode so the
+  // expression can still be edited.
+  editor_mode: "builder" | "raw";
+  builder_rows: BuilderRow[];
+  builder_joiner: Joiner;
 }
 
 const SEVERITY_OPTIONS: ReadonlyArray<{ value: Severity; label: string }> = [
@@ -96,6 +111,9 @@ export function openRuleForm(opts: OpenRuleFormOpts): Promise<boolean> {
     consecutive_frames: undefined,
     cooldown_ms: undefined,
     enabled: undefined,
+    editor_mode: undefined,
+    builder_rows: undefined,
+    builder_joiner: undefined,
   };
 
   const formHost = h("div", { class: "rule-form" });
@@ -182,6 +200,7 @@ export function openRuleForm(opts: OpenRuleFormOpts): Promise<boolean> {
 function buildInitialState(opts: OpenRuleFormOpts): FormState {
   if (opts.mode === "edit" && opts.existing) {
     const r = opts.existing;
+    const parsed = tryParseBuilder(r.when);
     return {
       id: r.id,
       name: r.name,
@@ -192,18 +211,25 @@ function buildInitialState(opts: OpenRuleFormOpts): FormState {
       consecutive_frames: r.consecutive_frames ?? 2,
       cooldown_ms: r.cooldown_ms ?? 30_000,
       enabled: r.enabled !== false,
+      editor_mode: parsed ? "builder" : "raw",
+      builder_rows: parsed ? parsed.rows : [],
+      builder_joiner: parsed ? parsed.joiner : "and",
     };
   }
+  const defaultRows: BuilderRow[] = [defaultRow()];
   return {
     id: "",
     name: "",
     severity: "low",
     camera_filter: [],
-    when: "object.label == 'person'",
+    when: compileBuilder(defaultRows, "and"),
     min_track_age_ms: 500,
     consecutive_frames: 2,
     cooldown_ms: 30_000,
     enabled: true,
+    editor_mode: "builder",
+    builder_rows: defaultRows,
+    builder_joiner: "and",
   };
 }
 
@@ -227,7 +253,6 @@ function buildForm(
             state.id = v.trim();
           },
         });
-
   return h(
     "div",
     null,
@@ -283,23 +308,7 @@ function buildForm(
     ),
     FormSection(
       "Condition",
-      TextArea({
-        label: "when (CEL)",
-        value: state.when,
-        rows: 4,
-        required: true,
-        placeholder:
-          "object.label == 'person' && object.attributes['motion.dwell_seconds'] >= 60",
-        helpText: CEL_HELP,
-        ...(errors["when"] !== undefined ? { error: errors["when"] } : {}),
-        onChange: (v) => {
-          state.when = v;
-        },
-        onBlur: (v) => {
-          state.when = v;
-          void validateWhen(v);
-        },
-      }),
+      buildConditionSection(state, errors, validateWhen),
     ),
     FormSection(
       "Debounce",
@@ -362,6 +371,111 @@ function readOnlyField(label: string, value: string): HTMLElement {
       "Rule id cannot be changed after creation.",
     ),
   );
+}
+
+/// Condition section — owns the builder ↔ raw mode toggle. Both
+/// modes write into `state.when`; the outer save flow doesn't need
+/// to know which one was used. The two buttons rerender locally so
+/// the rest of the form (id, name, debounce knobs) keeps its DOM
+/// state.
+function buildConditionSection(
+  state: FormState,
+  errors: Record<string, string | undefined>,
+  validateWhen: (value: string) => void,
+): HTMLElement {
+  const host = h("div", { class: "condition-section" });
+
+  function inner(): void {
+    while (host.firstChild) host.removeChild(host.firstChild);
+
+    const tabs = h(
+      "div",
+      { class: "condition-mode-tabs" },
+      h(
+        "button",
+        {
+          type: "button",
+          class:
+            "ghost condition-mode-tab" +
+            (state.editor_mode === "builder" ? " active" : ""),
+          on: { click: () => switchTo("builder") },
+        },
+        "Builder",
+      ),
+      h(
+        "button",
+        {
+          type: "button",
+          class:
+            "ghost condition-mode-tab" +
+            (state.editor_mode === "raw" ? " active" : ""),
+          on: { click: () => switchTo("raw") },
+        },
+        "Edit as text",
+      ),
+    );
+
+    const body: HTMLElement =
+      state.editor_mode === "builder"
+        ? renderBuilder({
+            rows: state.builder_rows,
+            joiner: state.builder_joiner,
+            onChange: () => {
+              state.when = compileBuilder(
+                state.builder_rows,
+                state.builder_joiner,
+              );
+              // The builder shape is always syntactically valid;
+              // clear any stale error from a prior raw-mode edit.
+              if (errors["when"] !== undefined) errors["when"] = undefined;
+            },
+          })
+        : TextArea({
+            label: "when (CEL)",
+            value: state.when,
+            rows: 4,
+            required: true,
+            placeholder:
+              "object.label == 'person' && object.attributes['motion.dwell_seconds'] >= 60",
+            helpText: CEL_HELP,
+            ...(errors["when"] !== undefined ? { error: errors["when"] } : {}),
+            onChange: (v) => {
+              state.when = v;
+            },
+            onBlur: (v) => {
+              state.when = v;
+              void validateWhen(v);
+            },
+          });
+
+    host.append(tabs, body);
+  }
+
+  function switchTo(mode: "builder" | "raw"): void {
+    if (mode === state.editor_mode) return;
+    if (mode === "builder") {
+      const parsed = tryParseBuilder(state.when);
+      if (!parsed) {
+        toast.error(
+          "This expression can't be represented in the visual builder. Stay in text mode or simplify it.",
+        );
+        return;
+      }
+      state.builder_rows = parsed.rows;
+      state.builder_joiner = parsed.joiner;
+      state.when = compileBuilder(parsed.rows, parsed.joiner);
+      if (errors["when"] !== undefined) errors["when"] = undefined;
+    } else {
+      // builder → raw: surface the live-compiled CEL so the
+      // textarea picks it up as the starting point.
+      state.when = compileBuilder(state.builder_rows, state.builder_joiner);
+    }
+    state.editor_mode = mode;
+    inner();
+  }
+
+  inner();
+  return host;
 }
 
 function validate(
