@@ -114,6 +114,12 @@ export interface RuleConfig {
   id: RuleId;
   name: string;
   camera_filter?: CameraId[] | null;
+  /// Zone-id allow-list. When non-empty, the rule only fires for
+  /// objects whose bbox centre falls inside at least one of these
+  /// zones (the zones themselves live on each camera; the rule
+  /// stores ids only and looks them up at evaluation time).
+  /// `null` / omitted / empty = no zone gate.
+  zones?: string[] | null;
   when: string;
   severity: Severity;
   min_track_age_ms?: number;

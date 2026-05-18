@@ -285,7 +285,15 @@ async fn run_camera(
 
             let events = {
                 let _g = info_span!("frame.rules").entered();
-                evaluator.evaluate(cfg.id, frame_id, &trace_id, &tracked)
+                evaluator.evaluate(
+                    cfg.id,
+                    frame_id,
+                    &trace_id,
+                    frame.width,
+                    frame.height,
+                    &zones,
+                    &tracked,
+                )
             };
             // Record + publish the events now so the row exists.
             // We defer the events.clip_id stamp until AFTER the

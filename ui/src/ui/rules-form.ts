@@ -70,6 +70,9 @@ interface FormState {
   name: string;
   severity: Severity;
   camera_filter: CameraId[];
+  /// Zone-id allow-list. Each entry is the `id` of a `ZoneConfig`
+  /// defined on some camera in `opts.cameras`. Empty = no gate.
+  zones: string[];
   when: string;
   min_track_age_ms: number;
   consecutive_frames: number;
@@ -106,6 +109,7 @@ export function openRuleForm(opts: OpenRuleFormOpts): Promise<boolean> {
     name: undefined,
     severity: undefined,
     camera_filter: undefined,
+    zones: undefined,
     when: undefined,
     min_track_age_ms: undefined,
     consecutive_frames: undefined,
@@ -206,6 +210,7 @@ function buildInitialState(opts: OpenRuleFormOpts): FormState {
       name: r.name,
       severity: (r.severity ?? "low") as Severity,
       camera_filter: r.camera_filter ? [...r.camera_filter] : [],
+      zones: r.zones ? [...r.zones] : [],
       when: r.when,
       min_track_age_ms: r.min_track_age_ms ?? 500,
       consecutive_frames: r.consecutive_frames ?? 2,
@@ -222,6 +227,7 @@ function buildInitialState(opts: OpenRuleFormOpts): FormState {
     name: "",
     severity: "low",
     camera_filter: [],
+    zones: [],
     when: compileBuilder(defaultRows, "and"),
     min_track_age_ms: 500,
     consecutive_frames: 2,
@@ -303,6 +309,23 @@ function buildForm(
           state.camera_filter = next
             .map((s) => Number(s))
             .filter((n) => Number.isFinite(n));
+          // Drop any selected zones that belong to cameras we just
+          // removed from the filter, so the rule stays consistent.
+          state.zones = pruneZonesAgainstFilter(
+            state.zones,
+            state.camera_filter,
+            opts.cameras,
+          );
+        },
+      }),
+      MultiSelect<string>({
+        label: "Zones",
+        value: [...state.zones],
+        options: zoneOptionsForCameras(opts.cameras, state.camera_filter),
+        helpText:
+          "Restrict the rule to objects whose bbox centre falls inside one of these zones on the camera. Zones must be defined on the camera (use the Cameras tab → Edit → Zones). Leave empty = no zone gate.",
+        onChange: (next) => {
+          state.zones = next;
         },
       }),
     ),
@@ -533,10 +556,70 @@ function toRuleConfig(state: FormState): RuleConfig {
     severity: state.severity,
     camera_filter:
       state.camera_filter.length === 0 ? null : [...state.camera_filter],
+    zones: state.zones.length === 0 ? null : [...state.zones],
     when: state.when.trim(),
     min_track_age_ms: state.min_track_age_ms,
     consecutive_frames: state.consecutive_frames,
     cooldown_ms: state.cooldown_ms,
     enabled: state.enabled,
   };
+}
+
+/// Build the option list for the Zones MultiSelect: the union of
+/// every zone defined on the cameras currently in scope (i.e. the
+/// camera_filter selection — or all cameras if the filter is
+/// empty). Each option label is `<camera name>: <zone name>` so
+/// operators can disambiguate when two cameras define a zone with
+/// the same name.
+///
+/// Option values are the bare zone ids — the rule config stores
+/// ids only and looks them up against the camera's zones at
+/// evaluation time. We do NOT prefix the value with the camera id
+/// because the engine's lookup is per-camera anyway (the active
+/// camera at evaluation time is the producer of the event, and
+/// the zone gate only consults *its* zone list).
+function zoneOptionsForCameras(
+  cameras: ReadonlyArray<CameraConfig>,
+  cameraFilter: ReadonlyArray<CameraId>,
+): { value: string; label: string }[] {
+  const inScope =
+    cameraFilter.length === 0
+      ? cameras
+      : cameras.filter((c) => cameraFilter.includes(c.id));
+  const opts: { value: string; label: string }[] = [];
+  for (const cam of inScope) {
+    if (!cam.zones || cam.zones.length === 0) continue;
+    for (const z of cam.zones) {
+      opts.push({
+        value: z.id,
+        label: `${cam.name}: ${z.name || z.id}`,
+      });
+    }
+  }
+  // De-duplicate by value — if two cameras share a zone id (rare
+  // but possible after copy-pasting zones), keep the first label
+  // we encountered. The engine still resolves per-camera so the
+  // behaviour is correct either way.
+  const seen = new Set<string>();
+  return opts.filter((o) => {
+    if (seen.has(o.value)) return false;
+    seen.add(o.value);
+    return true;
+  });
+}
+
+/// Drop zone ids from `selected` that no longer correspond to any
+/// zone on the in-scope cameras. Called from the camera_filter
+/// onChange so deselecting a camera also drops its zones from the
+/// rule, avoiding a "phantom" zone gate that silently never
+/// matches.
+function pruneZonesAgainstFilter(
+  selected: ReadonlyArray<string>,
+  cameraFilter: ReadonlyArray<CameraId>,
+  cameras: ReadonlyArray<CameraConfig>,
+): string[] {
+  const validIds = new Set(
+    zoneOptionsForCameras(cameras, cameraFilter).map((o) => o.value),
+  );
+  return selected.filter((id) => validIds.has(id));
 }

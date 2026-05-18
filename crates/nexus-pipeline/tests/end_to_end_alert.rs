@@ -52,6 +52,7 @@ async fn cel_rule_emits_alert_for_virtual_person() {
         id: "any_person".into(),
         name: "Any person".into(),
         camera_filter: None,
+        zones: None,
         when: "object.label == 'person'".into(),
         severity: "low".into(),
         min_track_age_ms: 0,

@@ -980,6 +980,17 @@ pub struct RuleConfig {
     pub id: String,
     pub name: String,
     pub camera_filter: Option<Vec<CameraId>>,
+    /// Zone-id allow-list. When `Some` and non-empty, an object only
+    /// matches the rule if its bbox centre falls inside at least one
+    /// zone whose `id` appears in this list AND that zone is defined
+    /// on the camera producing the event. `None` or empty = no zone
+    /// gate (rule fires anywhere in the frame).
+    ///
+    /// The pipeline looks up the zones on the camera at evaluation
+    /// time so a rule transparently follows zone-polygon edits — the
+    /// rule config only stores ids, never the polygons themselves.
+    #[serde(default)]
+    pub zones: Option<Vec<String>>,
     /// CEL expression evaluated against the per-frame `object` / `camera` /
     /// `now` context.
     pub when: String,

@@ -16,7 +16,7 @@ use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use cel_interpreter::{Context, Program, Value as CelValue};
 use chrono::Utc;
-use nexus_config::{RuleConfig, RulesBackendKind, RulesConfig};
+use nexus_config::{RuleConfig, RulesBackendKind, RulesConfig, ZoneConfig};
 use nexus_types::{AlertEvent, Artifacts, CameraId, FrameId, Severity, TraceId, TrackedObject};
 use parking_lot::Mutex;
 use serde_json::Value as JsonValue;
@@ -229,11 +229,30 @@ impl RuleEvaluator {
 
     /// Evaluate every rule against every tracked object on a frame.
     /// Returns the events that should be persisted + published.
+    ///
+    /// `frame_width` / `frame_height` are the pixel dimensions of the
+    /// frame the objects were detected on; they're needed so the
+    /// per-rule zone gate can normalise the object's bbox centre
+    /// before doing point-in-polygon. The supervisor already has
+    /// these in `Frame.width` / `Frame.height` — pass them through
+    /// rather than threading the whole `Frame`, so this crate stays
+    /// free of any frame/image dependency.
+    ///
+    /// `camera_zones` is the **full** zone list configured on the
+    /// camera that produced `objects`. Zones are looked up by `id`
+    /// against `rule.zones` (the rule stores only ids); a rule with
+    /// no `zones` set is unaffected by this argument.
+    #[allow(clippy::too_many_arguments)] // 8 args is the natural shape: rule eval inherently needs frame
+                                         // dims + zones + identifiers; bundling them would just push the
+                                         // boilerplate to every caller.
     pub fn evaluate(
         &self,
         camera_id: CameraId,
         frame_id: FrameId,
         trace_id: &TraceId,
+        frame_width: u32,
+        frame_height: u32,
+        camera_zones: &[ZoneConfig],
         objects: &[TrackedObject],
     ) -> Vec<AlertEvent> {
         let now_ms = SystemTime::now()
@@ -244,6 +263,11 @@ impl RuleEvaluator {
         let rules = self.rules.load();
         let mut out = Vec::new();
         let mut state = self.track_state.lock();
+
+        // Pre-resolve frame dims into f32 once; the per-object
+        // normalise math doesn't need anything else.
+        let fw = frame_width.max(1) as f32;
+        let fh = frame_height.max(1) as f32;
 
         for rule in rules.iter() {
             let cfg = &rule.config;
@@ -256,10 +280,65 @@ impl RuleEvaluator {
                 }
             }
 
+            // Resolve the rule's zone allow-list into the actual
+            // polygons exactly once per (rule, frame) — not per
+            // (rule, object). The allow-list is typically tiny
+            // (<10 entries) but we still pay an O(rules * objects)
+            // multiplier in the inner loop without this.
+            //
+            // Tri-state encoding:
+            //   * `None`     ⇒ no zone gate (rule fires anywhere)
+            //   * `Some(vs)` ⇒ object must fall inside at least one
+            //                  zone in `vs` (may be empty if every
+            //                  configured id failed to resolve —
+            //                  see below).
+            //
+            // Missing ids are silently skipped per-id (we log once
+            // at resolution time so misconfigurations are visible).
+            // But if `cfg.zones` was set + non-empty AND every id
+            // failed to resolve (e.g. the operator deleted every
+            // referenced zone), we keep `Some(vec![])` rather than
+            // collapsing to `None` — otherwise the rule would
+            // silently widen to fire on the whole frame, which is
+            // the worst possible failure mode (false-positive
+            // security alerts). Empty Vec ⇒ inside-any test
+            // returns false ⇒ rule suppresses everywhere on this
+            // camera until the operator fixes the config.
+            let rule_zones: Option<Vec<&ZoneConfig>> = match &cfg.zones {
+                None => None,
+                Some(ids) if ids.is_empty() => None,
+                Some(ids) => {
+                    let mut resolved: Vec<&ZoneConfig> = Vec::with_capacity(ids.len());
+                    for id in ids {
+                        if let Some(z) = camera_zones.iter().find(|z| &z.id == id) {
+                            resolved.push(z);
+                        } else {
+                            debug!(rule = %cfg.id, zone = %id, camera = camera_id,
+                                "rule references unknown zone id; skipping for this camera");
+                        }
+                    }
+                    Some(resolved)
+                }
+            };
+
             for o in objects {
                 if o.age_ms < cfg.min_track_age_ms {
                     continue;
                 }
+
+                // Zone gate (if any): object's bbox centre, normalised
+                // by the current frame dims, must fall inside at least
+                // one of the rule's allow-listed zones on this camera.
+                if let Some(zones) = &rule_zones {
+                    let (cx, cy) = o.bbox.center();
+                    let nx = (cx / fw).clamp(0.0, 1.0);
+                    let ny = (cy / fh).clamp(0.0, 1.0);
+                    let inside_any = zones.iter().any(|z| point_in_polygon(nx, ny, &z.polygon));
+                    if !inside_any {
+                        continue;
+                    }
+                }
+
                 let matched = match self.engine.matches(rule, o, camera_id) {
                     Ok(b) => b,
                     Err(e) => {
@@ -305,6 +384,36 @@ impl RuleEvaluator {
         }
         out
     }
+}
+
+/// Even-odd winding test on a normalised (0..1) polygon. Returns
+/// false if the polygon has fewer than 3 vertices. Duplicated here
+/// instead of pulled from `nexus-tracker` so the dependency graph
+/// stays `rules ← {config, types}` only — `nexus-tracker` already
+/// depends on `nexus-rules` indirectly via the pipeline, and we do
+/// not want a cycle.
+fn point_in_polygon(x: f32, y: f32, poly: &[(f32, f32)]) -> bool {
+    if poly.len() < 3 {
+        return false;
+    }
+    let mut inside = false;
+    let n = poly.len();
+    let xd = x as f64;
+    let yd = y as f64;
+    for i in 0..n {
+        let (p1x, p1y) = poly[i];
+        let (p2x, p2y) = poly[(i + 1) % n];
+        let p1x = p1x as f64;
+        let p1y = p1y as f64;
+        let p2x = p2x as f64;
+        let p2y = p2y as f64;
+        let intersects = ((p1y > yd) != (p2y > yd))
+            && (xd < ((p2x - p1x) * (yd - p1y) / ((p2y - p1y) + 1e-9) + p1x));
+        if intersects {
+            inside = !inside;
+        }
+    }
+    inside
 }
 
 fn compile_all(
@@ -355,6 +464,7 @@ mod tests {
             id: "r1".into(),
             name: "person".into(),
             camera_filter: None,
+            zones: None,
             when: "object.label == 'person'".into(),
             severity: "high".into(),
             min_track_age_ms: 0,
@@ -368,5 +478,153 @@ mod tests {
             .matches(&compiled, &obj("person", 0.9, 1000), 1)
             .unwrap());
         assert!(!eng.matches(&compiled, &obj("dog", 0.9, 1000), 1).unwrap());
+    }
+
+    fn obj_at_pixels(x1: f32, y1: f32, x2: f32, y2: f32) -> TrackedObject {
+        TrackedObject {
+            track_id: 7,
+            label: "person".into(),
+            confidence: 0.9,
+            bbox: BBox { x1, y1, x2, y2 },
+            age_frames: 10,
+            age_ms: 1000,
+            attributes: Default::default(),
+        }
+    }
+
+    fn unit_rules_cfg() -> RulesConfig {
+        RulesConfig {
+            backend: RulesBackendKind::Cel,
+            inline: vec![],
+        }
+    }
+
+    fn rule_with_zones(zones: Option<Vec<String>>) -> RuleConfig {
+        RuleConfig {
+            id: "zone_gated".into(),
+            name: "zone-gated person".into(),
+            camera_filter: None,
+            zones,
+            when: "object.label == 'person'".into(),
+            severity: "high".into(),
+            min_track_age_ms: 0,
+            consecutive_frames: 1,
+            cooldown_ms: 0,
+            enabled: true,
+        }
+    }
+
+    /// A zone covering the top-left quadrant of a normalised frame
+    /// (x:0..0.5, y:0..0.5). Lets the tests verify "object inside
+    /// quad" vs "object outside quad" with one shared shape.
+    fn top_left_quad_zone() -> ZoneConfig {
+        ZoneConfig {
+            id: "z_topleft".into(),
+            name: "top-left".into(),
+            polygon: vec![(0.0, 0.0), (0.5, 0.0), (0.5, 0.5), (0.0, 0.5)],
+            kind: nexus_config::ZoneKind::Inclusion,
+        }
+    }
+
+    #[test]
+    fn zone_gate_fires_when_object_centre_inside_listed_zone() {
+        // 100×100 frame, object spans (10,10)-(40,40) so centre is
+        // (25,25) → normalised (0.25, 0.25) → inside top-left quad.
+        let rule = rule_with_zones(Some(vec!["z_topleft".into()]));
+        let ev = RuleEvaluator::new(&unit_rules_cfg(), &[rule]).unwrap();
+        let zones = vec![top_left_quad_zone()];
+        let alerts = ev.evaluate(
+            1,
+            42,
+            &"trace-1".into(),
+            100,
+            100,
+            &zones,
+            &[obj_at_pixels(10.0, 10.0, 40.0, 40.0)],
+        );
+        assert_eq!(alerts.len(), 1, "object inside listed zone should fire");
+    }
+
+    #[test]
+    fn zone_gate_suppresses_when_object_centre_outside_listed_zone() {
+        // Same zone, but object centre is (75,75) — outside top-left.
+        let rule = rule_with_zones(Some(vec!["z_topleft".into()]));
+        let ev = RuleEvaluator::new(&unit_rules_cfg(), &[rule]).unwrap();
+        let zones = vec![top_left_quad_zone()];
+        let alerts = ev.evaluate(
+            1,
+            42,
+            &"trace-2".into(),
+            100,
+            100,
+            &zones,
+            &[obj_at_pixels(60.0, 60.0, 90.0, 90.0)],
+        );
+        assert!(
+            alerts.is_empty(),
+            "object outside listed zone should be suppressed, got {:?}",
+            alerts
+        );
+    }
+
+    #[test]
+    fn zone_gate_with_none_or_empty_does_not_filter() {
+        // No `zones` ⇒ rule fires anywhere.
+        let rule_a = rule_with_zones(None);
+        let ev_a = RuleEvaluator::new(&unit_rules_cfg(), &[rule_a]).unwrap();
+        let zones = vec![top_left_quad_zone()];
+        let alerts_a = ev_a.evaluate(
+            1,
+            1,
+            &"t".into(),
+            100,
+            100,
+            &zones,
+            &[obj_at_pixels(70.0, 70.0, 80.0, 80.0)],
+        );
+        assert_eq!(alerts_a.len(), 1, "None zones ⇒ rule fires anywhere");
+
+        // Empty Vec is treated the same as None — the loader and the
+        // UI may send either depending on whether the user touched
+        // the field; both must mean "no gate".
+        let rule_b = rule_with_zones(Some(vec![]));
+        let ev_b = RuleEvaluator::new(&unit_rules_cfg(), &[rule_b]).unwrap();
+        let alerts_b = ev_b.evaluate(
+            1,
+            1,
+            &"t".into(),
+            100,
+            100,
+            &zones,
+            &[obj_at_pixels(70.0, 70.0, 80.0, 80.0)],
+        );
+        assert_eq!(
+            alerts_b.len(),
+            1,
+            "Empty zones Vec ⇒ rule still fires anywhere"
+        );
+    }
+
+    #[test]
+    fn zone_gate_with_unknown_zone_id_suppresses_everywhere() {
+        // Rule references a zone the camera doesn't define — the
+        // operator likely deleted it. Better to silently suppress
+        // than to fire false-positively over the whole frame.
+        let rule = rule_with_zones(Some(vec!["z_ghost".into()]));
+        let ev = RuleEvaluator::new(&unit_rules_cfg(), &[rule]).unwrap();
+        let zones = vec![top_left_quad_zone()]; // no z_ghost
+        let alerts = ev.evaluate(
+            1,
+            1,
+            &"t".into(),
+            100,
+            100,
+            &zones,
+            &[obj_at_pixels(10.0, 10.0, 40.0, 40.0)], // would fire without gate
+        );
+        assert!(
+            alerts.is_empty(),
+            "unresolved zone id ⇒ suppress, not fall back to no-gate"
+        );
     }
 }
