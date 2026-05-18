@@ -281,11 +281,15 @@ async fn upsert_camera(
             &serde_json::to_value(&cam).unwrap_or(serde_json::Value::Null),
         )
         .await?;
+    // Fire-and-forget: the engine's `config.changed` reconciler
+    // listens for this and hot-starts a supervisor + pre-roll
+    // ingester for the new (or modified) camera. `action` lets the
+    // reconciler skip a DB roundtrip for the trivial cases.
     let _ = s
         .bus
         .publish(
             topic::CONFIG_CHANGED,
-            &serde_json::json!({ "camera_id": id }),
+            &serde_json::json!({ "kind": "camera", "action": "upsert", "camera_id": id }),
         )
         .await;
     Ok(Json(cam))
@@ -304,6 +308,15 @@ async fn delete_camera(
             &serde_json::json!({}),
         )
         .await?;
+    // Same channel as upsert — the reconciler diffs the live set
+    // against the DB and aborts the supervisor for any removed id.
+    let _ = s
+        .bus
+        .publish(
+            topic::CONFIG_CHANGED,
+            &serde_json::json!({ "kind": "camera", "action": "delete", "camera_id": id }),
+        )
+        .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -509,11 +522,86 @@ struct PreviewRuleResp {
     /// in the window than the cap allowed. The UI nudges the
     /// operator to either widen the window or accept the truncation.
     limit_hit: bool,
+    /// Histogram of the distinct labels in the scanned window,
+    /// most-frequent first. Lets the UI show a "saw these
+    /// labels in the window" hint when the rule returned zero
+    /// matches — the single most useful diagnostic for the
+    /// common foot-gun of writing `object.label == 'vehicle'`
+    /// against a YOLO/COCO pipeline that emits namespaced
+    /// labels like `vehicle.car`, `vehicle.truck`, etc.
+    /// Truncated to the top 32 labels so a noisy pipeline can't
+    /// blow up the response body.
+    scanned_labels: Vec<ScannedLabel>,
+    /// Number of scanned rows whose per-row CEL evaluation
+    /// returned an `Err` (e.g. missing attribute, type mismatch,
+    /// `startsWith` arity wrong). These are silently skipped by
+    /// the matcher so a single malformed row can't poison the
+    /// whole preview, but we still need to surface the count
+    /// because a non-zero value here is almost always the cause
+    /// of "my rule should match this label but it doesn't".
+    eval_errors: u32,
+    /// First per-row eval error message (deduped). Mirrors the
+    /// shape of `error` but at the per-row layer instead of
+    /// compile-time. Lets the UI show "15 of 49 rows errored:
+    /// <msg>" so the operator can fix the predicate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    eval_first_error: Option<String>,
+    /// Total number of rows rejected by the zone gate before
+    /// reaching the CEL matcher. Non-zero here when the rule
+    /// has `zones` configured AND some rows' bbox-centres fall
+    /// outside every resolved zone polygon. The fourth silent
+    /// rejection path (after compile-error, eval-error, and
+    /// CEL-returns-false) — surfaced because it's invisible
+    /// from the predicate alone: the rule looks correct but
+    /// zones are filtering everything.
+    zone_filtered: u32,
+    /// Echo of the CEL `when` string the engine actually compiled.
+    /// Verbatim from `req.rule.when` — lets the UI sanity-check
+    /// that the form really sent what the operator typed (the
+    /// most common cause of "my rule doesn't match" complaints
+    /// turns out to be a stale form state sending the wrong
+    /// expression entirely).
+    effective_when: String,
     /// Compile / validation error if the rule's CEL didn't parse.
     /// When set, `matches` is empty and the UI shows the error
     /// inline (same pattern as `/rules/validate`).
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+}
+
+/// One bucket in `PreviewRuleResp::scanned_labels`. Kept as a
+/// tuple-ish struct rather than `HashMap<String, u32>` so the JSON
+/// preserves the most-frequent-first ordering the UI displays.
+///
+/// `matched` lets the UI render the per-label scoreboard the
+/// operator needs to see when a rule "should" match a known
+/// label but doesn't: "vehicle.car: 49 scanned / 49 matched,
+/// person: 12 scanned / 0 matched" — the latter line points the
+/// finger directly at the broken predicate.
+#[derive(serde::Serialize)]
+struct ScannedLabel {
+    label: String,
+    count: u32,
+    /// Subset of `count` that satisfied the rule's CEL predicate
+    /// (post zone-gate). 0 = none, == count = all.
+    matched: u32,
+    /// Subset of `count` rejected by the zone gate BEFORE
+    /// reaching the CEL matcher. Surfacing this per-label is
+    /// crucial: it's how an operator distinguishes "my
+    /// predicate is wrong" (matched=0 with zone_filtered=0)
+    /// from "my zones don't cover where this label appears"
+    /// (zone_filtered == count).
+    zone_filtered: u32,
+    /// Byte-level representation of the label, as a JSON array of
+    /// u8 values, attached ONLY when `matched == 0 && count > 0
+    /// && zone_filtered == 0`. This is the tiebreaker for the
+    /// very-confusing case where the chip text reads identical
+    /// to the operator's literal but `==` still returns false
+    /// AND no zone filtering happened — invisible characters
+    /// (zero-width-joiner, BOM, NBSP, smart quotes) are the
+    /// usual culprit, and only a byte dump reveals them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    label_bytes: Option<Vec<u8>>,
 }
 
 async fn preview_rule(
@@ -553,6 +641,11 @@ async fn preview_rule(
             window_start,
             window_end,
             limit_hit: false,
+            scanned_labels: vec![],
+            eval_errors: 0,
+            eval_first_error: None,
+            zone_filtered: 0,
+            effective_when: req.rule.predicate.when.clone(),
             error: Some(msg),
         }));
     }
@@ -596,6 +689,26 @@ async fn preview_rule(
             .collect();
 
     let mut matches: Vec<PreviewMatch> = Vec::new();
+    // Track silently-swallowed CEL eval errors so the response
+    // can surface them. A non-zero count here is almost always
+    // the explanation when a rule "should" match but doesn't:
+    // e.g. predicate references `object.attributes['x']` on a
+    // synthetic preview object whose attributes are empty.
+    let mut eval_errors: u32 = 0;
+    let mut eval_first_error: Option<String> = None;
+    // Per-label scoreboards. `matched` counts rows that
+    // produced `Ok(true)`. `zone_filtered` counts rows that
+    // were rejected by the zone gate BEFORE reaching the CEL
+    // matcher — the third silent rejection path that
+    // produces "label scanned 12 times, matched 0" with no
+    // other explanation. Surfacing the two separately is the
+    // only way the operator can tell "my CEL is wrong" from
+    // "my zones reject this label's bboxes".
+    let mut matched_by_label: std::collections::HashMap<String, u32> =
+        std::collections::HashMap::new();
+    let mut zone_filtered_by_label: std::collections::HashMap<String, u32> =
+        std::collections::HashMap::new();
+    let mut zone_filtered_total: u32 = 0;
     for row in &rows {
         let synthetic = nexus_types::TrackedObject {
             track_id: row.track_id,
@@ -638,12 +751,17 @@ async fn preview_rule(
                 .iter()
                 .any(|z| preview_point_in_polygon(nx, ny, &z.polygon));
             if !inside_any {
+                *zone_filtered_by_label
+                    .entry(row.label.clone())
+                    .or_insert(0) += 1;
+                zone_filtered_total += 1;
                 continue;
             }
         }
 
         match engine.matches(&compiled, &synthetic, row.camera_id) {
             Ok(true) => {
+                *matched_by_label.entry(row.label.clone()).or_insert(0) += 1;
                 matches.push(PreviewMatch {
                     motion_event_id: row.id,
                     camera_id: row.camera_id,
@@ -656,12 +774,39 @@ async fn preview_rule(
                 });
             }
             Ok(false) => {}
-            // Per-row errors are intentionally swallowed in
-            // preview — a single malformed attribute shouldn't
-            // poison the whole result set. The CEL compile path
-            // above already caught the common breakage modes.
-            Err(_) => {}
+            // Per-row errors are intentionally swallowed for the
+            // matcher (a single malformed attribute shouldn't
+            // poison the whole result set), but we count them
+            // and capture the first message so the response can
+            // surface them. The UI shows "X of N rows errored:
+            // <msg>" — the missing piece that turns a silent
+            // zero-match into an actionable error.
+            Err(e) => {
+                eval_errors += 1;
+                if eval_first_error.is_none() {
+                    let msg = e.to_string();
+                    tracing::warn!(
+                        rule_id = %req.rule.id,
+                        label = %row.label,
+                        error = %msg,
+                        "preview: CEL eval error on row (counted, swallowed)"
+                    );
+                    eval_first_error = Some(msg);
+                }
+            }
         }
+    }
+
+    if eval_errors > 0 {
+        tracing::warn!(
+            rule_id = %req.rule.id,
+            eval_errors,
+            scanned,
+            "preview: {} of {} scanned rows errored during CEL eval (first: {:?})",
+            eval_errors,
+            scanned,
+            eval_first_error.as_deref().unwrap_or(""),
+        );
     }
 
     Ok(Json(PreviewRuleResp {
@@ -670,8 +815,80 @@ async fn preview_rule(
         window_start: from.to_rfc3339(),
         window_end: to.to_rfc3339(),
         limit_hit,
+        scanned_labels: tally_scanned_labels(
+            &rows,
+            32,
+            &matched_by_label,
+            &zone_filtered_by_label,
+        ),
+        eval_errors,
+        eval_first_error,
+        zone_filtered: zone_filtered_total,
+        effective_when: req.rule.predicate.when.clone(),
         error: None,
     }))
+}
+
+/// Bucket the scanned rows by `label`, return the top-N most
+/// frequent (descending). Powers the "saw these labels in the
+/// window" hint the UI shows when a rule returns zero matches —
+/// the single fastest way to spot the common foot-gun of writing
+/// `object.label == 'vehicle'` against a COCO pipeline that emits
+/// `vehicle.car`, `vehicle.truck`, etc. (see
+/// `nexus-inference/src/yolo.rs::map_coco_to_domain_label`).
+///
+/// `top_n` caps the response so a noisy pipeline (e.g. an
+/// open-vocab detector with 200 distinct prompts) can't make the
+/// preview JSON huge. 32 is enough headroom for every label the
+/// COCO-domain mapper emits plus typical open-vocab prompt sets.
+///
+/// `matched_by_label` is the per-label scoreboard from the
+/// matcher loop, used to populate `ScannedLabel.matched` (and
+/// `label_bytes` for the byte-level diagnostic when a label was
+/// scanned but matched zero times).
+fn tally_scanned_labels(
+    rows: &[nexus_store::MotionEventRow],
+    top_n: usize,
+    matched_by_label: &std::collections::HashMap<String, u32>,
+    zone_filtered_by_label: &std::collections::HashMap<String, u32>,
+) -> Vec<ScannedLabel> {
+    use std::collections::HashMap;
+    let mut counts: HashMap<&str, u32> = HashMap::new();
+    for row in rows {
+        *counts.entry(row.label.as_str()).or_insert(0) += 1;
+    }
+    let mut v: Vec<ScannedLabel> = counts
+        .into_iter()
+        .map(|(label, count)| {
+            let matched = matched_by_label.get(label).copied().unwrap_or(0);
+            let zone_filtered =
+                zone_filtered_by_label.get(label).copied().unwrap_or(0);
+            // Only attach the byte dump for the genuinely
+            // surprising case ("label appears N times, matched
+            // 0, AND none were zone-filtered"); when
+            // zone_filtered > 0 the explanation is the zone
+            // gate, not the predicate, so a byte dump would
+            // just be noise.
+            let label_bytes = if matched == 0 && count > 0 && zone_filtered == 0 {
+                Some(label.as_bytes().to_vec())
+            } else {
+                None
+            };
+            ScannedLabel {
+                label: label.to_string(),
+                count,
+                matched,
+                zone_filtered,
+                label_bytes,
+            }
+        })
+        .collect();
+    // Descending by count, then ascending by label for stable
+    // ordering when two labels tie (otherwise HashMap iteration
+    // order makes the response flap between requests).
+    v.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.label.cmp(&b.label)));
+    v.truncate(top_n);
+    v
 }
 
 /// Even-odd winding on a normalised polygon. Inlined here (copy of

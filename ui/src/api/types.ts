@@ -170,6 +170,50 @@ export interface RulePreviewResponse {
   window_start: string;
   window_end: string;
   limit_hit: boolean;
+  /// Histogram of distinct labels in the scanned window, most-
+  /// frequent first (top 32). Used by the UI to show a
+  /// "saw these labels in the window" hint when matches is
+  /// empty — the single most useful diagnostic for the common
+  /// foot-gun of writing `object.label == 'vehicle'` against a
+  /// COCO pipeline that emits `vehicle.car`, `vehicle.truck`,
+  /// etc. `matched` is the subset of `count` that satisfied the
+  /// rule's CEL predicate post zone-gate (lets the chip strip
+  /// render "person 12/0"). `zone_filtered` is the subset of
+  /// `count` rejected by the zone gate BEFORE reaching the CEL
+  /// matcher — the silent-rejection path that explains
+  /// "matched=0 but my predicate looks right". `label_bytes` is
+  /// the byte-level representation of the label, only attached
+  /// when the label was scanned but matched zero times AND no
+  /// rows were zone-filtered — invisible characters like NBSP /
+  /// zero-width-joiner / smart quotes are the usual culprit in
+  /// that case.
+  scanned_labels?: Array<{
+    label: string;
+    count: number;
+    matched: number;
+    zone_filtered: number;
+    label_bytes?: number[];
+  }>;
+  /// Count of scanned rows whose per-row CEL eval errored
+  /// (silently swallowed by the matcher to avoid one bad row
+  /// poisoning the whole result set). Non-zero almost always
+  /// explains a "should-match-but-doesn't" complaint — the UI
+  /// surfaces this prominently next to the summary line.
+  eval_errors?: number;
+  /// First per-row eval error message. Paired with `eval_errors`
+  /// so the operator sees what to fix instead of a silent zero.
+  eval_first_error?: string;
+  /// Total rows rejected by the zone gate before reaching the
+  /// CEL matcher. Non-zero when the rule has `zones` configured
+  /// AND some rows' bbox-centres fall outside every resolved
+  /// zone polygon. The UI surfaces this as an orange box.
+  zone_filtered?: number;
+  /// Echo of the `when` expression the engine actually compiled.
+  /// Lets the UI sanity-check that the form really sent what
+  /// the operator typed — when the displayed expression doesn't
+  /// match the textarea, the form state is stale and a tab
+  /// switch / refresh fixes it.
+  effective_when?: string;
   /// CEL compile error, when present. `matches` is empty in that case.
   error?: string;
 }
@@ -260,6 +304,13 @@ export interface ProbeRtspResult {
   ok: boolean;
   status: number;
   sdp_streams: SdpStream[];
+  /// RTSP path that actually answered with a 200 + SDP body.
+  /// Populated when the backend's path-discovery loop finds a
+  /// vendor-default that works (Hikvision `/Streaming/Channels/101`,
+  /// Dahua `/cam/realmonitor?channel=1&subtype=0`, …). Also set on
+  /// auth failures (401/403) so the UI can show the operator which
+  /// path it stopped on. Omitted when every candidate failed.
+  path?: string;
 }
 
 // ---------------------------------------------------------------------------

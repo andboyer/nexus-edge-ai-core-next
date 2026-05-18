@@ -12,7 +12,8 @@
 // here so the visual builder can target them.
 
 import { h } from "../lib/el.js";
-import { NumberField, Select, TextField } from "../lib/forms.js";
+import { Combobox, NumberField, Select, TextField } from "../lib/forms.js";
+import { COCO_DOMAIN_LABEL_STRINGS } from "../api/labels.js";
 
 // ---------------------------------------------------------------------------
 // Subject palette
@@ -35,10 +36,23 @@ export interface Subject {
   /// (e.g. `motion.zone_state`). Renders as a Select instead of
   /// a free-form TextField.
   options?: ReadonlyArray<string>;
+  /// Open-ended suggestion list for string subjects. Rendered as
+  /// a Combobox (text input + datalist + clickable chips) so the
+  /// user can pick a common value with one click OR type a
+  /// custom one. Used for `object.label` where the COCO domain
+  /// labels cover ~99% of cases but yolo_world open-vocab
+  /// pipelines can emit anything.
+  suggestions?: ReadonlyArray<string>;
 }
 
 export const SUBJECTS: ReadonlyArray<Subject> = [
-  { expr: "object.label", label: "object.label", kind: "string", placeholder: "person" },
+  {
+    expr: "object.label",
+    label: "object.label",
+    kind: "string",
+    placeholder: "person",
+    suggestions: COCO_DOMAIN_LABEL_STRINGS,
+  },
   { expr: "object.confidence", label: "object.confidence", kind: "number", placeholder: "0.7" },
   { expr: "object.track_id", label: "object.track_id", kind: "number" },
   { expr: "object.age_ms", label: "object.age_ms", kind: "number", placeholder: "1000" },
@@ -293,6 +307,12 @@ export interface BuilderUIOpts {
   /// update its own state + re-run [`compileBuilder`] to refresh
   /// the linked textarea / preview.
   onChange: () => void;
+  /// Notified when the AND/OR joiner select changes. The caller
+  /// MUST write the new value into its own state — `opts.joiner`
+  /// is a snapshot value, not a binding, so mutating it here
+  /// would not propagate back. Without this hook the dropdown
+  /// silently flipped back to AND on every recompile.
+  onJoinerChange: (joiner: Joiner) => void;
 }
 
 export function renderBuilder(opts: BuilderUIOpts): HTMLElement {
@@ -323,6 +343,7 @@ function buildInner(opts: BuilderUIOpts, rerender: () => void): HTMLElement {
           ],
           onChange: (next) => {
             opts.joiner = next;
+            opts.onJoinerChange(next);
             opts.onChange();
           },
         }),
@@ -341,6 +362,20 @@ function buildInner(opts: BuilderUIOpts, rerender: () => void): HTMLElement {
       ),
     );
   } else {
+    // Single column-header row above the stack of condition rows.
+    // The rows themselves render with `hideLabel: true` on each
+    // field so the heading isn't repeated 1× per row, which is
+    // what made the builder feel busy.
+    wrap.append(
+      h(
+        "div",
+        { class: "rule-builder-row rule-builder-header" },
+        h("span", { class: "rule-builder-col-label" }, "Subject"),
+        h("span", { class: "rule-builder-col-label" }, "Operator"),
+        h("span", { class: "rule-builder-col-label" }, "Value"),
+        h("span", null),
+      ),
+    );
     for (let i = 0; i < opts.rows.length; i++) {
       wrap.append(buildRow(opts, i, rerender));
     }
@@ -398,8 +433,14 @@ function buildRow(
     row.op = allowedOps[0]!;
   }
 
+  // Per-row controls render in a compact column layout. We hide
+  // the per-cell labels because the column-header row above
+  // (rendered by `buildInner`) already announces Subject /
+  // Operator / Value — repeating those labels on every row turns
+  // the builder into a noisy stack of identical headings.
   const subjectSelect = Select<string>({
     label: "Subject",
+    hideLabel: true,
     value: row.subject,
     options: SUBJECTS.map((s) => ({ value: s.expr, label: s.label })),
     onChange: (next) => {
@@ -415,6 +456,7 @@ function buildRow(
 
   const opSelect = Select<Op>({
     label: "Operator",
+    hideLabel: true,
     value: row.op,
     options: allowedOps.map((o) => ({ value: o, label: OP_LABEL[o] })),
     onChange: (next) => {
@@ -434,6 +476,7 @@ function buildRow(
     if (row.value !== currentOption) row.value = currentOption;
     valueField = Select<string>({
       label: "Value",
+      hideLabel: true,
       value: currentOption,
       options: subj.options.map((v) => ({ value: v, label: v })),
       onChange: (next) => {
@@ -445,6 +488,7 @@ function buildRow(
     const num = Number(row.value);
     valueField = NumberField({
       label: "Value",
+      hideLabel: true,
       value: Number.isFinite(num) ? num : 0,
       ...(subj.placeholder !== undefined ? { placeholder: subj.placeholder } : {}),
       onChange: (next) => {
@@ -452,9 +496,30 @@ function buildRow(
         opts.onChange();
       },
     });
+  } else if (subj.suggestions && subj.suggestions.length > 0) {
+    // Open-ended string with a known-good suggestion list (e.g.
+    // `object.label` with the COCO catalogue). Combobox lets the
+    // operator pick from the native datalist dropdown on focus,
+    // OR type a custom value. We pass `hideChips: true` so the
+    // always-visible chip strip doesn't pile 12 chips above every
+    // row — the chooser stays available on the cameras form for
+    // prompts, where it makes sense to see all options at once.
+    valueField = Combobox({
+      label: "Value",
+      hideLabel: true,
+      hideChips: true,
+      value: row.value,
+      suggestions: subj.suggestions,
+      ...(subj.placeholder !== undefined ? { placeholder: subj.placeholder } : {}),
+      onChange: (next) => {
+        row.value = next;
+        opts.onChange();
+      },
+    });
   } else {
     valueField = TextField({
       label: "Value",
+      hideLabel: true,
       value: row.value,
       ...(subj.placeholder !== undefined ? { placeholder: subj.placeholder } : {}),
       onChange: (next) => {

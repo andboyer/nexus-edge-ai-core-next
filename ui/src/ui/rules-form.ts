@@ -445,6 +445,9 @@ function buildConditionSection(
         ? renderBuilder({
             rows: state.builder_rows,
             joiner: state.builder_joiner,
+            onJoinerChange: (j) => {
+              state.builder_joiner = j;
+            },
             onChange: () => {
               state.when = compileBuilder(
                 state.builder_rows,
@@ -705,11 +708,31 @@ function buildPreviewSection(
                 : "";
               summaryHost.textContent =
                 resp.matches.length === 0
-                  ? `No matches in ${resp.matches.length === 0 ? "the last 24h" : ""} (scanned ${resp.scanned} detections).${limited}`
+                  ? `No matches in the last 24h (scanned ${resp.scanned} detections).${limited}`
                   : `${resp.matches.length} match${resp.matches.length === 1 ? "" : "es"} in the last 24h (scanned ${resp.scanned} detections).${limited}`;
-              resultsHost.replaceChildren(
-                renderPreviewMatches(resp.matches, cameraNameById),
-              );
+              if (resp.matches.length === 0 && resp.scanned > 0) {
+                // Zero-match diagnosis: surface the labels the
+                // detector actually emitted in the window. The
+                // most common reason a 'vehicle' rule reports
+                // zero matches is that the COCO mapper namespaces
+                // labels as `vehicle.car`, `vehicle.truck`, etc.
+                // — showing the histogram makes that obvious in
+                // one glance, no log-reading required.
+                resultsHost.replaceChildren(
+                  renderScannedLabelsHint(
+                    resp.scanned_labels ?? [],
+                    state.when,
+                    resp.eval_errors ?? 0,
+                    resp.eval_first_error,
+                    resp.effective_when,
+                    resp.zone_filtered ?? 0,
+                  ),
+                );
+              } else {
+                resultsHost.replaceChildren(
+                  renderPreviewMatches(resp.matches, cameraNameById),
+                );
+              }
             })
             .catch((err: unknown) => {
               inFlight = false;
@@ -798,6 +821,245 @@ function renderPreviewMatches(
     ),
     h("tbody", null, ...rows),
   );
+}
+
+/// Render the "labels seen in the scanned window" diagnostic that
+/// replaces the empty results table when a preview returns zero
+/// matches. Three layered hints, most-actionable first:
+///
+///   1. If the engine echoed back a `effective_when` that differs
+///      from the textarea content, the form sent a stale rule —
+///      surface that first because it explains every other
+///      apparent CEL bug.
+///   2. If any rows errored during per-row CEL eval, surface the
+///      count + first message — that's almost always the real
+///      cause of "should-match-but-doesn't" complaints.
+///   3. Otherwise show the label histogram + the COCO namespacing
+///      did-you-mean hint (see `nexus-inference/src/yolo.rs::
+///      map_coco_to_domain_label` for the mapping table).
+function renderScannedLabelsHint(
+  labels: ReadonlyArray<{
+    label: string;
+    count: number;
+    matched: number;
+    zone_filtered: number;
+    label_bytes?: number[];
+  }>,
+  whenExpr: string,
+  evalErrors: number,
+  evalFirstError: string | undefined,
+  effectiveWhen: string | undefined,
+  zoneFilteredTotal: number,
+): HTMLElement {
+  if (labels.length === 0) {
+    return h(
+      "div",
+      { class: "field-help rule-preview-labels-empty" },
+      "No detections in the window — no objects to match against.",
+    );
+  }
+
+  const children: (HTMLElement | null)[] = [];
+
+  // Hint 1: form sent a different expression than what's typed.
+  // We compare normalised whitespace because the engine round-
+  // trips the string verbatim but the form may have trimmed
+  // trailing newlines; we only flag a real divergence.
+  if (
+    typeof effectiveWhen === "string" &&
+    effectiveWhen.trim() !== whenExpr.trim()
+  ) {
+    children.push(
+      h(
+        "div",
+        { class: "rule-preview-suggestion rule-preview-suggestion-warn" },
+        "The form sent a different expression than what's in the textarea. Switch tabs and back, then re-run preview. Engine evaluated: ",
+        h("code", null, effectiveWhen),
+      ),
+    );
+  }
+
+  // Hint 2: per-row CEL eval errors. Almost always the actual
+  // cause when label histogram contains the values you expect
+  // but matches is still zero.
+  if (evalErrors > 0) {
+    children.push(
+      h(
+        "div",
+        { class: "rule-preview-suggestion rule-preview-suggestion-warn" },
+        `${evalErrors} of the scanned rows errored during CEL evaluation `,
+        "(silently skipped by the matcher). First error: ",
+        h("code", null, evalFirstError ?? "(unknown)"),
+        ". This usually means the predicate references a field ",
+        "that isn't populated in preview — e.g. ",
+        h("code", null, "object.attributes['motion.dwell_seconds']"),
+        " is empty on preview (preview can't reconstruct attributes from a ",
+        "single past row). Restructure the rule to gate on stored ",
+        "fields only (label, confidence, bbox, camera.id), or test ",
+        "against live data instead.",
+      ),
+    );
+  }
+
+  // Hint 2b: the zone gate rejected rows before they even
+  // reached the CEL matcher. This is invisible from the
+  // predicate alone — the rule looks correct but zones
+  // silently filtered out everything. Surfacing the count is
+  // crucial because it's the difference between "my CEL is
+  // wrong" and "my zones don't cover where this label appears".
+  if (zoneFilteredTotal > 0) {
+    children.push(
+      h(
+        "div",
+        { class: "rule-preview-suggestion rule-preview-suggestion-warn" },
+        `${zoneFilteredTotal} of the scanned rows were rejected by the zone gate `,
+        "before the CEL matcher saw them — their bbox-centres fell outside every configured zone. ",
+        "Remove the zone filter from the rule (Scope → Zones) and re-run preview to confirm; ",
+        "if the matches reappear, the zones don't cover the bboxes for the labels you care about. ",
+        "Per-label breakdown appears below.",
+      ),
+    );
+  }
+
+  // Hint 3 (the histogram + did-you-mean) is always useful, even
+  // when eval errors are present.
+  const families = new Set<string>();
+  for (const { label } of labels) {
+    const dot = label.indexOf(".");
+    if (dot > 0) families.add(label.slice(0, dot));
+  }
+  const suggestions: string[] = [];
+  for (const fam of families) {
+    const re = new RegExp(`(['"])${fam}\\1`);
+    if (re.test(whenExpr)) {
+      suggestions.push(fam);
+    }
+  }
+
+  const chips = labels.slice(0, 16).map((l) => {
+    const zoneSuffix = l.zone_filtered > 0 ? ` (${l.zone_filtered} zone-filtered)` : "";
+    return h(
+      "span",
+      {
+        class:
+          l.count > 0 && l.matched === 0
+            ? "chip rule-preview-label-chip rule-preview-label-chip-zero"
+            : "chip rule-preview-label-chip",
+        title:
+          l.count > 0 && l.matched === 0
+            ? `${l.count} rows scanned, 0 matched the rule${zoneSuffix}`
+            : `${l.count} rows scanned, ${l.matched} matched the rule${zoneSuffix}`,
+      },
+      l.label,
+      h(
+        "span",
+        { class: "rule-preview-label-count" },
+        ` ${l.matched}/${l.count}${l.zone_filtered > 0 ? ` ⊘${l.zone_filtered}` : ""}`,
+      ),
+    );
+  });
+
+  children.push(
+    h(
+      "div",
+      { class: "field-help" },
+      `Detector saw these labels in the window — matched/scanned (top ${chips.length}):`,
+    ),
+    h("div", { class: "rule-preview-labels" }, ...chips),
+  );
+
+  // Byte-level diagnostic: when a label was scanned N times but
+  // matched zero, AND no rows were zone-filtered, AND the
+  // operator's `when` literally contains that exact label
+  // string, the comparison failure is almost always an
+  // invisible-character mismatch (NBSP \u00A0, BOM \uFEFF,
+  // zero-width-joiner \u200D, smart quote ’ vs '). Dump the
+  // bytes of both sides so the operator can see the
+  // discrepancy. (When zone_filtered > 0 the explanation is
+  // the zone gate above, not the predicate — skip the
+  // byte-dump noise.)
+  for (const l of labels) {
+    if (l.matched !== 0 || l.count === 0) continue;
+    if (l.zone_filtered > 0) continue;
+    if (l.label_bytes === undefined) continue;
+    // Is this label literally mentioned in the operator's CEL?
+    // If not, the mismatch is expected (rule doesn't reference
+    // this label) — skip the byte dump.
+    const re = new RegExp(`(['"])${escapeRegex(l.label)}\\1`);
+    if (!re.test(whenExpr)) continue;
+
+    const dbBytes = l.label_bytes;
+    const literalMatch = whenExpr.match(
+      new RegExp(`(['"])(${escapeRegex(l.label)})\\1`),
+    );
+    const ruleBytes = literalMatch
+      ? Array.from(new TextEncoder().encode(literalMatch[2]!))
+      : null;
+
+    const bytesEqual =
+      ruleBytes !== null &&
+      ruleBytes.length === dbBytes.length &&
+      ruleBytes.every((b, i) => b === dbBytes[i]);
+
+    if (!bytesEqual) {
+      children.push(
+        h(
+          "div",
+          { class: "rule-preview-suggestion rule-preview-suggestion-warn" },
+          `The label `,
+          h("code", null, `'${l.label}'`),
+          ` was scanned ${l.count} times but matched 0 — and the bytes don't match your rule literal. `,
+          "This is almost always a hidden-character mismatch (smart quote, NBSP, BOM, zero-width joiner). Bytes — DB: ",
+          h("code", null, `[${dbBytes.join(",")}]`),
+          ", rule literal: ",
+          h(
+            "code",
+            null,
+            ruleBytes ? `[${ruleBytes.join(",")}]` : "(not found)",
+          ),
+          ". Try retyping the literal in the textarea.",
+        ),
+      );
+    } else {
+      // Bytes match but matcher still says zero — escalate.
+      children.push(
+        h(
+          "div",
+          { class: "rule-preview-suggestion rule-preview-suggestion-warn" },
+          `The label `,
+          h("code", null, `'${l.label}'`),
+          ` was scanned ${l.count} times and the bytes match your rule literal exactly, but the matcher returned 0. `,
+          "This is a real engine bug — please report it with the rule text and the response payload from the network tab.",
+        ),
+      );
+    }
+  }
+
+  if (suggestions.length > 0) {
+    for (const fam of suggestions) {
+      children.push(
+        h(
+          "div",
+          { class: "rule-preview-suggestion" },
+          `Tip: the detector emits namespaced labels like `,
+          h("code", null, `${fam}.car`),
+          ` — to match every ${fam} variant, use `,
+          h("code", null, `object.label.startsWith('${fam}.')`),
+          `.`,
+        ),
+      );
+    }
+  }
+
+  return h("div", { class: "rule-preview-labels-hint" }, ...children);
+}
+
+/// Escape every regex metacharacter so an arbitrary label string
+/// can be inlined into a `new RegExp(...)` literal without
+/// breaking on `.`, `*`, brackets, etc. Used by the preview byte-
+/// dump diagnostic to look up the operator's literal in the CEL.
+function escapeRegex(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 /// "5m ago" / "2h ago" / "3d ago" — falls back to the ISO string
