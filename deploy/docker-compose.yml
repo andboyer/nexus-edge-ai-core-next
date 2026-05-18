@@ -1,11 +1,24 @@
 # Single-service deploy. The engine container holds the API, the UI, and
 # the per-camera pipelines. No admin sidecar, no viewer sidecar.
+#
+# Production usage: stack a per-tier overlay on top of this file. Each
+# overlay supplies the right `devices:` / `group_add:` block plus the
+# tier-pinned NEXUS_CONFIG env. See `deploy/docker-compose.t10.yml`,
+# `t24.yml`, `t36s.yml`. Symlink the chosen one to
+# `docker-compose.override.yml` next to this file and Compose auto-merges.
+#
+# Dev usage (no overlay): `docker compose up -d` builds locally and runs
+# without GPU passthrough. Virtual sources don't need acceleration.
 services:
   engine:
+    # Local build for dev iteration. Production overlays pin
+    # `image: ghcr.io/andboyer/nexus-engine:vX.Y.Z` and never hit the
+    # `build:` path. Released images are published by
+    # `.github/workflows/release.yml` on tag push.
     build:
       context: ..
       dockerfile: deploy/Dockerfile
-    image: ghcr.io/andboyer/nexus-engine:dev
+    image: ghcr.io/andboyer/nexus-engine:latest
     container_name: nexus-engine
     restart: unless-stopped
     ports:
@@ -16,11 +29,10 @@ services:
     environment:
       - NEXUS_CONFIG=/etc/nexus/nexus.toml
       - RUST_LOG=info,nexus=debug
-    # GPU passthrough is config-by-target. Examples:
+    # GPU passthrough lives in the per-tier overlay files. Examples:
     #   Intel iGPU / Arc:   devices: ["/dev/dri:/dev/dri"]
     #   NVIDIA:             runtime: nvidia, deploy.resources.reservations.devices ...
     #   Intel NPU:          devices: ["/dev/accel/accel0:/dev/accel/accel0"]
-    # Leave commented in dev — virtual source needs no acceleration.
 
 volumes:
   nexus-state: {}

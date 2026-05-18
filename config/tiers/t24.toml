@@ -24,6 +24,7 @@ ep_priority = ["openvino", "cpu"]
 
 [inference.model]
 kind = "yolo"
+pack_path = "/usr/share/nexus/models"  # baked into the Docker image; override to /var/lib/nexus/models for custom packs
 preset = "640"                  # default operating point per models-manifest.json
 input_width = 640
 input_height = 640

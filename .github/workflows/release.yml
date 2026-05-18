@@ -1,0 +1,89 @@
+# ---------------------------------------------------------------------------
+# Release pipeline — M-Install Checkpoint 3a (image scope).
+#
+# Triggered on `v*` tag push. Builds the kitchen-sink all-EPs Docker image
+# (same FEATURES set as the .github/workflows/ci.yml `docker-all-eps` job)
+# and pushes it to GHCR as:
+#
+#   ghcr.io/<owner>/nexus-engine:vX.Y.Z   (the literal git tag)
+#   ghcr.io/<owner>/nexus-engine:<sha>    (the commit sha, immutable)
+#   ghcr.io/<owner>/nexus-engine:latest   (always rolls forward — pin to a
+#                                          specific vX.Y.Z in prod)
+#
+# Why this is its own workflow and not a job under ci.yml: the push needs
+# `packages: write` (which ci.yml deliberately doesn't grant on PRs) and a
+# different trigger (`tags`, not `push`/`pull_request`). Keeping them split
+# means a broken release workflow can never block PR iteration.
+#
+# Scope deliberately left at "image only" for now. Binary artifacts
+# (nexus-engine / nexus-probe / nexus-doctor standalone) and the signed
+# `models-pack-vX.Y.Z.tar.gz` are the bare-metal + customer-ops parts of
+# Checkpoint 3a; not needed for the Docker-Compose path on our dogfooding
+# fleet, will land before M8 customer migration.
+# ---------------------------------------------------------------------------
+
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to publish (e.g. v0.1.0). Must already exist."
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  image:
+    name: build + push GHCR image
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # On workflow_dispatch, allow re-publishing a previous tag.
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: set up docker buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: derive image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/nexus-engine
+          tags: |
+            type=ref,event=tag
+            type=sha,format=long,prefix=
+            type=raw,value=latest
+
+      - name: build + push (all-EPs, gha cache)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Kitchen sink — same FEATURES set as ci.yml `docker-all-eps`
+          # so the released image is a superset of every tier's needs.
+          # Drop EPs one at a time only if a release-blocker surfaces.
+          build-args: |
+            FEATURES=ort,ep-cpu,ep-openvino,ep-cuda,ep-tensorrt
+          # Reuse the docker-all-eps gha cache scope — first release on
+          # a branch warm-starts from the most recent CI build of the
+          # same scope, cuts ~15 min off cold publishing.
+          cache-from: type=gha,scope=docker-all-eps
+          cache-to: type=gha,scope=docker-all-eps,mode=max

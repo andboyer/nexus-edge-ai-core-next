@@ -103,6 +103,20 @@ COPY --from=rust-build /work/target/release/nexus-probe  /usr/local/bin/nexus-pr
 # UI assets — served at `/` by the engine.
 COPY --from=ui-build /work/ui/dist /usr/share/nexus/ui
 
+# Default model pack — baked into the image so a fresh `docker compose up`
+# works without §6.4 host-side model staging. ~58 MB total (yolo26n ~10 MB,
+# yolo_world ~48 MB, manifest ~8 KB). Mounted read-only via the image
+# layer; the tier configs in `config/tiers/` point `pack_path` here.
+# Operators with custom model packs override by setting
+# `[inference.model].pack_path = "/var/lib/nexus/models"` in their
+# nexus.toml and bind-mounting `/var/lib/nexus/models/` over the read-only
+# image dir. Path mirrors `/usr/share/nexus/ui/` so neither is shadowed
+# by the `/var/lib/nexus` state bind from the per-tier overlays.
+RUN mkdir -p /usr/share/nexus/models
+COPY models/yolo26n_dynamic.onnx     /usr/share/nexus/models/yolo26n_dynamic.onnx
+COPY models/yolo_world_v2_s.onnx     /usr/share/nexus/models/yolo_world_v2_s.onnx
+COPY models/models-manifest.json     /usr/share/nexus/models/models-manifest.json
+
 # Default config + state dirs.
 RUN mkdir -p /etc/nexus /var/lib/nexus && chown -R nexus:nexus /var/lib/nexus
 COPY config/single-camera.toml /etc/nexus/nexus.toml

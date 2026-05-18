@@ -2,11 +2,17 @@
 
 > **Status: beta.** Cores M0–M4 + M-Install Checkpoints 1–2 + M-Admin
 > Phases 0–6 are complete; the engine + admin UI are usable
-> end-to-end on the reference hardware tiers. Production deployment
-> is still blocked on M7 (alert delivery) + M8 (first customer
-> trial) per [`ROADMAP.md`](ROADMAP.md). Follow the verification
-> gate in §9 before declaring an install "done", and start with
-> §10.0 for the admin UI quickstart.
+> end-to-end on the reference hardware tiers. **M-Install Checkpoint
+> 3a (image scope)** is also live: every `v*` git tag now publishes
+> `ghcr.io/andboyer/nexus-engine:vX.Y.Z` via
+> [.github/workflows/release.yml](../.github/workflows/release.yml),
+> the default model pack is baked into the image, and per-tier
+> Compose overlays under `deploy/` ship the right device + tier-config
+> wiring out of the box (see §6). Production deployment is still
+> blocked on M7 (alert delivery) + M8 (first customer trial) per
+> [`ROADMAP.md`](ROADMAP.md). Follow the verification gate in §9
+> before declaring an install "done", and start with §10.0 for the
+> admin UI quickstart.
 >
 > **Audience:** an operator bringing up the engine on a fresh
 > tier-target box. If you're contributing to the codebase, follow
@@ -636,34 +642,42 @@ git clone https://github.com/andboyer/nexus-edge-ai-core-next.git .
 
 ### 6.3 Pick the tier config
 
+Copy the tier file matching your hardware (from §1) into the
+canonical engine config path. The per-tier overlays in §6.6 mount
+`/etc/nexus/nexus.toml` into the container as the active config —
+keeping the filename stable means switching tiers later, hand-editing
+camera URLs, or pointing tooling at "the config" all just work.
+
+```bash
+sudo install -o nexus -g nexus -m 0644 \
+    /opt/nexus/config/tiers/t24.toml \
+    /etc/nexus/nexus.toml            # ← swap t24.toml for your tier
+```
+
 > **Optional once you're on the dogfooding kit.** Engine ≥ 0.1
 > understands `--tier auto` (or `NEXUS_TIER=auto`), which calls
 > `nexus-probe` in-process at startup and loads the matching
-> `config/tiers/<tier>.toml` itself. The manual copy below is still
-> the right move for production deployments where you want to pin a
-> version-controlled config under `/etc/nexus/nexus.toml` and audit
-> changes — but for fast bring-up on the box you just unboxed,
-> `nexus-engine --tier auto` skips this step entirely. See
+> `config/tiers/<tier>.toml` itself. The explicit copy above is
+> still the right move for production deployments where you want
+> to pin a version-controlled config and audit changes. See
 > [`docs/ROADMAP.md` → M-Install Checkpoint 1](ROADMAP.md#checkpoint-1--dogfooding-kit-now-2-days).
 
-Replace `t24.toml` with the file matching your tier from §1.
+### 6.4 Stage the models (optional — custom packs only)
+
+> **Skip this section by default.** The published Docker image ships
+> with the default model pack baked in at `/usr/share/nexus/models/`
+> (yolo26n_dynamic.onnx + yolo_world_v2_s.onnx + models-manifest.json,
+> ~58 MB total). All five tier configs in `config/tiers/` already point
+> `[inference.model].pack_path` there, so a fresh `docker compose up`
+> works without any host-side model staging.
+
+Follow the steps below **only if** you've regenerated the models
+locally per [Appendix A](#12-appendix-a--reproducible-model-generation),
+fine-tuned them, or are running a custom pack.
 
 ```bash
-sudo install -o nexus -g nexus -m 0600 \
-    /opt/nexus/config/tiers/t24.toml \
-    /etc/nexus/nexus.toml
-```
-
-### 6.4 Stage the models
-
-> **Today:** there is no signed release artifact yet. Copy a model
-> from another machine, or follow [Appendix A](#12-appendix-a--reproducible-model-generation)
-> to regenerate them on the box. A `models-pack-vX.Y.tar.gz` will
-> land on GitHub Releases before v0.1; this section will switch to a
-> signed `curl` + `sha256sum -c` once it exists.
-
-```bash
-# From wherever your prebuilt models live:
+# Stage your custom pack on the host:
+sudo mkdir -p /var/lib/nexus/models
 sudo install -o nexus -g nexus -m 0644 \
     /path/to/yolo26n_dynamic.onnx \
     /var/lib/nexus/models/yolo26n_dynamic.onnx
@@ -678,56 +692,95 @@ sudo install -o nexus -g nexus -m 0644 \
 # doesn't match the file on disk.
 sha256sum /var/lib/nexus/models/*.onnx
 jq '.models[].sha256' /var/lib/nexus/models/models-manifest.json
+
+# Tell the engine to read from /var/lib/nexus/models instead of
+# /usr/share/nexus/models. Edit the active config:
+sudo sed -i \
+    's#/usr/share/nexus/models#/var/lib/nexus/models#g' \
+    /etc/nexus/nexus.toml
 ```
 
-### 6.5 Pin the model dir into the container
+### 6.5 Where state lives
 
-The default [deploy/docker-compose.yml](../deploy/docker-compose.yml)
-mounts `../config:/etc/nexus:ro` and a named `nexus-state` volume
-for `/var/lib/nexus`. We replace the named volume with a host bind
-so the model files we staged in §6.4 actually show up inside the
-container:
+The per-tier overlays in §6.6 bind-mount `/var/lib/nexus` from the
+host into the container. That's where the engine writes:
+
+| Host path                                  | Holds                                             |
+| ------------------------------------------ | ------------------------------------------------- |
+| `/var/lib/nexus/nexus.db`                  | SQLite (cameras, rules, events, motion)           |
+| `/var/lib/nexus/clips/`                    | Recorded mp4 clips                                |
+| `/var/lib/nexus/state/dev-token`           | Auto-provisioned bearer token (mode 0600)         |
+| `/var/lib/nexus/models/` *(if you ran §6.4)* | Custom model pack overriding the baked-in one  |
+
+The baked-in image models at `/usr/share/nexus/models/` are **not**
+shadowed by this bind mount — they live on a separate path inside
+the container's read-only image layer.
+
+### 6.6 Pick the per-tier compose overlay
+
+The repo ships one overlay per supported tier under `deploy/`. Each one
+sets the right `devices:` / `group_add:` / tier-pinned `NEXUS_CONFIG`
+so the engine boots with the matching `ep_priority` list:
+
+| Tier      | Overlay file                                                                        | What it adds                                      |
+| --------- | ----------------------------------------------------------------------------------- | ------------------------------------------------- |
+| **T10**   | [deploy/docker-compose.t10.yml](../deploy/docker-compose.t10.yml)     | `/dev/dri` iGPU, `t10.toml`                       |
+| **T24**   | [deploy/docker-compose.t24.yml](../deploy/docker-compose.t24.yml)     | `/dev/dri` iGPU, `t24.toml`                       |
+| **T36-S** | [deploy/docker-compose.t36s.yml](../deploy/docker-compose.t36s.yml)   | `/dev/dri` iGPU; **NPU passthrough commented** (see §5.3 — bare-metal still preferred for NPU today). Falls back to OpenVINO on the Arc 140V iGPU until you enable it. |
+
+T36 (Arc A380 dGPU) and T64 (NVIDIA) overlays haven't been authored
+yet because neither box is on the dogfooding desk; until they land,
+fall back to a hand-written `docker-compose.override.yml` modeled on
+the same shape — see §6.6.legacy below.
+
+Symlink the right overlay so Compose auto-merges it on every command:
 
 ```bash
-sudo install -o nexus-admin -g nexus-admin -m 0644 /dev/null \
-    /opt/nexus/deploy/docker-compose.override.yml
-sudo tee /opt/nexus/deploy/docker-compose.override.yml >/dev/null <<'EOF'
-services:
-  engine:
-    volumes:
-      - /etc/nexus:/etc/nexus:ro
-      - /var/lib/nexus:/var/lib/nexus
-EOF
+cd /opt/nexus/deploy
+sudo ln -sf docker-compose.t24.yml docker-compose.override.yml   # ← T24 example; swap for your tier
+ls -l docker-compose.override.yml                                # confirm symlink target
 ```
 
-`/var/lib/nexus` ownership is uid 1000 / gid 1000 (set in §4.3),
-which matches the `nexus` user inside the image — no permission
-surprises.
+> **Why a symlink instead of `cp`:** subsequent `git pull` on
+> `/opt/nexus` brings in upstream overlay tweaks automatically.
+> Copying freezes the override at install-time and means you'll
+> drift behind future bug-fixes.
 
-### 6.6 Tier-specific compose override (devices)
+#### 6.6.legacy — Hand-written override (T36, T64, or custom)
 
-Append the device block matching your tier to the same
-`docker-compose.override.yml`:
+If your tier doesn't have a ready-made overlay yet, write your own
+`docker-compose.override.yml` next to the base compose. Use one of
+the canned overlays as a template; the device block is the only
+tier-specific bit.
 
-**T10 / T24 / T36 (Intel iGPU / dGPU):**
+**T36 (Intel Arc A380 dGPU):**
 
 ```yaml
 services:
   engine:
+    image: ghcr.io/andboyer/nexus-engine:latest
     devices:
       - /dev/dri:/dev/dri
     group_add:
-      - "render"        # numeric GID also OK; render is 110 on 24.04
+      - "video"
+      - "render"
+    volumes:
+      - /etc/nexus:/etc/nexus:ro
+      - /var/lib/nexus:/var/lib/nexus
+    environment:
+      - NEXUS_CONFIG=/etc/nexus/nexus.toml
+      - NEXUS_TIER=t36
 ```
 
-**T36-S** — go to §7 (bare-metal). Container NPU passthrough is
-unreliable on the kernels available today.
+**T36-S** with NPU passthrough — see §7 (bare-metal). Container
+NPU passthrough is unreliable on the kernels available today.
 
 **T64 (NVIDIA):**
 
 ```yaml
 services:
   engine:
+    image: ghcr.io/andboyer/nexus-engine:latest
     runtime: nvidia
     deploy:
       resources:
@@ -736,19 +789,86 @@ services:
             - driver: nvidia
               count: all
               capabilities: ["gpu"]
+    volumes:
+      - /etc/nexus:/etc/nexus:ro
+      - /var/lib/nexus:/var/lib/nexus
+    environment:
+      - NEXUS_CONFIG=/etc/nexus/nexus.toml
+      - NEXUS_TIER=t64
 ```
 
-### 6.7 Build + start
+### 6.7 Pull + start
+
+> **Pre-flight:** the published image is on GHCR at
+> `ghcr.io/andboyer/nexus-engine:latest` (pushed by
+> [.github/workflows/release.yml](../.github/workflows/release.yml)
+> on every `v*` tag). For a public package no login is needed; for a
+> private package, one-time `docker login ghcr.io -u andboyer` with a
+> read-scoped PAT.
+>
+> Pin to a specific `vX.Y.Z` in production by editing the `image:`
+> line of your overlay — `:latest` is fine for the dogfooding fleet
+> but means a tagged release rolls forward on the next `pull`.
+
+```bash
+cd /opt/nexus/deploy
+docker compose pull         # grab the all-EPs image from GHCR
+docker compose up -d        # start the engine
+docker compose logs -f      # Ctrl-C to detach; engine keeps running
+```
+
+First-boot tasks the engine performs automatically:
+
+- Generates `/var/lib/nexus/state/dev-token` (mode 0600) — your bearer
+  token. See §8.3.
+- Creates `nexus.db` if absent and runs migrations.
+- Loads the tier-pinned config, prints resolved `ep_priority` and
+  worker counts.
+
+Grab the dev-token straight out of the container:
+
+```bash
+docker exec nexus-engine cat /var/lib/nexus/state/dev-token
+```
+
+Then jump to §8 to add cameras.
+
+### 6.8 Updating to a new release
+
+The release workflow publishes a new immutable `vX.Y.Z` plus a
+rolling `:latest` on every git tag. Updating each box is two
+commands:
 
 ```bash
 cd /opt/nexus
-docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.override.yml build
-docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.override.yml up -d
-docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.override.yml logs -f
-# Ctrl-C to detach from logs (the engine keeps running).
+git pull --ff-only          # picks up overlay tweaks + new tier configs
+cd deploy
+docker compose pull         # pulls the new GHCR image
+docker compose up -d        # restart-in-place with the new image
+docker image prune -f       # reclaim disk
 ```
 
-Now jump to §8 to add cameras.
+Wrap that in `/usr/local/bin/nexus-update` and you have a one-word
+update across the fleet:
+
+```bash
+sudo install -m 0755 /dev/null /usr/local/bin/nexus-update
+sudo tee /usr/local/bin/nexus-update >/dev/null <<'EOF'
+#!/bin/sh
+set -e
+cd /opt/nexus && git pull --ff-only
+cd /opt/nexus/deploy
+docker compose pull
+docker compose up -d
+docker image prune -f
+EOF
+```
+
+Run by hand on each box after tagging a release, or cron-schedule it
+nightly — your call. **Don't** point Watchtower at the container if
+you care about staging releases: `:latest` rolls forward and a bad
+tag breaks every box at once. Pin to `vX.Y.Z` in the overlay if you
+want full release-gating.
 
 ---
 

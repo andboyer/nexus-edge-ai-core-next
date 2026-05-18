@@ -24,6 +24,7 @@ ep_priority = ["openvino", "cpu"]
 
 [inference.model]
 kind = "yolo"                   # closed-vocab (yolo26n_dynamic.onnx)
+pack_path = "/usr/share/nexus/models"  # baked into the Docker image; override to /var/lib/nexus/models for custom packs
 preset = "320"                  # T10 picks the lowest-latency model-pack preset
 input_width = 320
 input_height = 320
