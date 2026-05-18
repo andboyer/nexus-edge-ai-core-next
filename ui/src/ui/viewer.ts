@@ -36,7 +36,10 @@ async function poll(cameraId: number, canvas: HTMLCanvasElement) {
     } catch {
       // Engine restart, no frame yet, etc. Keep polling.
     }
-    await sleep(500);
+    // 100ms => 10fps perceived ceiling. Server-side cap is the camera's
+    // `max_fps`; if that's lower (e.g. 5) we just busy-poll the same
+    // frame_id repeatedly, which is cheap because metadata is JSON.
+    await sleep(100);
   }
 }
 
