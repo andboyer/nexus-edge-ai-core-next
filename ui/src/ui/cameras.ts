@@ -185,7 +185,6 @@ function row(
       }),
       iconButton("trash", {
         title: `Delete camera ${cam.name}`,
-        danger: true,
         onClick: () => void confirmDelete(cam, onChange),
       }),
     ),

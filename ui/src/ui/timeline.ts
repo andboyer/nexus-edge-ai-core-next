@@ -46,11 +46,15 @@ export async function renderTimeline(root: HTMLElement): Promise<void> {
     ),
   );
 
-  // Anchor the grid on a wall-clock hour boundary so labels map
-  // cleanly to "13:00" etc. instead of "12:47".
+  // Anchor the grid so the LAST cell is the current (in-progress)
+  // hour. We snap `now` down to the hour boundary, then push `to`
+  // one bucket forward so the [from, to) window covers
+  // [now-23h, now+1h) — i.e. 24 cells whose final bucket is the
+  // hour the operator is currently looking at. Without this push
+  // the current hour silently falls off the right edge.
   const now = new Date();
   now.setMinutes(0, 0, 0);
-  const to = now;
+  const to = new Date(now.getTime() + BUCKET_SECONDS * 1000);
   const from = new Date(to.getTime() - HOURS * BUCKET_SECONDS * 1000);
 
   const host = h("div", { class: "timeline-host" });

@@ -186,7 +186,6 @@ function row(
       }),
       iconButton("trash", {
         title: `Delete rule ${r.name}`,
-        danger: true,
         onClick: () => void confirmDelete(r, onChange),
       }),
     ),

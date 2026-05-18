@@ -465,7 +465,6 @@ function renderBackendsSection(
         iconButton("trash", {
           title:
             "DELETE /v1/admin/storage/backends/:handle. Fails if any motion_clips row references this backend.",
-          danger: true,
           onClick: () => void deleteBackend(b.handle, reload),
         }),
       );

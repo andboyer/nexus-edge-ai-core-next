@@ -646,12 +646,6 @@ textarea {
   stroke: currentColor;
 }
 
-.icon-btn--trash:hover,
-.icon-btn.danger:hover {
-  color: var(--crit);
-  border-color: rgba(239, 71, 111, 0.4);
-}
-
 /* Action cell helper — group multiple icon buttons (and the rare
    text button) with even spacing, right-aligned. */
 .admin-table td.actions,
@@ -1318,6 +1312,68 @@ button.chip {
   margin-top: 8px;
 }
 
+/* Shared username/password row inside the Discover dialog. Two
+   inputs side-by-side on wide screens, stacked on narrow ones. */
+.discovery-creds {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  margin-top: 8px;
+}
+
+@media (max-width: 520px) {
+  .discovery-creds {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* Password reveal toggle. Wraps a single `<input type=password>`
+   in a relative-positioned span and pins an eye-icon button to
+   the right edge. The button is borderless / chrome-less so the
+   input still reads as a single field; only the icon color
+   shifts on hover. Used by the discovery dialog's shared-creds
+   block so the operator can verify the password they typed
+   without re-typing. */
+.password-reveal-wrap {
+  position: relative;
+  display: block;
+}
+.password-reveal-wrap input {
+  /* Reserve space on the right for the icon button so the typed
+     value doesn't slide under it. 28px button + 8px breathing
+     room. */
+  padding-right: 36px !important;
+}
+.password-reveal {
+  position: absolute;
+  top: 50%;
+  right: 4px;
+  transform: translateY(-50%);
+  width: 28px;
+  height: 26px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+  color: var(--text-dim);
+  border-radius: 4px;
+}
+.password-reveal:hover {
+  color: var(--text);
+  background: var(--bg-elev);
+}
+.password-reveal:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.password-reveal svg {
+  width: 14px;
+  height: 14px;
+}
+
 .discovery-progress {
   display: flex;
   flex-direction: column;
@@ -1403,15 +1459,19 @@ button.chip {
   border-radius: 6px;
   overflow: hidden;
   min-height: 320px;
-  display: flex;
-  align-items: stretch;
-  justify-content: stretch;
+  /* No `display:flex` here: the snapshot <img> sets its own height
+     (width:100%; height:auto) so the aspect ratio of the camera
+     frame is preserved. A flex container with align-items:stretch
+     would vertically stretch the img and distort the picture. */
 }
 
 .zones-snapshot-img {
   display: block;
   width: 100%;
   height: auto;
+  /* Belt-and-braces: even if a parent regrows the box, never
+     scale the picture beyond its natural ratio. */
+  object-fit: contain;
   user-select: none;
   -webkit-user-drag: none;
 }
@@ -1602,12 +1662,36 @@ button.chip {
   display: grid;
   grid-template-columns: minmax(0, 2fr) minmax(0, 1fr) minmax(0, 1.5fr) auto;
   gap: 8px;
-  align-items: flex-end;
-  margin-bottom: 8px;
+  align-items: center;
+  margin-bottom: 6px;
+}
+
+/* Column-header row above the stack of condition rows. Renders
+   small uppercase labels in the same grid columns as the row
+   controls so they line up exactly. We drop the visual labels
+   on each row itself (via `hideLabel: true` on the field
+   primitives) to declutter — one header beats N repeated
+   "Subject" / "Operator" / "Value" headings. */
+.rule-builder-header {
+  margin-bottom: 4px;
+}
+.rule-builder-col-label {
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  font-weight: 600;
 }
 
 .rule-builder-row .field {
   min-width: 0;
+}
+
+/* Without a label heading the bare controls already collapse to
+   their natural height — drop the bottom margin that was added
+   to compensate for the label baseline offset. */
+.rule-builder-row .field-nolabel {
+  margin: 0;
 }
 
 .rule-builder-row .rule-builder-remove {
@@ -1616,8 +1700,7 @@ button.chip {
   padding: 0;
   font-size: 18px;
   line-height: 1;
-  align-self: flex-end;
-  margin-bottom: 4px;
+  align-self: center;
 }
 
 .rule-builder-joiner-wrap {
@@ -1656,3 +1739,140 @@ button.chip {
   display: block;
   white-space: pre-wrap;
 }
+
+/* "Labels seen in the scanned window" hint shown when Run preview
+   returns zero matches. Helps the operator spot the COCO-domain
+   label namespacing (`vehicle.car`, not `vehicle`). */
+.rule-preview-labels-hint {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 6px;
+}
+.rule-preview-labels {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.rule-preview-label-chip {
+  /* Inherits `.chip` look; we just add a faint mono treatment so
+     long namespaced labels read clearly. */
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.rule-preview-label-chip-zero {
+  /* Label was scanned but matched zero rows for this rule. Dim
+     the background slightly so the eye lands on labels that DID
+     match (matched > 0) rendered with the default style. */
+  opacity: 0.65;
+}
+.rule-preview-label-count {
+  color: var(--text-dim);
+  font-family: inherit;
+  font-size: 11px;
+  margin-left: 2px;
+}
+.rule-preview-suggestion {
+  font-size: 12px;
+  color: var(--text);
+  background: rgba(56, 225, 255, 0.08);
+  border: 1px solid var(--accent-dim);
+  border-radius: 4px;
+  padding: 6px 8px;
+  line-height: 1.5;
+}
+.rule-preview-suggestion-warn {
+  /* Tinted amber/red to clearly distinguish "your form sent the
+     wrong thing" / "rows errored" from the gentle namespacing
+     did-you-mean tip below. */
+  background: rgba(255, 180, 60, 0.10);
+  border-color: rgba(255, 180, 60, 0.45);
+}
+.rule-preview-suggestion code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  background: rgba(0, 0, 0, 0.25);
+  padding: 1px 4px;
+  border-radius: 3px;
+}
+.rule-preview-labels-empty {
+  font-style: italic;
+}
+
+/* ==========================================================
+   Combobox + COCO label chooser
+   ----------------------------------------------------------
+   Combobox = text input + native <datalist> autocomplete +
+   horizontal chip strip of common values rendered above the
+   input. Used by the rules builder for `object.label`. The
+   COCO chooser is a closely-related grouped variant rendered
+   under the Prompts ChipsInput in the cameras form.
+   ========================================================== */
+
+.combobox {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.combobox-wrap {
+  display: flex;
+  flex-direction: column;
+}
+
+.combobox-suggestions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.combobox-chip {
+  /* Tighter than the default `.chip` because we render a lot
+     of them inline and want the input itself to dominate. */
+  padding: 1px 8px;
+  font-size: 11px;
+}
+
+.prompts-field-host {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.coco-chooser {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 10px;
+  background: var(--bg-elev);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+}
+
+.coco-chooser-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.coco-chooser-group {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.coco-chooser-group-name {
+  font-size: 11px;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  font-weight: 600;
+  min-width: 64px;
+}
+
+.coco-chooser-group-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+

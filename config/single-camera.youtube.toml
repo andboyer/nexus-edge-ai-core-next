@@ -1,6 +1,16 @@
 # Local-dev config — one RTSP camera fed by the youtube-rtsp-bridge,
 # real ORT detector (yolo26n @ 640), CoreML-eligible on Apple Silicon.
 #
+# Schema note: the TOML wire shape is flat (top-level `url`, `enabled`,
+# `prompts`, `max_fps`, `parking_lot_mode`, …) and is mapped onto the
+# nested Rust groups (`CameraIngest`, `CameraDetector`, `CameraBehavior`)
+# via `#[serde(flatten)]`. Same story for rules: `when` / `severity` /
+# `camera_filter` / `zones` / `min_track_age_ms` / `consecutive_frames` /
+# `cooldown_ms` are flat keys backed by `RulePredicate` / `RuleGates` /
+# `RuleDebounce`. Nothing in this file needs to change when the Rust
+# structs are reorganised, but keep new optional fields visible here so
+# operators copy-pasting from this template see the full surface.
+#
 # Pre-flight:
 #   brew install gstreamer node@22 onnxruntime yt-dlp ffmpeg mediamtx
 #   mediamtx                                                      # terminal A
@@ -67,15 +77,36 @@ backend = "iou_naive"
 [rules]
 backend = "cel"
 
+# Flat wire shape (predicate + gates + debounce all live at the top
+# level via `#[serde(flatten)]`). `camera_filter` and `zones` are
+# both optional — when present the rule only fires for objects
+# inside the listed camera(s) AND inside at least one of the listed
+# zone ids on that camera.
 [[rules.inline]]
 id = "any_person"
 name = "Any person"
 when = "object.label == 'person'"
 severity = "low"
+# camera_filter = [1]
+# zones = ["studio_window"]
 min_track_age_ms = 0
 consecutive_frames = 1
 cooldown_ms = 5000
 enabled = true
+
+# Second rule scoped to the studio window zone — fires only when a
+# tracked person sits inside that zone for ≥3 seconds. Demonstrates
+# the per-rule zone gate added in M-Admin Phase 4.
+[[rules.inline]]
+id = "person_in_studio_window"
+name = "Person in studio window"
+when = "object.label == 'person' && object.attributes['motion.dwell_seconds'] >= 3"
+severity = "medium"
+zones = ["studio_window"]
+min_track_age_ms = 500
+consecutive_frames = 2
+cooldown_ms = 15000
+enabled = false
 
 [bus]
 backend = "broadcast"
@@ -92,3 +123,29 @@ prompts = ["person"]
 # slower hardware. The viewer polls metadata at 10 Hz, so anything ≥10
 # is indistinguishable to a human.
 max_fps = 15
+# CameraBehavior knob — opt-in to the static-object filter from
+# `tracker.static_object.*`. Off for the Lofi Girl stream (no
+# vehicles to promote). Set true on parking-lot / driveway cameras.
+parking_lot_mode = false
+
+# Polygon zones in normalized (0..1) coordinates. The Lofi Girl
+# composition keeps the studio window roughly in the right third of
+# the frame; this zone is also the target of the second rule above.
+# `kind = "inclusion"` participates in `motion.zone_state` and the
+# per-rule `zones` gate; `"exclusion"` would drop detections inside
+# the polygon at the engine, before rules ever see them.
+[[cameras.zones]]
+id = "studio_window"
+name = "Studio window"
+polygon = [[0.60, 0.20], [0.95, 0.20], [0.95, 0.85], [0.60, 0.85]]
+kind = "inclusion"
+
+# Optional per-camera detector override. Drops the threshold for
+# this camera only — handy if the stream is dim and the global
+# 0.30 misses too many people. Commented out so the camera follows
+# the workspace [inference.model] defaults.
+# [cameras.model_override]
+# kind = "yolo"
+# pack_path = "models"
+# preset = "640"
+# score_threshold = 0.20

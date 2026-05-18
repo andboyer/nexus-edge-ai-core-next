@@ -188,6 +188,34 @@ export function openZonesEditor(
           ctx.stroke();
         });
       }
+
+      // Zone-name label at the polygon centroid. Skipped while
+      // drafting (the polygon is open + likely degenerate) and
+      // when the name is empty.
+      if (
+        !(isSelected && state.drafting) &&
+        z.polygon.length >= 3 &&
+        z.name.trim() !== ""
+      ) {
+        let cx = 0;
+        let cy = 0;
+        for (const [nx, ny] of z.polygon) {
+          cx += nx * w;
+          cy += ny * hPx;
+        }
+        cx /= z.polygon.length;
+        cy /= z.polygon.length;
+        ctx.font =
+          "600 13px system-ui, -apple-system, Segoe UI, Roboto, sans-serif";
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        // Dark halo so the label stays readable on bright frames.
+        ctx.lineWidth = 4;
+        ctx.strokeStyle = "rgba(0, 0, 0, 0.75)";
+        ctx.strokeText(z.name, cx, cy);
+        ctx.fillStyle = "#ffffff";
+        ctx.fillText(z.name, cx, cy);
+      }
     });
   }
 
@@ -374,7 +402,7 @@ export function openZonesEditor(
       "button",
       {
         type: "button",
-        class: "btn btn-primary btn-sm btn-with-icon",
+        class: "primary btn-with-icon",
         on: { click: () => addZone() },
       },
       icon("plus"),
@@ -445,7 +473,7 @@ export function openZonesEditor(
             "button",
             {
               type: "button",
-              class: "btn btn-sm",
+              class: "ghost",
               disabled: z.polygon.length < 3,
               on: { click: () => closePolygon() },
             },
@@ -464,7 +492,6 @@ export function openZonesEditor(
       actions.append(
         iconButton("trash", {
           title: `Delete ${z.name || "zone"}`,
-          danger: true,
           onClick: () => deleteZone(i),
         }),
       );
