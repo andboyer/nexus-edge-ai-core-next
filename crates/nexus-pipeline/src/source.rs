@@ -188,15 +188,22 @@ impl RtspSource {
         use gstreamer as gst;
         use gstreamer::prelude::*;
         use gstreamer_app::{AppSink, AppSinkCallbacks};
-        use gstreamer_video::VideoInfo;
+        use gstreamer_video::prelude::*;
+        use gstreamer_video::{VideoFormat, VideoFrameRef, VideoInfo};
+        use std::sync::atomic::{AtomicBool, Ordering};
 
         // The URL is operator-supplied via config; we drop embedded `"` to
         // keep `parse::launch` parsing safe but otherwise pass through (RFC
         // 3986 forbids unescaped quotes anyway).
         let url_safe = self.url.replace('"', "");
         let fr = if self.max_fps == 0 { 15 } else { self.max_fps };
+        // protocols=tcp forces TCP-only RTP transport. UDP would be
+        // marginally lower latency but loses packets silently under
+        // any link contention — see preroll_ingester.rs for the same
+        // reasoning. latency=500 matches the recorder so both feeds
+        // recover from the same hiccups at the same time.
         let desc = format!(
-            "rtspsrc location=\"{url_safe}\" latency=200 protocols=tcp+udp \
+            "rtspsrc location=\"{url_safe}\" latency=500 protocols=tcp \
              ! decodebin force-sw-decoders=true \
              ! videoconvert ! videoscale ! videorate \
              ! video/x-raw,format=RGB,width=960,height=540,framerate={fr}/1 \
@@ -218,6 +225,8 @@ impl RtspSource {
         let counter = Arc::new(parking_lot::Mutex::new(0u64));
         let tx_cb = tx.clone();
         let counter_cb = counter.clone();
+        let logged_first = Arc::new(AtomicBool::new(false));
+        let logged_first_cb = logged_first.clone();
 
         sink.set_callbacks(
             AppSinkCallbacks::builder()
@@ -226,38 +235,75 @@ impl RtspSource {
                     let buffer = sample.buffer().ok_or(gst::FlowError::Error)?;
                     let caps = sample.caps().ok_or(gst::FlowError::Error)?;
                     let info = VideoInfo::from_caps(caps).map_err(|_| gst::FlowError::Error)?;
-                    let map = buffer.map_readable().map_err(|_| gst::FlowError::Error)?;
 
-                    // GStreamer pads each row to a SIMD-aligned stride
-                    // (typically 16- or 64-byte boundaries). Downstream
-                    // consumers — image::JpegEncoder for the snapshot
-                    // endpoint, ndarray for the YOLO detector — all
-                    // expect a tightly packed `width * height * 3` buffer.
-                    // Copy row-by-row using `info.stride()[0]` so we
-                    // never ship a misaligned frame. Symptom of the bug
-                    // when this was missing: greyscale-looking output
-                    // (RGB triplets smear across rows) plus a truncated
-                    // bottom edge (data runs out before the last rows).
-                    let map_slice = map.as_slice();
-                    let stride = info.stride()[0] as usize;
+                    // Use VideoFrameRef so we read the *actual* per-buffer
+                    // plane data and stride (which can come from a
+                    // VideoMeta attached to the buffer and differ from
+                    // caps-derived defaults). For RGB this is one plane;
+                    // we copy row-by-row into a tightly packed Vec because
+                    // downstream consumers (image::JpegEncoder for the
+                    // snapshot endpoint, ndarray for the YOLO detector)
+                    // expect width*height*3 with no row padding.
+                    let frame_ref = VideoFrameRef::from_buffer_ref_readable(buffer, &info)
+                        .map_err(|_| gst::FlowError::Error)?;
+
+                    // One-shot diagnostic on the first sample of each
+                    // session so we can see what was actually negotiated
+                    // (vs what we asked for in the caps filter).
+                    if !logged_first_cb.swap(true, Ordering::Relaxed) {
+                        tracing::info!(
+                            camera_id = camera_id,
+                            caps = %caps,
+                            format = ?info.format(),
+                            width = info.width(),
+                            height = info.height(),
+                            stride0 = frame_ref.plane_stride().first().copied().unwrap_or(0),
+                            buffer_size = buffer.size(),
+                            expected_rgb_bytes = info.width() as usize * info.height() as usize * 3,
+                            "rtsp appsink: first sample"
+                        );
+                    }
+
+                    // Bail out loudly if the caps negotiation gave us
+                    // anything other than RGB — we want a hard failure
+                    // (and a backoff retry) instead of silently shipping
+                    // YUV bytes mislabeled as RGB to the JPEG encoder.
+                    if info.format() != VideoFormat::Rgb {
+                        tracing::error!(
+                            camera_id = camera_id,
+                            format = ?info.format(),
+                            "rtsp appsink received non-RGB sample; \
+                             check capsfilter and videoconvert in the pipeline"
+                        );
+                        return Err(gst::FlowError::NotNegotiated);
+                    }
+
+                    let plane = frame_ref.plane_data(0).map_err(|_| gst::FlowError::Error)?;
+                    let stride = frame_ref.plane_stride().first().copied().unwrap_or(0) as usize;
                     let width = info.width() as usize;
                     let height = info.height() as usize;
                     let row_bytes = width * 3;
+
+                    if stride < row_bytes || plane.len() < stride * height {
+                        tracing::error!(
+                            camera_id = camera_id,
+                            stride,
+                            row_bytes,
+                            plane_len = plane.len(),
+                            height,
+                            "rtsp appsink buffer geometry inconsistent with caps"
+                        );
+                        return Err(gst::FlowError::Error);
+                    }
+
                     let mut data = Vec::with_capacity(row_bytes * height);
                     if stride == row_bytes {
                         // Hot path: no padding, single bulk copy.
-                        let end = row_bytes * height;
-                        if map_slice.len() < end {
-                            return Err(gst::FlowError::Error);
-                        }
-                        data.extend_from_slice(&map_slice[..end]);
+                        data.extend_from_slice(&plane[..row_bytes * height]);
                     } else {
-                        if map_slice.len() < stride * height {
-                            return Err(gst::FlowError::Error);
-                        }
                         for y in 0..height {
                             let start = y * stride;
-                            data.extend_from_slice(&map_slice[start..start + row_bytes]);
+                            data.extend_from_slice(&plane[start..start + row_bytes]);
                         }
                     }
 
@@ -291,17 +337,34 @@ impl RtspSource {
         let bus = pipeline
             .bus()
             .ok_or_else(|| FrameSourceError::Backend("pipeline bus missing".into()))?;
+
+        // Cooperative shutdown for the blocking bus thread. `iter_timed(NONE)`
+        // would park the OS thread forever — on Ctrl-C the supervisor aborts
+        // this task, but the spawn_blocking thread keeps the bus + a strong
+        // pipeline ref alive, and the tokio runtime can never finish dropping.
+        // Symptom: engine ignores Ctrl-C and needs SIGKILL. Fix: short
+        // `timed_pop` poll that checks an AtomicBool every 100ms, and a
+        // sibling future that flips the flag the moment the mpsc receiver is
+        // dropped (which happens as soon as the supervisor task is aborted).
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_bus = shutdown.clone();
         let pipeline_for_bus = pipeline.clone();
-        let bus_result = tokio::task::spawn_blocking(move || -> Result<(), String> {
+        let bus_join = tokio::task::spawn_blocking(move || -> Result<(), String> {
             use gst::MessageView;
-            for msg in bus.iter_timed(gst::ClockTime::NONE) {
+            let poll = gst::ClockTime::from_mseconds(100);
+            loop {
+                if shutdown_bus.load(Ordering::Relaxed) {
+                    return Ok(());
+                }
+                let Some(msg) = bus.timed_pop(Some(poll)) else {
+                    continue;
+                };
                 match msg.view() {
                     MessageView::Eos(..) => {
+                        let _ = &pipeline_for_bus;
                         return Ok(());
                     }
                     MessageView::Error(e) => {
-                        // Keep pipeline alive past the iterator drop so the
-                        // outer caller can null it explicitly.
                         let _ = &pipeline_for_bus;
                         return Err(format!(
                             "{}: {}",
@@ -312,12 +375,28 @@ impl RtspSource {
                     _ => {}
                 }
             }
-            Ok(())
-        })
-        .await
-        .map_err(|e| FrameSourceError::Backend(format!("bus join: {e}")))?;
+        });
 
+        // `tx.closed()` resolves the moment the supervisor's Receiver is
+        // dropped (typically within microseconds of `task.abort()`). Racing
+        // it against the bus join means a Ctrl-C tear-down doesn't have to
+        // wait for an RTSP timeout or an EOS that may never come.
+        let bus_result = tokio::select! {
+            r = bus_join => {
+                r.map_err(|e| FrameSourceError::Backend(format!("bus join: {e}")))?
+                    .map_err(FrameSourceError::Backend)
+            }
+            _ = tx.closed() => {
+                shutdown.store(true, Ordering::Relaxed);
+                Err(FrameSourceError::Closed)
+            }
+        };
+
+        // Null the pipeline regardless of which branch won. This unblocks
+        // any in-flight bus dispatch on the (now-detached) blocking thread,
+        // which will then observe `shutdown=true` on its next poll and exit
+        // within ≤100 ms — no thread leak, no Drop hang.
         let _ = pipeline.set_state(gst::State::Null);
-        bus_result.map_err(FrameSourceError::Backend)
+        bus_result
     }
 }

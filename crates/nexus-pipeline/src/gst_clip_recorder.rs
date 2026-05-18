@@ -211,9 +211,14 @@ impl GstClipRecorder {
     /// with [`Self::build_pipeline`].
     fn pipeline_desc(location: &Path) -> String {
         let location_safe = location.to_string_lossy().replace('"', "");
+        // appsrc max-bytes=64 MiB ≈ 128 s headroom at 4 Mbps. The bigger
+        // the queue, the longer push_buffer can stay non-blocking under
+        // disk stalls, which keeps the upstream broadcast channel from
+        // filling up and dropping samples (the most common cause of
+        // visibly choppy clips).
         format!(
             "appsrc name=src is-live=false format=time do-timestamp=false \
-                     stream-type=stream max-bytes=16777216 block=true \
+                     stream-type=stream max-bytes=67108864 block=true \
              ! h264parse config-interval=-1 \
              ! video/x-h264,stream-format=avc,alignment=au \
              ! mp4mux fragment-duration=5000 streamable=true faststart=true \
@@ -241,10 +246,13 @@ impl GstClipRecorder {
         //                     the pusher rather than returning Eos.
         //                     Our pump is async on tokio so blocking
         //                     just yields to the runtime.
-        //   max-bytes=16M   : ~32s of headroom at 4 Mbps; the live
+        //   max-bytes=64M   : ~128s of headroom at 4 Mbps; the live
         //                     pump shouldn't ever hit this in normal
         //                     operation but it bounds memory if
-        //                     filesink is slow (full disk).
+        //                     filesink is slow (full disk). Sized
+        //                     deliberately large because any push
+        //                     stall propagates back to the broadcast
+        //                     channel and starts dropping frames.
         let desc = Self::pipeline_desc(location);
         let pipeline = gst::parse::launch(&desc)
             .map_err(|e| RecorderError::Io(std::io::Error::other(format!("parse::launch: {e}"))))?

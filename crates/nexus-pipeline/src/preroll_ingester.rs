@@ -59,9 +59,14 @@ use crate::preroll::{NalRingBuffer, NalSample};
 use crate::source::gst_init;
 
 /// How many in-flight live samples the broadcast channel buffers
-/// per subscriber. At ~30fps a recording at most 1-2 seconds behind
-/// before we should be panicking anyway.
-const BROADCAST_CAPACITY: usize = 64;
+/// per subscriber. Tokio's broadcast drops the OLDEST sample when
+/// full (no backpressure on the sender), so any slow consumer past
+/// this capacity sees `RecvError::Lagged(n)` and the matching frames
+/// never reach the recorder — clip plays back choppy with chunks
+/// missing. 512 buffers ≈ 17s at 30fps; an average H.264 frame at
+/// 720p is ~10–50 KB, so worst-case ~25 MB per camera. Cheaper than
+/// losing frames in the recording.
+const BROADCAST_CAPACITY: usize = 512;
 
 /// Max backoff between reconnect attempts.
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
@@ -238,8 +243,15 @@ async fn run_session(
     shutdown: Arc<AtomicBool>,
 ) -> Result<(), IngesterError> {
     let url_safe = url.replace('"', "");
+    // protocols=tcp (NOT tcp+udp) so rtspsrc never falls back to UDP.
+    // UDP packet loss on a contended link (WiFi / busy switch / bursty
+    // CPU on the receiver) shows up as 2–4 s gaps in the recorded clip
+    // where the camera OSD clock visibly jumps. TCP gives guaranteed
+    // in-order delivery; the camera buffers send-side rather than
+    // silently dropping. Latency bumped to 500 ms to absorb the
+    // resulting in-band re-tx jitter.
     let desc = format!(
-        "rtspsrc location=\"{url_safe}\" latency=200 protocols=tcp+udp \
+        "rtspsrc location=\"{url_safe}\" latency=500 protocols=tcp \
          ! rtph264depay \
          ! h264parse config-interval=-1 \
          ! video/x-h264,stream-format=byte-stream,alignment=au \
