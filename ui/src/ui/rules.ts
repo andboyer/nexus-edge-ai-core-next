@@ -8,6 +8,7 @@ import { api } from "../api/client.js";
 import { clear, h } from "../lib/el.js";
 import { openDialog, dialogFooter, type DialogHandle } from "../lib/dialog.js";
 import { toast } from "../lib/toast.js";
+import { icon, iconButton } from "../lib/icons.js";
 import { openRuleForm } from "./rules-form.js";
 import type { CameraConfig, RuleConfig } from "../api/types.js";
 
@@ -37,7 +38,7 @@ function buildToolbar(onChange: () => Promise<void>): HTMLElement[] {
   const newBtn = h(
     "button",
     {
-      class: "primary",
+      class: "primary btn-with-icon",
       type: "button",
       on: {
         click: async () => {
@@ -57,7 +58,8 @@ function buildToolbar(onChange: () => Promise<void>): HTMLElement[] {
         },
       },
     },
-    "+ New rule",
+    icon("plus"),
+    "New rule",
   );
   return [newBtn];
 }
@@ -169,37 +171,24 @@ function row(
     h("td", null, enabledPill),
     h(
       "td",
-      null,
-      h(
-        "button",
-        {
-          class: "ghost",
-          type: "button",
-          on: {
-            click: async () => {
-              const ok = await openRuleForm({
-                mode: "edit",
-                existing: r,
-                existingIds: list.map((x) => x.id),
-                cameras,
-              });
-              if (ok) await onChange();
-            },
-          },
+      { class: "actions" },
+      iconButton("gear", {
+        title: `Edit rule ${r.name}`,
+        onClick: async () => {
+          const ok = await openRuleForm({
+            mode: "edit",
+            existing: r,
+            existingIds: list.map((x) => x.id),
+            cameras,
+          });
+          if (ok) await onChange();
         },
-        "Edit",
-      ),
-      h(
-        "button",
-        {
-          class: "ghost danger",
-          type: "button",
-          on: {
-            click: () => void confirmDelete(r, onChange),
-          },
-        },
-        "Delete",
-      ),
+      }),
+      iconButton("trash", {
+        title: `Delete rule ${r.name}`,
+        danger: true,
+        onClick: () => void confirmDelete(r, onChange),
+      }),
     ),
   );
 }

@@ -40,6 +40,7 @@ import { api } from "../api/client.js";
 import { clear, h } from "../lib/el.js";
 import { openDialog, dialogFooter, type DialogHandle } from "../lib/dialog.js";
 import { toast } from "../lib/toast.js";
+import { iconButton } from "../lib/icons.js";
 import type {
   ColdHealthOut,
   ColdStatus,
@@ -461,18 +462,12 @@ function renderBackendsSection(
           },
           isActive ? "Active" : "Make active",
         ),
-        h(
-          "button",
-          {
-            class: "ghost danger",
-            on: {
-              click: () => void deleteBackend(b.handle, reload),
-            },
-            title:
-              "DELETE /v1/admin/storage/backends/:handle. Fails if any motion_clips row references this backend.",
-          },
-          "Delete",
-        ),
+        iconButton("trash", {
+          title:
+            "DELETE /v1/admin/storage/backends/:handle. Fails if any motion_clips row references this backend.",
+          danger: true,
+          onClick: () => void deleteBackend(b.handle, reload),
+        }),
       );
     } else {
       actions.append(h("span", { class: "muted" }, "—"));
