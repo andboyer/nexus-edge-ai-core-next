@@ -10,6 +10,10 @@
 //! * `motion.parked_vehicle`— `yes | no` (only on `vehicle.*` labels)
 //! * `motion.dwell_seconds` — integer seconds since the track was first seen
 //! * `motion.zone_state`    — `outside | entering | inside | exiting`
+//! * `motion.zone_ids`      — `Vec<String>` of inclusion/dwell zone IDs
+//!   the object is currently inside (post-transition). Lets rules
+//!   target a specific zone, e.g.
+//!   `'parking' in object.attributes['motion.zone_ids']`.
 //! * `group.size`           — count of *other* same-label tracks within
 //!   `group_radius_box_multiplier × bbox half-perimeter`
 //!
@@ -181,14 +185,24 @@ impl TrackAnnotator {
             o.attributes
                 .insert("motion.dwell_seconds".into(), json!(dwell_ms / 1000));
 
-            // ---- zone_state ----
+            // ---- zone_state + zone_ids ----
             // Per-zone FSM: outside -> entering -> inside -> exiting -> outside.
             // Aggregate via priority: entering > exiting > inside > outside,
             // so a single rule that matches "entering" still fires on the
             // first frame the track crosses *any* zone boundary, even if
             // the track is already "inside" a different zone.
+            //
+            // `motion.zone_ids` is the list of inclusion/dwell zone IDs the
+            // object is currently INSIDE (post-transition). Lets rules
+            // target a specific zone by id:
+            //   `'parking' in object.attributes['motion.zone_ids']`
+            // Excluded zones never appear (they're filtered upstream by
+            // `filter_excluded_zones`; even if they reached here, an
+            // exclusion zone the object is "inside" would have already
+            // dropped the detection — they're not meaningful as labels).
             let mut aggregate_state = "outside";
             let mut state_priority: u8 = 1;
+            let mut inside_zone_ids: Vec<String> = Vec::new();
             for zone in zones.iter().filter(|z| z.kind != ZoneKind::Exclusion) {
                 let inside_now = point_in_normalized_polygon(
                     center.0 / frame_w.max(1.0),
@@ -197,6 +211,10 @@ impl TrackAnnotator {
                 );
                 let inside_prev = state.inside_by_zone.get(&zone.id).copied().unwrap_or(false);
                 state.inside_by_zone.insert(zone.id.clone(), inside_now);
+
+                if inside_now {
+                    inside_zone_ids.push(zone.id.clone());
+                }
 
                 let (zone_state, prio) = match (inside_now, inside_prev) {
                     (true, false) => ("entering", 4u8),
@@ -211,6 +229,8 @@ impl TrackAnnotator {
             }
             o.attributes
                 .insert("motion.zone_state".into(), json!(aggregate_state));
+            o.attributes
+                .insert("motion.zone_ids".into(), json!(inside_zone_ids));
 
             // ---- group.size ----
             // Same-label tracks whose centers fall within
@@ -487,6 +507,56 @@ mod tests {
         // Despite being inside the exclusion polygon, zone_state stays
         // outside — exclusion zones are a gate concern, not an annotator one.
         assert_eq!(o[0].attributes["motion.zone_state"], "outside");
+    }
+
+    #[test]
+    fn zone_ids_lists_inclusion_zones_currently_inside() {
+        let mut a = TrackAnnotator::new(AnnotatorConfig::default());
+        // Two overlapping inclusion zones + one exclusion zone that
+        // covers the whole frame. The exclusion zone must NEVER show
+        // up in motion.zone_ids regardless of object position.
+        let zones = vec![
+            ZoneConfig {
+                id: "parking".into(),
+                name: "parking".into(),
+                polygon: vec![(0.0, 0.0), (0.5, 0.0), (0.5, 1.0), (0.0, 1.0)],
+                kind: ZoneKind::Inclusion,
+            },
+            ZoneConfig {
+                id: "loading_dock".into(),
+                name: "loading_dock".into(),
+                polygon: vec![(0.2, 0.2), (0.6, 0.2), (0.6, 0.6), (0.2, 0.6)],
+                kind: ZoneKind::Inclusion,
+            },
+            ZoneConfig {
+                id: "should_never_appear".into(),
+                name: "x".into(),
+                polygon: vec![(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)],
+                kind: ZoneKind::Exclusion,
+            },
+        ];
+
+        // Center at (0.15, 0.15) — inside `parking` only.
+        let mut o = vec![obj(1, "person", 1920.0 * 0.15, 1080.0 * 0.15)];
+        a.annotate(&frame_at(0, 1920, 1080), &zones, &mut o);
+        let ids = o[0].attributes["motion.zone_ids"].as_array().unwrap();
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ids[0], "parking");
+
+        // Center at (0.4, 0.4) — inside BOTH parking and loading_dock.
+        let mut o = vec![obj(1, "person", 1920.0 * 0.4, 1080.0 * 0.4)];
+        a.annotate(&frame_at(1, 1920, 1080), &zones, &mut o);
+        let ids = o[0].attributes["motion.zone_ids"].as_array().unwrap();
+        let id_strs: Vec<&str> = ids.iter().map(|v| v.as_str().unwrap()).collect();
+        assert!(id_strs.contains(&"parking"));
+        assert!(id_strs.contains(&"loading_dock"));
+        assert!(!id_strs.contains(&"should_never_appear"));
+
+        // Center at (0.9, 0.9) — outside both inclusion zones.
+        let mut o = vec![obj(1, "person", 1920.0 * 0.9, 1080.0 * 0.9)];
+        a.annotate(&frame_at(2, 1920, 1080), &zones, &mut o);
+        let ids = o[0].attributes["motion.zone_ids"].as_array().unwrap();
+        assert!(ids.is_empty());
     }
 
     #[test]

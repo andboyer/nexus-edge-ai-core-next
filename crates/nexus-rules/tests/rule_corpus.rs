@@ -119,6 +119,19 @@ const RULE_CORPUS: &[RuleSpec] = &[
         severity: "low",
     },
     RuleSpec {
+        // Zone-targeted rule — requires the annotator's
+        // `motion.zone_ids` attribute (list of inclusion/dwell zone
+        // IDs the object is currently inside). Lets a single rule
+        // discriminate between zones on the same camera without
+        // needing one rule per zone.
+        id: "parking_zone_breach",
+        name: "Person entering the parking zone",
+        when: "object.label == 'person' && \
+               'parking' in object.attributes['motion.zone_ids'] && \
+               object.attributes['motion.zone_state'] == 'entering'",
+        severity: "critical",
+    },
+    RuleSpec {
         id: "crowd_forming",
         name: "3+ people grouped together",
         when: "object.label == 'person' && \
@@ -526,6 +539,55 @@ fn fixtures() -> Vec<Fixture> {
             object: || {
                 ObjectBuilder::new("person")
                     .attr("motion.zone_state", json!("entering"))
+                    .build()
+            },
+        },
+        // --- parking_zone_breach (zone-id targeted) ------------------------
+        Fixture {
+            name: "parking_zone_breach: entering parking matches",
+            rule_id: "parking_zone_breach",
+            camera_id: 1,
+            expected: true,
+            object: || {
+                ObjectBuilder::new("person")
+                    .attr("motion.zone_state", json!("entering"))
+                    .attr("motion.zone_ids", json!(["parking"]))
+                    .build()
+            },
+        },
+        Fixture {
+            name: "parking_zone_breach: entering loading_dock does NOT match (wrong zone)",
+            rule_id: "parking_zone_breach",
+            camera_id: 1,
+            expected: false,
+            object: || {
+                ObjectBuilder::new("person")
+                    .attr("motion.zone_state", json!("entering"))
+                    .attr("motion.zone_ids", json!(["loading_dock"]))
+                    .build()
+            },
+        },
+        Fixture {
+            name: "parking_zone_breach: inside parking does NOT match (wrong state)",
+            rule_id: "parking_zone_breach",
+            camera_id: 1,
+            expected: false,
+            object: || {
+                ObjectBuilder::new("person")
+                    .attr("motion.zone_state", json!("inside"))
+                    .attr("motion.zone_ids", json!(["parking"]))
+                    .build()
+            },
+        },
+        Fixture {
+            name: "parking_zone_breach: entering both zones matches (parking is in the list)",
+            rule_id: "parking_zone_breach",
+            camera_id: 1,
+            expected: true,
+            object: || {
+                ObjectBuilder::new("person")
+                    .attr("motion.zone_state", json!("entering"))
+                    .attr("motion.zone_ids", json!(["parking", "loading_dock"]))
                     .build()
             },
         },
