@@ -2638,3 +2638,151 @@ button.chip {
   color: var(--text);
   border-color: var(--text-dim);
 }
+
+/* ---------------------------------------------------------------- */
+/* M6 Phase 2 Step 2.9c — /admin/users page                          */
+/* ---------------------------------------------------------------- */
+
+.users-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.users-header h2 {
+  margin: 0;
+}
+
+.users-header .spacer {
+  flex: 1;
+}
+
+.users-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-dim);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.users-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.users-table th,
+.users-table td {
+  text-align: left;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--line);
+  vertical-align: middle;
+}
+
+.users-table th {
+  color: var(--text-dim);
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  font-weight: 500;
+}
+
+.users-table th.right,
+.users-table td.right {
+  text-align: right;
+}
+
+.users-table tr.row-deleted {
+  opacity: 0.55;
+}
+
+.users-table td.badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  align-items: center;
+}
+
+.users-actions {
+  display: inline-flex;
+  gap: 6px;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+}
+
+.users-actions .role-select {
+  padding: 4px 6px;
+  font-size: 12px;
+}
+
+/* Status chips ----------------------------------------------- */
+.badge {
+  display: inline-block;
+  padding: 2px 6px;
+  border-radius: 3px;
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  border: 1px solid var(--line);
+  background: var(--bg-elev-2);
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+.badge-ok {
+  color: var(--ok);
+  border-color: var(--ok);
+}
+
+.badge-warn {
+  color: var(--warn);
+  border-color: var(--warn);
+}
+
+.badge-crit {
+  color: var(--crit);
+  border-color: var(--crit);
+}
+
+.badge-info {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.badge-muted {
+  color: var(--text-dim);
+  border-color: var(--line);
+}
+
+/* Dialog footer (admin-users + change-password) --------------- */
+.dialog-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+}
+
+/* OTP reveal row --------------------------------------------- */
+.otp-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin: 12px 0;
+}
+
+.otp-field {
+  flex: 1;
+  font-family: var(--mono, ui-monospace, "SF Mono", Menlo, monospace);
+  font-size: 13px;
+  padding: 8px 10px;
+  background: var(--bg-elev-2);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  color: var(--text);
+  letter-spacing: 0.03em;
+}

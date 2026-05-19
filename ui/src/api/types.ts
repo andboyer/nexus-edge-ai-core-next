@@ -826,3 +826,62 @@ export interface TokenResponse {
   user: SessionUser;
 }
 
+// ---------------------------------------------------------------------------
+// M6 Phase 2 Step 2.9c — admin user-CRUD wire types. Mirror of
+// `crates/nexus-engine/src/auth/users_admin.rs`.
+// ---------------------------------------------------------------------------
+
+/// Public projection of the `users` row — same shape the engine
+/// returns from `GET /api/v1/admin/users` and the per-user
+/// endpoints. Excludes the argon2 hash, which is never on the
+/// wire.
+export interface UserView {
+  id: number;
+  username: string;
+  role: Role;
+  force_password_reset: boolean;
+  disabled: boolean;
+  failed_login_count: number;
+  locked_until: string | null;
+  last_login_at: string | null;
+  last_failed_login_at: string | null;
+  created_at: string;
+  updated_at: string;
+  deleted_at: string | null;
+  has_oidc: boolean;
+  has_password: boolean;
+}
+
+export interface UserListResponse {
+  users: UserView[];
+}
+
+export interface CreateUserRequest {
+  username: string;
+  role: Role;
+  /// Optional — when omitted, the server generates a 192-bit
+  /// URL-safe-base64 OTP and returns it in `one_time_password`.
+  password?: string;
+}
+
+export interface CreateUserResponse {
+  user: UserView;
+  /// Plaintext one-time password — present iff the caller did
+  /// NOT supply a password (i.e. the server generated one).
+  one_time_password: string | null;
+}
+
+export interface UpdateUserRequest {
+  /// `null` / omitted leaves the role as-is.
+  role?: Role;
+  /// `null` / omitted leaves disabled-state as-is.
+  disabled?: boolean;
+}
+
+export interface ResetPasswordResponse {
+  /// Plaintext OTP. The server has already set
+  /// `force_password_reset = true` on the row, so the user MUST
+  /// rotate this on next login.
+  one_time_password: string;
+}
+

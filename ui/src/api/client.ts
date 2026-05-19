@@ -9,6 +9,8 @@ import type {
   CameraConfig,
   CameraId,
   ClipId,
+  CreateUserRequest,
+  CreateUserResponse,
   DiscoverySession,
   ClipTracksResponse,
   DeliverySettings,
@@ -27,6 +29,7 @@ import type {
   PutBackendReq,
   PutColdReq,
   PutRuleDeliveryRequest,
+  ResetPasswordResponse,
   RuleConfig,
   RuleDeliveryResponse,
   RuleId,
@@ -39,6 +42,9 @@ import type {
   StorageBackendOut,
   StorageLocalResponse,
   StorageResponse,
+  UpdateUserRequest,
+  UserListResponse,
+  UserView,
   FrameMetadata,
 } from "./types.js";
 
@@ -382,5 +388,62 @@ export const api = {
     /// `windows[].label` (currently `"1h"` + `"24h"`).
     sinksHealth: () =>
       request<SinksHealthResponse>("/v1/admin/sinks/health"),
+  },
+
+  // M6 Phase 2 Step 2.9c — admin user CRUD. Every route below
+  // sits BEHIND `admin_auth_layer` AND the per-handler
+  // `AdminContext` extractor; the SPA can only reach them once
+  // the session principal carries `role = admin`. Surface 4xx
+  // responses to the operator (the error bodies are stable
+  // contracts — see `UsersAdminError::IntoResponse`).
+  adminUsers: {
+    /// Paginated-by-the-store list (no offset/limit on the wire
+    /// today). `includeDeleted` surfaces tombstones — the
+    /// admin/users page hides them behind a toggle.
+    list: (opts: { includeDeleted?: boolean } = {}) => {
+      const qs = opts.includeDeleted ? "?include_deleted=true" : "";
+      return request<UserListResponse>(`/v1/admin/users${qs}`);
+    },
+
+    /// Create a user. When `password` is omitted, the engine
+    /// generates a 192-bit OTP and returns it in
+    /// `one_time_password`; either way the new row is flagged
+    /// `force_password_reset = true`.
+    create: (req: CreateUserRequest) =>
+      request<CreateUserResponse>("/v1/admin/users", {
+        method: "POST",
+        body: JSON.stringify(req),
+      }),
+
+    /// Mutate role / disabled. Either field may be omitted.
+    /// Last-admin protection: demoting or disabling the only
+    /// active admin returns 409 `{"error":"last_admin"}`.
+    update: (id: number, req: UpdateUserRequest) =>
+      request<UserView>(`/v1/admin/users/${id}`, {
+        method: "PUT",
+        body: JSON.stringify(req),
+      }),
+
+    /// Server-generated OTP only — the admin never picks the
+    /// new password directly (avoids social-engineering: the
+    /// new password is shown ONCE in the response and never
+    /// logged). Also revokes EVERY active refresh chain for
+    /// the target user.
+    resetPassword: (id: number) =>
+      request<ResetPasswordResponse>(
+        `/v1/admin/users/${id}/reset-password`,
+        { method: "POST" },
+      ),
+
+    /// Clears lockout counters + `locked_until`.
+    unlock: (id: number) =>
+      request<void>(`/v1/admin/users/${id}/unlock`, { method: "POST" }),
+
+    /// Soft-delete: sets `deleted_at`, `disabled = true`, and
+    /// renames `username → "<id>:deleted-<iso8601>"` so the
+    /// original name can be reused. Revokes every active
+    /// refresh chain. Last-admin protection applies.
+    remove: (id: number) =>
+      request<void>(`/v1/admin/users/${id}`, { method: "DELETE" }),
   },
 };

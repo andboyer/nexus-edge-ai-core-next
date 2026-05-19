@@ -7,6 +7,7 @@ import { renderHealth } from "./ui/health.js";
 import { renderStorage } from "./ui/storage.js";
 import { renderAdminStorage } from "./ui/admin-storage.js";
 import { renderAdminDelivery } from "./ui/admin-delivery.js";
+import { renderAdminUsers } from "./ui/admin-users.js";
 import { renderTimeline } from "./ui/timeline.js";
 import { mountAlertTicker } from "./ui/alert-ticker.js";
 import { api } from "./api/client.js";
@@ -33,6 +34,11 @@ interface SidebarItem {
   id: string;
   label: string;
   render: TabRender;
+  /// When true, the item is hidden from the sidebar unless
+  /// the current session principal has `role = admin`. The
+  /// route remains registered (so a direct hash-link still
+  /// resolves), but the API calls will 403 for non-admins.
+  requireAdmin?: boolean;
 }
 
 interface SidebarSection {
@@ -66,6 +72,7 @@ const SECTIONS: SidebarSection[] = [
       { id: "storage", label: "Storage", render: renderStorage },
       { id: "admin-storage", label: "Storage Admin", render: renderAdminStorage },
       { id: "admin-delivery", label: "Alert Delivery", render: renderAdminDelivery },
+      { id: "admin-users", label: "Users", render: renderAdminUsers, requireAdmin: true },
       { id: "backends", label: "Backends", render: renderBackends },
       { id: "health", label: "Health", render: renderHealth },
     ],
@@ -104,14 +111,19 @@ function activate(
 
 function buildSidebar(sidebar: HTMLElement): void {
   while (sidebar.firstChild) sidebar.removeChild(sidebar.firstChild);
+  const isAdmin = getSession()?.user.role === "admin";
   for (const section of SECTIONS) {
+    const visibleItems = section.items.filter(
+      (item) => !item.requireAdmin || isAdmin,
+    );
+    if (visibleItems.length === 0) continue;
     const sectEl = document.createElement("div");
     sectEl.className = "sidebar-section";
     const head = document.createElement("div");
     head.className = "sidebar-section-label";
     head.textContent = section.label;
     sectEl.appendChild(head);
-    for (const item of section.items) {
+    for (const item of visibleItems) {
       const link = document.createElement("a");
       link.className = "sidebar-link";
       link.href = `#/${item.id}`;
@@ -333,7 +345,14 @@ async function main() {
   // Watch for logout while the shell is up — drop back into
   // the overlay loop. Watch for session re-acquisition (e.g.
   // someone hand-edits localStorage) — mount the shell.
+  // Also rebuild the sidebar on every session change so the
+  // admin-only "Users" link appears/disappears with role
+  // changes (login as admin, demote-self, etc).
   onSessionChange((session) => {
+    if (shellMounted) {
+      const sidebarEl = document.getElementById("sidebar");
+      if (sidebarEl) buildSidebar(sidebarEl);
+    }
     if (!needsSessionLogin) return;
     if (!session) {
       setShellVisible(false);
