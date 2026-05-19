@@ -201,6 +201,15 @@ pub struct RuntimeConfig {
     /// M2.1 motion-clip recording + safety-floor configuration.
     #[serde(default)]
     pub clips: ClipsConfig,
+    /// M6 auth-side runtime knobs (lockout FSM thresholds, audit
+    /// retention). All have safe defaults so existing configs that
+    /// predate M6 boot unchanged.
+    #[serde(default)]
+    pub auth: RuntimeAuthConfig,
+    /// M6 audit-log retention. Daily sweeper deletes rows older
+    /// than `retention_days`. Defaults to 365 days.
+    #[serde(default)]
+    pub audit: RuntimeAuditConfig,
 }
 
 impl Default for RuntimeConfig {
@@ -210,6 +219,8 @@ impl Default for RuntimeConfig {
             blocking_threads: default_blocking_threads(),
             state_dir: default_state_dir(),
             clips: ClipsConfig::default(),
+            auth: RuntimeAuthConfig::default(),
+            audit: RuntimeAuditConfig::default(),
         }
     }
 }
@@ -220,6 +231,101 @@ fn default_blocking_threads() -> usize {
 
 fn default_state_dir() -> PathBuf {
     PathBuf::from("/var/lib/nexus/state")
+}
+
+// ---------------------------------------------------------------------------
+// Runtime auth + audit (M6)
+// ---------------------------------------------------------------------------
+
+/// Runtime-tunable knobs for the M6 local-users lockout FSM.
+/// Operators override these in `nexus.toml` under
+/// `[runtime.auth.lockout]`. All defaults match the M6 design
+/// (5 fails in 15 minutes → 15-minute lockout).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeAuthConfig {
+    #[serde(default)]
+    pub lockout: LockoutConfig,
+}
+
+impl Default for RuntimeAuthConfig {
+    fn default() -> Self {
+        Self {
+            lockout: LockoutConfig::default(),
+        }
+    }
+}
+
+/// Failed-login lockout policy. The FSM lives in
+/// `nexus-engine::auth::lockout`. These knobs let operators tune
+/// the thresholds without recompiling — useful for sites with
+/// monitoring tools that already do brute-force protection
+/// upstream and want a looser per-user lockout.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LockoutConfig {
+    /// Number of consecutive failed-login attempts inside
+    /// `window_secs` that trip the lockout. Default: 5.
+    #[serde(default = "default_lockout_max_attempts")]
+    pub max_attempts: u32,
+    /// Sliding window for the attempt counter (seconds).
+    /// Default: 900 (15 min).
+    #[serde(default = "default_lockout_window_secs")]
+    pub window_secs: u32,
+    /// Lockout duration once the threshold is tripped (seconds).
+    /// Default: 900 (15 min). Admins can clear early via
+    /// `POST /api/v1/admin/users/:id/unlock`.
+    #[serde(default = "default_lockout_secs")]
+    pub lockout_secs: u32,
+}
+
+impl Default for LockoutConfig {
+    fn default() -> Self {
+        Self {
+            max_attempts: default_lockout_max_attempts(),
+            window_secs: default_lockout_window_secs(),
+            lockout_secs: default_lockout_secs(),
+        }
+    }
+}
+
+fn default_lockout_max_attempts() -> u32 {
+    5
+}
+
+fn default_lockout_window_secs() -> u32 {
+    900
+}
+
+fn default_lockout_secs() -> u32 {
+    900
+}
+
+/// M6 audit-log retention. Daily sweeper deletes audit_log rows
+/// older than `retention_days`. Reuses the M2.1 retention sweeper
+/// plumbing.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeAuditConfig {
+    /// How long audit_log rows live before the daily sweeper
+    /// deletes them. Default: 365 days. Set to 0 to disable the
+    /// sweeper entirely (retain forever — used by operators who
+    /// ship audit to an external SIEM and don't want local
+    /// expiry).
+    #[serde(default = "default_audit_retention_days")]
+    pub retention_days: u32,
+}
+
+impl Default for RuntimeAuditConfig {
+    fn default() -> Self {
+        Self {
+            retention_days: default_audit_retention_days(),
+        }
+    }
+}
+
+fn default_audit_retention_days() -> u32 {
+    365
 }
 
 // ---------------------------------------------------------------------------
@@ -518,15 +624,129 @@ pub enum AuthMode {
     /// `Authorization: Bearer <token>` on every request.
     #[default]
     DevToken,
+    /// M6 local-users backend. Per-user argon2id passwords, lockout
+    /// FSM, first-boot bootstrap admin. Rejects [`AuthConfig::oidc`].
+    Local,
+    /// M6 OIDC backend. Auth-code + PKCE against an external IdP
+    /// (Authentik, Keycloak, Azure AD, Okta, Google Workspace).
+    /// Requires [`AuthConfig::oidc`].
     Oidc,
+    /// M6 hybrid — local users AND OIDC at once. The only mode
+    /// that allows both sources. Required for the "break-glass
+    /// local admin during IdP outage" pattern. Requires
+    /// [`AuthConfig::oidc`].
+    Hybrid,
+}
+
+impl AuthMode {
+    /// Does this mode permit local username/password login?
+    /// True for `Local` and `Hybrid`.
+    pub fn allows_local(self) -> bool {
+        matches!(self, AuthMode::Local | AuthMode::Hybrid)
+    }
+
+    /// Does this mode permit OIDC sign-in? True for `Oidc` and
+    /// `Hybrid`.
+    pub fn allows_oidc(self) -> bool {
+        matches!(self, AuthMode::Oidc | AuthMode::Hybrid)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OidcConfig {
+    /// OIDC issuer URL (e.g. `https://auth.example.com/application/o/nexus/`).
+    /// Used as the base for discovery at
+    /// `<issuer>/.well-known/openid-configuration`.
     pub issuer: String,
+    /// Expected `aud` claim. Typically the OIDC client ID issued by
+    /// the IdP for this Nexus deployment.
     pub audience: String,
+    /// Optional explicit JWKS URI; if absent, discovery resolves it
+    /// from the issuer's well-known metadata.
+    #[serde(default)]
     pub jwks_uri: Option<String>,
+    /// OIDC client ID for the auth-code + PKCE flow. Required by
+    /// the M6 OIDC backend; the M5-era validator-only path ignores
+    /// it.
+    #[serde(default)]
+    pub client_id: Option<String>,
+    /// Display name shown on the `/login` page's "Sign in with X"
+    /// button (e.g. `"Authentik"`, `"Microsoft"`). Falls back to
+    /// `"single sign-on"` if absent.
+    #[serde(default)]
+    pub display_name: Option<String>,
+    /// OAuth scopes to request. Defaults to `["openid", "profile",
+    /// "email", "groups"]` — `groups` is what every M6-supported
+    /// IdP uses to carry role information, but the role mapper
+    /// also looks at `roles` and a configurable custom claim.
+    #[serde(default = "default_oidc_scopes")]
+    pub scopes: Vec<String>,
+    /// Claim path lookup order for role mapping. First claim that
+    /// exists wins. Defaults to `["groups", "roles",
+    /// "https://nexus.local/role"]`.
+    #[serde(default = "default_oidc_role_claims")]
+    pub role_claims: Vec<String>,
+    /// Per-role mapping rules. Each entry pairs a Nexus role with
+    /// a list of values that, if found in the resolved role claim,
+    /// promote the user to that role. The highest-privilege match
+    /// wins (admin > operator > viewer).
+    ///
+    /// Example TOML:
+    /// ```toml
+    /// [auth.oidc.role_map]
+    /// admin = ["nexus-admins"]
+    /// operator = ["nexus-operators", "security-team"]
+    /// ```
+    #[serde(default)]
+    pub role_map: OidcRoleMap,
+    /// When true, an OIDC user whose claims don't match any
+    /// `role_map` entry is rejected with 403 instead of receiving
+    /// the default viewer role. Stricter installs (regulated
+    /// industries) typically flip this on.
+    #[serde(default)]
+    pub deny_unmapped: bool,
+}
+
+fn default_oidc_scopes() -> Vec<String> {
+    vec![
+        "openid".to_string(),
+        "profile".to_string(),
+        "email".to_string(),
+        "groups".to_string(),
+    ]
+}
+
+fn default_oidc_role_claims() -> Vec<String> {
+    vec![
+        "groups".to_string(),
+        "roles".to_string(),
+        "https://nexus.local/role".to_string(),
+    ]
+}
+
+/// Per-role allow-lists for OIDC claim values. A user is granted
+/// the highest-privilege role whose list contains any value found
+/// in any of the configured `role_claims`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct OidcRoleMap {
+    #[serde(default)]
+    pub admin: Vec<String>,
+    #[serde(default)]
+    pub operator: Vec<String>,
+    #[serde(default)]
+    pub viewer: Vec<String>,
+}
+
+impl OidcRoleMap {
+    /// Returns true if at least one mapping is configured.
+    /// Required for `Local`/`Hybrid` validation so an OIDC-disabled
+    /// install can ship an empty map without tripping a "you
+    /// forgot to map any group" warning.
+    pub fn is_empty(&self) -> bool {
+        self.admin.is_empty() && self.operator.is_empty() && self.viewer.is_empty()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1453,6 +1673,117 @@ mod tests {
         let (cfg, notice) = Config::load_with_compat(&path).unwrap();
         assert!(!notice.auth_grandfathered);
         assert_eq!(cfg.auth.mode, AuthMode::DevToken);
+    }
+
+    // -----------------------------------------------------------------------
+    // M6 — AuthMode + OidcConfig + RuntimeAuthConfig
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn auth_mode_local_and_hybrid_parse() {
+        for (s, expected) in [
+            ("local", AuthMode::Local),
+            ("oidc", AuthMode::Oidc),
+            ("hybrid", AuthMode::Hybrid),
+        ] {
+            let toml_src = format!("mode = \"{s}\"\n");
+            let parsed: AuthConfig = toml::from_str(&toml_src).unwrap();
+            assert_eq!(parsed.mode, expected, "round-trip for {s:?}");
+        }
+    }
+
+    #[test]
+    fn auth_mode_allows_local_and_oidc_matrix() {
+        // Pinned matrix so future variants don't accidentally flip
+        // a bit and let an `Oidc`-only deployment accept local login.
+        for (mode, local, oidc) in [
+            (AuthMode::None, false, false),
+            (AuthMode::DevToken, false, false),
+            (AuthMode::Local, true, false),
+            (AuthMode::Oidc, false, true),
+            (AuthMode::Hybrid, true, true),
+        ] {
+            assert_eq!(mode.allows_local(), local, "{mode:?}.allows_local");
+            assert_eq!(mode.allows_oidc(), oidc, "{mode:?}.allows_oidc");
+        }
+    }
+
+    #[test]
+    fn oidc_config_defaults_supply_sane_scopes_and_claims() {
+        let src = r#"
+issuer = "https://auth.example.com"
+audience = "nexus"
+"#;
+        let cfg: OidcConfig = toml::from_str(src).unwrap();
+        assert_eq!(cfg.scopes, vec!["openid", "profile", "email", "groups"]);
+        assert_eq!(
+            cfg.role_claims,
+            vec!["groups", "roles", "https://nexus.local/role"]
+        );
+        assert!(cfg.role_map.is_empty());
+        assert!(!cfg.deny_unmapped);
+        assert!(cfg.client_id.is_none());
+        assert!(cfg.display_name.is_none());
+    }
+
+    #[test]
+    fn oidc_role_map_parses_per_role_lists() {
+        let src = r#"
+issuer = "https://auth.example.com"
+audience = "nexus"
+deny_unmapped = true
+
+[role_map]
+admin = ["nexus-admins"]
+operator = ["nexus-operators", "security-team"]
+"#;
+        let cfg: OidcConfig = toml::from_str(src).unwrap();
+        assert!(cfg.deny_unmapped);
+        assert_eq!(cfg.role_map.admin, vec!["nexus-admins"]);
+        assert_eq!(
+            cfg.role_map.operator,
+            vec!["nexus-operators", "security-team"]
+        );
+        assert!(cfg.role_map.viewer.is_empty());
+        assert!(!cfg.role_map.is_empty());
+    }
+
+    #[test]
+    fn runtime_auth_lockout_defaults_match_design() {
+        // The defaults are wire-pinned (5 / 15min / 15min) — these
+        // are the OWASP-ish baseline the M6 design committed to. If
+        // a future PR wants to tune them, change this test in lock-
+        // step with the doc.
+        let r: RuntimeAuthConfig = Default::default();
+        assert_eq!(r.lockout.max_attempts, 5);
+        assert_eq!(r.lockout.window_secs, 900);
+        assert_eq!(r.lockout.lockout_secs, 900);
+    }
+
+    #[test]
+    fn runtime_audit_retention_default_is_one_year() {
+        let r: RuntimeAuditConfig = Default::default();
+        assert_eq!(r.retention_days, 365);
+    }
+
+    #[test]
+    fn runtime_auth_overrides_round_trip_via_toml() {
+        let src = r#"
+state_dir = "/var/lib/nexus/state"
+
+[auth.lockout]
+max_attempts = 10
+window_secs = 300
+lockout_secs = 60
+
+[audit]
+retention_days = 90
+"#;
+        let rc: RuntimeConfig = toml::from_str(src).unwrap();
+        assert_eq!(rc.auth.lockout.max_attempts, 10);
+        assert_eq!(rc.auth.lockout.window_secs, 300);
+        assert_eq!(rc.auth.lockout.lockout_secs, 60);
+        assert_eq!(rc.audit.retention_days, 90);
     }
 
     /// Wire-shape lock for the camera/rule refactor: the public TOML

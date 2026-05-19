@@ -633,6 +633,7 @@ async fn schema_migrations_table_records_apply_order() {
             "0006_alert_sink_outbox".to_string(),
             "0007_delivery_settings".to_string(),
             "0008_rules_delivery_policy".to_string(),
+            "0009_audit_log".to_string(),
         ]
     );
 }

@@ -210,6 +210,102 @@ pub enum Severity {
     Critical,
 }
 
+// ---------------------------------------------------------------------------
+// Identity (M6)
+// ---------------------------------------------------------------------------
+
+/// Three-role authorisation model. Lifted verbatim from M6 design:
+/// `admin` (everything; only role allowed to mutate users, OIDC
+/// config, storage backends, OAuth start/callback), `operator`
+/// (camera/rule/zone/visual-prompt CRUD + replay + delivery
+/// toggles), `viewer` (read-only — live frames, timeline, events,
+/// dashboards).
+///
+/// The variants have a total order via [`Role::level`] so a
+/// `require_role(operator)` extractor accepts both operators and
+/// admins: `role.level() >= required.level()`. The order is
+/// `Viewer < Operator < Admin` — picking integer levels (10, 50,
+/// 100) leaves room for future tiers without renumbering.
+///
+/// Serde representation is `"admin" | "operator" | "viewer"` —
+/// the same string we store in `users.role` and the
+/// `audit_log.actor_label` denormalisation, and the same shape
+/// the UI sees over JSON.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(TS),
+    ts(export, export_to = "../../../ui/src/api/types/")
+)]
+#[serde(rename_all = "lowercase")]
+pub enum Role {
+    /// Full access including user / OIDC / storage / OAuth admin.
+    Admin,
+    /// Camera + rule + zone + visual-prompt CRUD + replay +
+    /// per-rule delivery toggles. Cannot mutate users or
+    /// security-critical config.
+    Operator,
+    /// Read-only — frames, timeline, events, dashboards.
+    Viewer,
+}
+
+impl Role {
+    /// String form used in `users.role`, `audit_log` queries,
+    /// JWT claims, and OIDC role mappings. Matches the serde
+    /// representation by construction.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Role::Admin => "admin",
+            Role::Operator => "operator",
+            Role::Viewer => "viewer",
+        }
+    }
+
+    /// Integer level used by the future `require_role` extractor.
+    /// Higher = more permissions. Gaps are intentional — they
+    /// leave headroom for tiers like `superadmin` (200) or
+    /// `analyst` (30, between viewer and operator) without
+    /// renumbering the existing three.
+    pub fn level(self) -> u32 {
+        match self {
+            Role::Admin => 100,
+            Role::Operator => 50,
+            Role::Viewer => 10,
+        }
+    }
+
+    /// Permission check: does `self` satisfy `required`?
+    /// `admin >= operator >= viewer`.
+    pub fn satisfies(self, required: Role) -> bool {
+        self.level() >= required.level()
+    }
+
+    /// All three variants in increasing order of privilege.
+    /// Used by the future role-enforcement matrix test.
+    pub fn all() -> [Role; 3] {
+        [Role::Viewer, Role::Operator, Role::Admin]
+    }
+}
+
+impl std::fmt::Display for Role {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for Role {
+    type Err = TypesError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "admin" => Ok(Role::Admin),
+            "operator" => Ok(Role::Operator),
+            "viewer" => Ok(Role::Viewer),
+            other => Err(TypesError::InvalidRole(other.to_string())),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[cfg_attr(
     feature = "ts",
@@ -449,6 +545,8 @@ pub enum TypesError {
     FrameBufferLen { expected: usize, got: usize },
     #[error("invalid delivery schedule: {0}")]
     InvalidSchedule(String),
+    #[error("invalid role: {0:?} (expected admin|operator|viewer)")]
+    InvalidRole(String),
 }
 
 #[cfg(test)]
@@ -544,5 +642,73 @@ mod tests {
         let p = RuleDeliveryPolicy::default();
         assert!(p.enabled);
         assert!(p.schedule.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // M6 — Role enum
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn role_string_round_trips_serde() {
+        use std::str::FromStr;
+        for r in Role::all() {
+            // Display + as_str + serde lowercase all agree.
+            let s = r.as_str();
+            assert_eq!(format!("{r}"), s);
+            assert_eq!(serde_json::to_string(&r).unwrap(), format!("\"{s}\""));
+            // round-trip both directions
+            assert_eq!(Role::from_str(s).unwrap(), r);
+            let back: Role = serde_json::from_str(&format!("\"{s}\"")).unwrap();
+            assert_eq!(back, r);
+        }
+    }
+
+    #[test]
+    fn role_from_str_rejects_unknown() {
+        use std::str::FromStr;
+        let err = Role::from_str("superadmin").unwrap_err();
+        assert!(matches!(err, TypesError::InvalidRole(ref s) if s == "superadmin"));
+    }
+
+    #[test]
+    fn role_satisfies_is_total_order() {
+        // admin >= operator >= viewer.
+        assert!(Role::Admin.satisfies(Role::Admin));
+        assert!(Role::Admin.satisfies(Role::Operator));
+        assert!(Role::Admin.satisfies(Role::Viewer));
+        assert!(Role::Operator.satisfies(Role::Operator));
+        assert!(Role::Operator.satisfies(Role::Viewer));
+        assert!(!Role::Operator.satisfies(Role::Admin));
+        assert!(Role::Viewer.satisfies(Role::Viewer));
+        assert!(!Role::Viewer.satisfies(Role::Operator));
+        assert!(!Role::Viewer.satisfies(Role::Admin));
+    }
+
+    #[test]
+    fn role_levels_have_headroom() {
+        // We rely on gaps so a future `analyst` (30) or
+        // `superadmin` (200) doesn't force renumbering.
+        let levels: Vec<u32> = Role::all().iter().map(|r| r.level()).collect();
+        assert_eq!(levels, vec![10, 50, 100]);
+        // Strictly increasing.
+        for w in levels.windows(2) {
+            assert!(w[0] < w[1]);
+        }
+    }
+
+    #[test]
+    fn role_all_in_ascending_order() {
+        let a = Role::all();
+        assert_eq!(a, [Role::Viewer, Role::Operator, Role::Admin]);
+    }
+
+    #[test]
+    fn role_case_sensitive_from_str() {
+        use std::str::FromStr;
+        // Wire format is lowercase by spec; anything else is a
+        // wire-protocol bug we want to surface loudly.
+        assert!(Role::from_str("Admin").is_err());
+        assert!(Role::from_str("ADMIN").is_err());
+        assert!(Role::from_str("").is_err());
     }
 }

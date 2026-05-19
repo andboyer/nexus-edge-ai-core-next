@@ -10,12 +10,14 @@
 
 pub mod motion;
 pub mod outbox;
+pub mod audit;
 pub use motion::{
     ClipClose, ClipColdMark, ClipId, ClipRow, ColdReplicaRow, ColdReplicaStats, DeleteBackendError,
     MotionEventId, MotionEventKind, MotionEventRow, MotionHistogramBucket, NewClip, NewMotionEvent,
     PerCameraClipStats, StorageBackendRow,
 };
 pub use outbox::{OutboxRow, OutboxSinkCounts, OutboxStatus, SuppressionReason};
+pub use audit::{AuditActorKind, AuditEntry, AuditFilter, AuditOutcome, NewAuditEntry};
 
 use std::sync::Arc;
 
@@ -25,7 +27,6 @@ use nexus_config::{CameraConfig, Config, RuleConfig, StoreConfig};
 use nexus_types::{
     AlertEvent, CameraId, DeliverySchedule, DeliverySettings, RuleDeliveryPolicy, RuleId,
 };
-use serde::{Deserialize, Serialize};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 use thiserror::Error;
@@ -69,6 +70,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
     (
         "0008_rules_delivery_policy",
         include_str!("../migrations/0008_rules_delivery_policy.sql"),
+    ),
+    (
+        "0009_audit_log",
+        include_str!("../migrations/0009_audit_log.sql"),
     ),
 ];
 
@@ -897,18 +902,9 @@ fn parse_sqlite_timestamp(s: &str) -> Result<DateTime<Utc>, StoreError> {
 }
 
 // ---------------------------------------------------------------------------
-// AuditEntry — exposed for the API layer.
+// (AuditEntry now lives in audit.rs and is re-exported above; see
+//  audit::AuditEntry, audit::NewAuditEntry, etc.)
 // ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AuditEntry {
-    pub id: i64,
-    pub actor: String,
-    pub action: String,
-    pub resource: String,
-    pub diff: serde_json::Value,
-    pub created_at: DateTime<Utc>,
-}
 
 // Re-export the Arc-friendly handle type.
 pub type StoreHandle = Arc<Store>;

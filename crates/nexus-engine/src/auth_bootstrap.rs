@@ -81,7 +81,7 @@ pub fn apply(cfg: &mut Config, state_dir: &Path, notice: CompatNotice) -> Result
                 );
             }
         }
-        AuthMode::Oidc => {
+        AuthMode::Oidc | AuthMode::Local | AuthMode::Hybrid => {
             // No-op here. The OIDC verifier is built later from
             // cfg.auth.oidc; if that block is missing, the
             // verifier itself surfaces a clear error.
