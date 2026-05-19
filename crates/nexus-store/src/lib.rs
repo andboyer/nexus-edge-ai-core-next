@@ -11,6 +11,7 @@
 pub mod motion;
 pub mod outbox;
 pub mod audit;
+pub mod users;
 pub use motion::{
     ClipClose, ClipColdMark, ClipId, ClipRow, ColdReplicaRow, ColdReplicaStats, DeleteBackendError,
     MotionEventId, MotionEventKind, MotionEventRow, MotionHistogramBucket, NewClip, NewMotionEvent,
@@ -18,6 +19,7 @@ pub use motion::{
 };
 pub use outbox::{OutboxRow, OutboxSinkCounts, OutboxStatus, SuppressionReason};
 pub use audit::{AuditActorKind, AuditEntry, AuditFilter, AuditOutcome, NewAuditEntry};
+pub use users::{NewUser, User, UserId, UsersError};
 
 use std::sync::Arc;
 
@@ -74,6 +76,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
     (
         "0009_audit_log",
         include_str!("../migrations/0009_audit_log.sql"),
+    ),
+    (
+        "0010_local_users",
+        include_str!("../migrations/0010_local_users.sql"),
     ),
 ];
 

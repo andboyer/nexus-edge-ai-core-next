@@ -231,7 +231,7 @@ pub enum Severity {
 /// the same string we store in `users.role` and the
 /// `audit_log.actor_label` denormalisation, and the same shape
 /// the UI sees over JSON.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(
     feature = "ts",
     derive(TS),
@@ -246,6 +246,9 @@ pub enum Role {
     /// security-critical config.
     Operator,
     /// Read-only — frames, timeline, events, dashboards.
+    /// Newly-created users default to viewer (least privilege);
+    /// admin promotes after the fact.
+    #[default]
     Viewer,
 }
 
