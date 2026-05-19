@@ -610,14 +610,23 @@ pub enum AuthMode {
     // M-Install Checkpoint 2 — secure by default. Anything deployed
     // beyond a hand-rolled `mode = "none"` opt-in lands on the
     // dev-token path automatically.
-    /// Default. On first boot the engine generates a 32-byte
-    /// URL-safe random token at `/var/lib/nexus/dev-token` (mode
-    /// 0600) and prints it to the WARN log; clients send it as
-    /// `Authorization: Bearer <token>` on every request.
+    /// Default in dev builds. On first boot the engine generates a
+    /// 32-byte URL-safe random token at `/var/lib/nexus/dev-token`
+    /// (mode 0600) and prints it to the WARN log; clients send it
+    /// as `Authorization: Bearer <token>` on every request.
+    ///
+    /// **NOT compiled in release builds.** When `nexus-config` is
+    /// built with the `prod-auth` feature, this variant is removed
+    /// entirely so a shipped binary cannot accidentally fall back
+    /// to a shared-secret bearer. M6 Phase 4 Step 4.5.
+    #[cfg(not(feature = "prod-auth"))]
     #[default]
     DevToken,
     /// M6 local-users backend. Per-user argon2id passwords, lockout
     /// FSM, first-boot bootstrap admin. Rejects [`AuthConfig::oidc`].
+    ///
+    /// Default in release builds (`prod-auth` feature on).
+    #[cfg_attr(feature = "prod-auth", default)]
     Local,
     /// M6 OIDC backend. Auth-code + PKCE against an external IdP
     /// (Authentik, Keycloak, Azure AD, Okta, Google Workspace).
@@ -1619,12 +1628,33 @@ mod tests {
     // (and any TOML that only writes `[auth]\n`) land on DevToken
     // automatically. Failing this test means a new install without
     // an explicit `mode = "..."` would silently leak a no-auth API.
+    //
+    // M6 Phase 4 Step 4.5 — gated off in release builds where the
+    // `DevToken` variant doesn't exist. The release-build default
+    // is `AuthMode::Local`, covered by
+    // `auth_mode_default_is_local_under_prod_auth` below.
     #[test]
+    #[cfg(not(feature = "prod-auth"))]
     fn auth_mode_default_is_dev_token() {
         let auth: AuthConfig = Default::default();
         assert_eq!(auth.mode, AuthMode::DevToken);
         let parsed: AuthConfig = toml::from_str("").unwrap();
         assert_eq!(parsed.mode, AuthMode::DevToken);
+    }
+
+    /// M6 Phase 4 Step 4.5 — under `prod-auth` the secure-by-default
+    /// `AuthMode` falls through to `Local` (the only other mode that
+    /// gates `/api/v1/*` writes without an external dependency like
+    /// an OIDC IdP). A fresh install therefore prompts an operator
+    /// to run the bootstrap-admin flow rather than handing out a
+    /// shared-secret bearer.
+    #[test]
+    #[cfg(feature = "prod-auth")]
+    fn auth_mode_default_is_local_under_prod_auth() {
+        let auth: AuthConfig = Default::default();
+        assert_eq!(auth.mode, AuthMode::Local);
+        let parsed: AuthConfig = toml::from_str("").unwrap();
+        assert_eq!(parsed.mode, AuthMode::Local);
     }
 
     #[test]
@@ -1658,6 +1688,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "prod-auth"))]
     fn load_with_compat_respects_explicit_auth() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nexus.toml");
@@ -1688,13 +1719,25 @@ mod tests {
     fn auth_mode_allows_local_and_oidc_matrix() {
         // Pinned matrix so future variants don't accidentally flip
         // a bit and let an `Oidc`-only deployment accept local login.
-        for (mode, local, oidc) in [
+        //
+        // M6 Phase 4 Step 4.5 — `DevToken` is omitted under
+        // `prod-auth` since the variant itself is gone.
+        #[cfg(not(feature = "prod-auth"))]
+        let cases: &[(AuthMode, bool, bool)] = &[
             (AuthMode::None, false, false),
             (AuthMode::DevToken, false, false),
             (AuthMode::Local, true, false),
             (AuthMode::Oidc, false, true),
             (AuthMode::Hybrid, true, true),
-        ] {
+        ];
+        #[cfg(feature = "prod-auth")]
+        let cases: &[(AuthMode, bool, bool)] = &[
+            (AuthMode::None, false, false),
+            (AuthMode::Local, true, false),
+            (AuthMode::Oidc, false, true),
+            (AuthMode::Hybrid, true, true),
+        ];
+        for (mode, local, oidc) in cases.iter().copied() {
             assert_eq!(mode.allows_local(), local, "{mode:?}.allows_local");
             assert_eq!(mode.allows_oidc(), oidc, "{mode:?}.allows_oidc");
         }
@@ -1805,6 +1848,27 @@ retention_days = 90
             let path = entry.path();
             if path.extension().and_then(|s| s.to_str()) != Some("toml") {
                 continue;
+            }
+            // M6 Phase 4 Step 4.5 — under `prod-auth` the
+            // `AuthMode::DevToken` variant is compiled out, so
+            // shipped dev configs that pin `mode = "dev_token"`
+            // can't parse. Those configs are still valid for the
+            // default-feature build (dev installs); skip them here
+            // rather than erroring, since prod deployments won't
+            // ship them anyway. We scan line-by-line to avoid
+            // matching the string inside a `#` comment (which
+            // would skip configs that just MENTION dev_token in
+            // a doc-comment).
+            #[cfg(feature = "prod-auth")]
+            {
+                let src = std::fs::read_to_string(&path).unwrap_or_default();
+                let pins_dev_token = src.lines().any(|raw| {
+                    let line = raw.split('#').next().unwrap_or(raw).trim();
+                    line == "mode = \"dev_token\"" || line.starts_with("mode = \"dev_token\"")
+                });
+                if pins_dev_token {
+                    continue;
+                }
             }
             let cfg =
                 Config::load(&path).unwrap_or_else(|e| panic!("load {}: {e}", path.display()));

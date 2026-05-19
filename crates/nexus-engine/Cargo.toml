@@ -31,6 +31,13 @@ ep-directml = ["nexus-inference/ep-directml"]
 # (so the e2e fixture can hit it under `auth.mode = "none"`) and
 # would let any caller inject arbitrary events. Off by default.
 test-injection = []
+# M6 Phase 4 Step 4.5 — secure-by-default release builds. Forwards
+# to `nexus-config/prod-auth` which removes `AuthMode::DevToken`
+# from the enum entirely. The release pipeline (and Docker images
+# that ship to customers) MUST flip this on; dev builds leave it
+# off so the devtoken bootstrap path remains usable on a fresh
+# clone.
+prod-auth = ["nexus-config/prod-auth"]
 
 [[bin]]
 name = "nexus-engine"

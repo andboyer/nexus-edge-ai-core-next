@@ -464,6 +464,7 @@ async fn get_auth_info(State(s): State<ApiState>) -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "mode": match s.auth_mode {
             nexus_config::AuthMode::None => "none",
+            #[cfg(not(feature = "prod-auth"))]
             nexus_config::AuthMode::DevToken => "dev_token",
             nexus_config::AuthMode::Local => "local",
             nexus_config::AuthMode::Oidc => "oidc",
@@ -4670,7 +4671,17 @@ mod tests {
             // that exercise the local-auth code paths override
             // this on the constructed state before building the
             // app.
+            //
+            // M6 Phase 4 Step 4.5 — with `prod-auth` the
+            // `DevToken` variant is compile-gated away; tests
+            // fall back to `None` (which is the only other mode
+            // that doesn't require external state like an OIDC
+            // issuer or seeded local users). The auth-mode-tagged
+            // tests are gated alongside the variant they exercise.
+            #[cfg(not(feature = "prod-auth"))]
             auth_mode: nexus_config::AuthMode::DevToken,
+            #[cfg(feature = "prod-auth")]
+            auth_mode: nexus_config::AuthMode::None,
             // M6 Phase 3 Step 3.3 — no OIDC backend in unit
             // tests; the dedicated oidc_login tests live in
             // their own module against a wiremock IdP.
@@ -5316,6 +5327,12 @@ mod tests {
     /// WITHOUT a bearer (anonymous visitors need to know how to
     /// log in) and returns the mode plus the two derived flags.
     /// `build_test_router` defaults to `DevToken`.
+    ///
+    /// M6 Phase 4 Step 4.5 — gated off when `prod-auth` strips the
+    /// `DevToken` variant; the equivalent assertion under prod-auth
+    /// would just be "the test router falls back to None mode"
+    /// which is covered by the auth_info_under_prod_auth test below.
+    #[cfg(not(feature = "prod-auth"))]
     #[tokio::test]
     async fn auth_info_is_public_and_returns_mode() {
         use axum::body::to_bytes;
@@ -5330,6 +5347,30 @@ mod tests {
         let body = to_bytes(res.into_body(), 4 * 1024).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["mode"], "dev_token");
+        assert_eq!(v["allows_local"], false);
+        assert_eq!(v["allows_oidc"], false);
+    }
+
+    /// M6 Phase 4 Step 4.5 — release-build equivalent. With
+    /// `prod-auth` the `DevToken` variant is gone; `build_test_router`
+    /// constructs the test app under `AuthMode::None`. The probe
+    /// still works and reports the absence of any login surface,
+    /// which is the contract the SPA's `<Login>` page relies on.
+    #[cfg(feature = "prod-auth")]
+    #[tokio::test]
+    async fn auth_info_under_prod_auth_reports_none_mode() {
+        use axum::body::to_bytes;
+        let (app, _store, _dir) = build_test_router(None).await;
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/auth/info")
+            .body(Body::empty())
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = to_bytes(res.into_body(), 4 * 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["mode"], "none");
         assert_eq!(v["allows_local"], false);
         assert_eq!(v["allows_oidc"], false);
     }

@@ -24,12 +24,17 @@
 //!    enforced by the config crate; this module just surfaces it
 //!    to the operator.
 
+#[cfg(not(feature = "prod-auth"))]
 use std::fs;
+#[cfg(not(feature = "prod-auth"))]
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Context, Result};
+#[cfg(not(feature = "prod-auth"))]
+use anyhow::Context;
+use anyhow::{anyhow, Result};
+#[cfg(not(feature = "prod-auth"))]
 use base64::engine::{general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::{Duration, Utc};
 use nexus_config::{AuthMode, CompatNotice, Config};
@@ -37,12 +42,14 @@ use nexus_config::{AuthMode, CompatNotice, Config};
 /// File on disk that holds the auto-generated dev token. Lives
 /// alongside the engine state directory so a wipe of `/var/lib/nexus`
 /// rotates the token along with the rest of the box's identity.
+#[cfg(not(feature = "prod-auth"))]
 const DEV_TOKEN_FILE: &str = "dev-token";
 
 /// Length, in raw bytes, of the generated dev token. URL-safe-no-pad
 /// base64 expands this to 43 characters — long enough for a 256-bit
 /// secret and short enough to copy/paste into a browser tab without
 /// truncation.
+#[cfg(not(feature = "prod-auth"))]
 const DEV_TOKEN_BYTES: usize = 32;
 
 /// Apply Checkpoint-2 auth-posture rules. Mutates `cfg.auth.dev_token`
@@ -55,7 +62,15 @@ const DEV_TOKEN_BYTES: usize = 32;
 ///
 /// Returns `Err` for boot-fatal posture violations (currently only
 /// the non-loopback `mode = none` case).
-pub fn apply(cfg: &mut Config, state_dir: &Path, notice: CompatNotice) -> Result<()> {
+pub fn apply(
+    cfg: &mut Config,
+    // M6 Phase 4 Step 4.5 — `state_dir` is only consulted when the
+    // dev-token branch is reachable (i.e. `prod-auth` is off). The
+    // underscore prefix suppresses the unused-arg warning under the
+    // release feature without changing the public signature.
+    #[cfg_attr(feature = "prod-auth", allow(unused_variables))] state_dir: &Path,
+    notice: CompatNotice,
+) -> Result<()> {
     if notice.auth_grandfathered {
         let deadline = Utc::now() + Duration::days(7);
         eprintln!(
@@ -70,6 +85,7 @@ pub fn apply(cfg: &mut Config, state_dir: &Path, notice: CompatNotice) -> Result
 
     match cfg.auth.mode {
         AuthMode::None => enforce_loopback_only(&cfg.server.api_bind)?,
+        #[cfg(not(feature = "prod-auth"))]
         AuthMode::DevToken => {
             if cfg.auth.dev_token.is_none() {
                 let token = ensure_dev_token(state_dir)?;
@@ -128,6 +144,7 @@ fn enforce_loopback_only(bind: &str) -> Result<()> {
 /// Read `<state_dir>/dev-token` if present; otherwise generate a
 /// fresh 32-byte URL-safe random token, write it with mode 0600,
 /// and log the value at WARN so operators can copy it once.
+#[cfg(not(feature = "prod-auth"))]
 fn ensure_dev_token(state_dir: &Path) -> Result<String> {
     let path = state_dir.join(DEV_TOKEN_FILE);
 
@@ -174,6 +191,7 @@ fn ensure_dev_token(state_dir: &Path) -> Result<String> {
 /// 32 bytes from the OS RNG, encoded as URL-safe-no-pad base64.
 /// `getrandom` is the same crate `rand` ultimately calls; using it
 /// directly keeps nexus-engine's dep graph one fewer crate wide.
+#[cfg(not(feature = "prod-auth"))]
 fn generate_token() -> String {
     let mut buf = [0u8; DEV_TOKEN_BYTES];
     // OsRng.fill_bytes never fails on the platforms the engine
@@ -187,6 +205,7 @@ fn generate_token() -> String {
 /// Write `bytes` to `path` with mode 0600. On non-unix systems
 /// (the engine doesn't ship there, but tests can run on macOS)
 /// the mode bits are skipped — `OpenOptions::mode` is unix-only.
+#[cfg(not(feature = "prod-auth"))]
 fn write_secret(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::fs::OpenOptions;
     let mut opts = OpenOptions::new();
@@ -240,6 +259,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "prod-auth"))]
     fn ensure_dev_token_generates_then_reads_back() {
         let dir = tempfile::tempdir().unwrap();
         let first = ensure_dev_token(dir.path()).unwrap();
@@ -268,6 +288,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "prod-auth"))]
     fn apply_dev_token_branch_populates_field() {
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = Config {

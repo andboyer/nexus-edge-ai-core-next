@@ -212,7 +212,14 @@ mod tests {
     #[tokio::test]
     async fn skips_when_mode_disallows_local() {
         let (store, _g) = fresh_store().await;
-        for mode in [AuthMode::None, AuthMode::DevToken, AuthMode::Oidc] {
+        // M6 Phase 4 Step 4.5 — `DevToken` only exists when the
+        // `prod-auth` feature is off. The set of "modes that don't
+        // allow local users" is therefore feature-dependent.
+        #[cfg(not(feature = "prod-auth"))]
+        let modes: &[AuthMode] = &[AuthMode::None, AuthMode::DevToken, AuthMode::Oidc];
+        #[cfg(feature = "prod-auth")]
+        let modes: &[AuthMode] = &[AuthMode::None, AuthMode::Oidc];
+        for mode in modes.iter().copied() {
             let out = bootstrap_if_needed(&store, mode).await.unwrap();
             assert!(
                 matches!(out, BootstrapOutcome::SkippedModeDisallowsLocal),
