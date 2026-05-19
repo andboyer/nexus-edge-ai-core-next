@@ -151,6 +151,12 @@ pub struct ApiState {
     /// `LoginState::from_ref` bridge. Cheap to clone — three
     /// u32 fields.
     pub lockout: nexus_config::LockoutConfig,
+    /// M6 Phase 2 Step 2.9 — auth-mode snapshot. Surfaced by
+    /// the unauthenticated `GET /api/v1/auth/info` endpoint so
+    /// the UI can decide which login form to render (paste-a-
+    /// dev-token vs. username+password vs. OIDC redirect).
+    /// Snapshot at boot — mode changes require a restart.
+    pub auth_mode: nexus_config::AuthMode,
 }
 
 pub fn router(state: ApiState) -> Router {
@@ -331,6 +337,11 @@ pub fn router(state: ApiState) -> Router {
             "/v1/auth/change-password",
             axum::routing::post(crate::auth::login::post_change_password),
         )
+        // M6 Phase 2 Step 2.9 — public auth-mode probe. The UI
+        // hits this on first paint to decide which login form
+        // to render (paste-a-dev-token vs. username+password
+        // vs. OIDC redirect). Unauthenticated by design.
+        .route("/v1/auth/info", get(get_auth_info))
         // Admin writes (gated) merged in last so they share state.
         .merge(admin);
 
@@ -382,6 +393,39 @@ async fn health() -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "status": "ok",
         "version": env!("CARGO_PKG_VERSION"),
+    }))
+}
+
+/// `GET /api/v1/auth/info` — public auth-mode probe. Returns
+/// the engine's configured authentication backend so the UI
+/// can pick the right login form on first paint without
+/// needing to know which deployment it's pointing at.
+///
+/// Wire shape:
+///
+/// ```json
+/// {
+///   "mode": "none" | "dev_token" | "local" | "oidc" | "hybrid",
+///   "allows_local": bool,
+///   "allows_oidc": bool
+/// }
+/// ```
+///
+/// Deliberately unauthenticated: anonymous visitors need to
+/// know how to authenticate. No other fields are exposed — in
+/// particular nothing about the OIDC issuer (which would leak
+/// internal IdP topology), no lockout policy, no user counts.
+async fn get_auth_info(State(s): State<ApiState>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "mode": match s.auth_mode {
+            nexus_config::AuthMode::None => "none",
+            nexus_config::AuthMode::DevToken => "dev_token",
+            nexus_config::AuthMode::Local => "local",
+            nexus_config::AuthMode::Oidc => "oidc",
+            nexus_config::AuthMode::Hybrid => "hybrid",
+        },
+        "allows_local": s.auth_mode.allows_local(),
+        "allows_oidc": s.auth_mode.allows_oidc(),
     }))
 }
 
@@ -4213,6 +4257,12 @@ mod tests {
             // override via a per-test mutation of `state` before
             // building the app.
             lockout: nexus_config::LockoutConfig::default(),
+            // M6 Phase 2 Step 2.9 — tests live under the
+            // `DevToken` mode by default. The handful of tests
+            // that exercise the local-auth code paths override
+            // this on the constructed state before building the
+            // app.
+            auth_mode: nexus_config::AuthMode::DevToken,
         };
         let app = super::router(state);
         (app, store, dir)
@@ -4845,5 +4895,27 @@ mod tests {
         assert_eq!(windows[0]["label"], "1h");
         assert_eq!(windows[1]["label"], "24h");
         assert_eq!(v["sinks"].as_array().unwrap().len(), 0);
+    }
+
+    /// M6 Phase 2 Step 2.9 — public auth-mode probe is reachable
+    /// WITHOUT a bearer (anonymous visitors need to know how to
+    /// log in) and returns the mode plus the two derived flags.
+    /// `build_test_router` defaults to `DevToken`.
+    #[tokio::test]
+    async fn auth_info_is_public_and_returns_mode() {
+        use axum::body::to_bytes;
+        let (app, _store, _dir) = build_test_router(None).await;
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/auth/info")
+            .body(Body::empty())
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = to_bytes(res.into_body(), 4 * 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["mode"], "dev_token");
+        assert_eq!(v["allows_local"], false);
+        assert_eq!(v["allows_oidc"], false);
     }
 }

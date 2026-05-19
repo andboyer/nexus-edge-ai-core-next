@@ -578,6 +578,10 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
         // requires an engine restart for now (acceptable — these
         // knobs change once a quarter at most).
         lockout: cfg.runtime.auth.lockout.clone(),
+        // M6 Phase 2 Step 2.9 — snapshot the auth mode so
+        // `GET /api/v1/auth/info` can surface it to the UI
+        // without re-reading config on every request.
+        auth_mode: cfg.auth.mode,
     };
 
     // M-Admin Phase 1B — start the registry eviction sweep. Holds
