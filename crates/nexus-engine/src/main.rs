@@ -223,6 +223,58 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
         }
     }
 
+    // M6 Phase 3 Step 3.3 — discover the OIDC IdP when the
+    // configured auth mode allows OIDC AND an `[auth.oidc]`
+    // block exists. Discovery is an async HTTP hop to the
+    // IdP's `/.well-known/openid-configuration`; we tolerate
+    // failure here only by *logging* (boot still proceeds) so
+    // a transient IdP outage doesn't keep cameras offline.
+    // If discovery fails the OIDC routes simply aren't mounted
+    // and the UI falls back to local-only login (assuming
+    // hybrid mode). For pure-OIDC mode this means no one can
+    // log in until the IdP recovers + the engine is bounced.
+    let oidc_login_state = match (cfg.auth.mode.allows_oidc(), cfg.auth.oidc.as_ref()) {
+        (true, Some(oidc_cfg)) => {
+            match auth::oidc::OidcClient::discover(oidc_cfg.clone()).await {
+                Ok(client) => {
+                    let client = std::sync::Arc::new(client);
+                    // Start the 1h background refresh loop so
+                    // JWKS rotations land without a bounce.
+                    let _refresh_handle = std::sync::Arc::clone(&client).spawn_refresh();
+                    tracing::info!(
+                        issuer = %oidc_cfg.issuer,
+                        "OIDC discovery succeeded; auth-code routes will be mounted"
+                    );
+                    Some(auth::oidc_login::OidcLoginState {
+                        store: store.clone(),
+                        admin_auth: std::sync::Arc::new(
+                            admin_auth::AdminAuthState::from_config(&cfg.auth)
+                                .context("building admin-auth state for oidc login")?,
+                        ),
+                        oidc_client: client,
+                        cfg: oidc_cfg.clone(),
+                        sessions: auth::oidc_login::OidcLoginSessions::new(),
+                    })
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        issuer = %oidc_cfg.issuer,
+                        error = %e,
+                        "OIDC discovery failed at boot; auth-code routes will NOT be mounted",
+                    );
+                    None
+                }
+            }
+        }
+        (true, None) => {
+            tracing::warn!(
+                "auth.mode allows OIDC but no [auth.oidc] block is configured; auth-code routes will NOT be mounted",
+            );
+            None
+        }
+        _ => None,
+    };
+
     let rules = store.list_rules().await?;
     let evaluator = Arc::new(RuleEvaluator::new(&cfg.rules, &rules)?);
     info!(
@@ -582,6 +634,11 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
         // `GET /api/v1/auth/info` can surface it to the UI
         // without re-reading config on every request.
         auth_mode: cfg.auth.mode,
+        // M6 Phase 3 Step 3.3 — OIDC login state populated
+        // above. `None` when OIDC isn't enabled or discovery
+        // failed; the router skips the auth-code routes in
+        // that case.
+        oidc_login: oidc_login_state,
     };
 
     // M-Admin Phase 1B — start the registry eviction sweep. Holds

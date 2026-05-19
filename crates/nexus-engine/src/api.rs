@@ -157,6 +157,13 @@ pub struct ApiState {
     /// dev-token vs. username+password vs. OIDC redirect).
     /// Snapshot at boot — mode changes require a restart.
     pub auth_mode: nexus_config::AuthMode,
+    /// M6 Phase 3 Step 3.3 — OIDC login state. `Some` iff
+    /// `cfg.auth.mode` allows OIDC AND `cfg.auth.oidc` is set
+    /// AND `OidcClient::discover` succeeded at boot. The two
+    /// `/v1/auth/oidc/{start,callback}` handlers extract this
+    /// via `FromRef`; the router only mounts those routes when
+    /// this Option is `Some`, so the handlers can `.expect()`.
+    pub oidc_login: Option<crate::auth::oidc_login::OidcLoginState>,
 }
 
 pub fn router(state: ApiState) -> Router {
@@ -344,6 +351,26 @@ pub fn router(state: ApiState) -> Router {
         .route("/v1/auth/info", get(get_auth_info))
         // Admin writes (gated) merged in last so they share state.
         .merge(admin);
+
+    // M6 Phase 3 Step 3.3 — mount the OIDC auth-code routes
+    // ONLY when an `OidcLoginState` is wired in. The handlers
+    // extract that state via `FromRef::expect`, so registering
+    // the routes here when it's `None` would panic on first
+    // hit; gating on the Option keeps `auth.mode = none /
+    // dev_token / local` deployments from accidentally
+    // exposing a 500'ing OIDC endpoint.
+    let api = if state.oidc_login.is_some() {
+        api.route(
+            "/v1/auth/oidc/start",
+            axum::routing::post(crate::auth::oidc_login::post_start),
+        )
+        .route(
+            "/v1/auth/oidc/callback",
+            get(crate::auth::oidc_login::get_callback),
+        )
+    } else {
+        api
+    };
 
     // M7 Step 6F2 — dev-only event-injection endpoint. Lives
     // OUTSIDE the admin gate by design (the e2e fixture runs
@@ -4263,6 +4290,10 @@ mod tests {
             // this on the constructed state before building the
             // app.
             auth_mode: nexus_config::AuthMode::DevToken,
+            // M6 Phase 3 Step 3.3 — no OIDC backend in unit
+            // tests; the dedicated oidc_login tests live in
+            // their own module against a wiremock IdP.
+            oidc_login: None,
         };
         let app = super::router(state);
         (app, store, dir)

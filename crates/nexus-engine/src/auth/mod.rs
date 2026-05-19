@@ -51,6 +51,7 @@ pub mod login;
 // allow disappears the moment Step 3.3 imports `OidcClient`.
 #[allow(dead_code)]
 pub mod oidc;
+pub mod oidc_login;
 // Same parking pattern as `oidc` — `map_role` is exercised by
 // its own unit tests; the Step 3.3 callback handler will be the
 // in-tree consumer. Drop the allow when that handler lands.
