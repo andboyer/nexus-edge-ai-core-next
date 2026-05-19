@@ -9,12 +9,17 @@
 //!   (Phase 2 Step 2.3).
 //! * [`sessions`] — HS256 access JWT + opaque refresh-secret
 //!   primitives (Phase 2 Step 2.4).
+//! * [`require_role`] — axum extractor that pulls the session
+//!   off the request, decodes the JWT, and asserts a minimum
+//!   role. Bridges the legacy `AdminClaims` shape during the
+//!   deprecation window (Phase 2 Step 2.5).
 //!
 //! Future siblings (planned in [`docs/M6_IDENTITY.md`](../../../docs/M6_IDENTITY.md)):
 //!
-//! * `require_role` — axum extractor that pulls the session
-//!   off the request, decodes it, and asserts a minimum role
-//!   (Phase 2 Step 2.5).
+//! * `bootstrap` — one-shot CLI / first-run seed for the
+//!   initial admin user (Phase 2 Step 2.6).
+//! * `login` — axum handler that consumes the above primitives
+//!   and issues the session cookie (Phase 2 Step 2.7).
 //!
 //! Keeping each concern as a tiny leaf module under `auth/`
 //! lets the login handler in `api.rs` compose them without
@@ -32,3 +37,5 @@ pub mod passwords;
 pub mod lockout;
 #[allow(dead_code)]
 pub mod sessions;
+#[allow(dead_code)]
+pub mod require_role;
