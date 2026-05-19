@@ -1,17 +1,17 @@
 //! M6 — local user authentication primitives.
 //!
 //! Pure, self-contained sub-modules consumed by the eventual
-//! `auth::login` / `auth::sessions` handlers:
+//! `auth::login` / `auth::require_role` handlers:
 //!
 //! * [`passwords`] — argon2id hashing + password policy
 //!   (Phase 2 Step 2.2).
 //! * [`lockout`] — failed-login lockout FSM
 //!   (Phase 2 Step 2.3).
+//! * [`sessions`] — HS256 access JWT + opaque refresh-secret
+//!   primitives (Phase 2 Step 2.4).
 //!
 //! Future siblings (planned in [`docs/M6_IDENTITY.md`](../../../docs/M6_IDENTITY.md)):
 //!
-//! * `sessions` — HS256 JWT issue/verify + refresh-token
-//!   rotation (Phase 2 Step 2.4).
 //! * `require_role` — axum extractor that pulls the session
 //!   off the request, decodes it, and asserts a minimum role
 //!   (Phase 2 Step 2.5).
@@ -30,3 +30,5 @@
 pub mod passwords;
 #[allow(dead_code)]
 pub mod lockout;
+#[allow(dead_code)]
+pub mod sessions;
