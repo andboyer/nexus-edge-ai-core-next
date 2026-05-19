@@ -55,7 +55,7 @@ use std::net::IpAddr;
 
 use axum::http::HeaderMap;
 use nexus_store::audit::{AuditActorKind, AuditOutcome, NewAuditEntry};
-use nexus_store::Store;
+use nexus_store::{SqliteTx, Store, StoreError};
 
 use super::require_role::SessionContext;
 
@@ -178,6 +178,63 @@ pub async fn audit_admin_action(
             "admin audit write failed",
         );
     }
+}
+
+/// Tx-merged sibling of [`audit_admin_action`] for the
+/// success path of an admin mutation.
+///
+/// Where [`audit_admin_action`] opens its own transaction and
+/// swallows write failures (fire-and-forget), this variant
+/// writes the row inside the caller's transaction and returns
+/// any error so the caller can roll back the matching domain
+/// mutation. The intended call shape is:
+///
+/// ```ignore
+/// let mut tx = state.store.begin_tx().await?;
+/// state.store.upsert_camera_tx(&mut tx, &cam).await?;
+/// audit_admin_action_in_tx(
+///     &state.store, &mut tx, session.as_ref(), &headers, peer.ip(),
+///     "camera.upsert", "camera", Some(&id_str),
+///     before_str.as_deref(), after_str.as_deref(),
+/// ).await?;
+/// tx.commit().await.map_err(StoreError::from)?;
+/// ```
+///
+/// Outcome is always [`AuditOutcome::Success`] \u2014 a failure
+/// outcome belongs on the rolled-back side, where the
+/// fire-and-forget [`audit_admin_action`] is the right call.
+#[allow(clippy::too_many_arguments)]
+pub async fn audit_admin_action_in_tx(
+    store: &Store,
+    tx: &mut SqliteTx<'_>,
+    actor: Option<&SessionContext>,
+    headers: &HeaderMap,
+    peer_ip: IpAddr,
+    action: &str,
+    resource_kind: &str,
+    resource_id: Option<&str>,
+    before_json: Option<&str>,
+    after_json: Option<&str>,
+) -> Result<(), StoreError> {
+    let (actor_kind, actor_id, actor_label) = actor_triple(actor);
+    let ua = user_agent_from(headers);
+    let ip = peer_ip.to_string();
+
+    let entry = NewAuditEntry {
+        actor_kind: Some(actor_kind),
+        actor_id: Some(actor_id.as_str()),
+        actor_label: actor_label.as_str(),
+        action,
+        resource_kind: Some(resource_kind),
+        resource_id,
+        before_json,
+        after_json,
+        outcome: AuditOutcome::Success,
+        ip: Some(ip.as_str()),
+        user_agent: ua,
+    };
+    store.record_audit_event(tx, &entry).await?;
+    Ok(())
 }
 
 #[cfg(test)]

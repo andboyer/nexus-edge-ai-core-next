@@ -23,6 +23,12 @@ pub use outbox::{OutboxRow, OutboxSinkCounts, OutboxStatus, SuppressionReason};
 pub use sessions::{NewRefreshToken, RefreshToken, RefreshTokenId, SessionsError};
 pub use users::{NewUser, User, UserId, UsersError};
 
+/// Re-export the SQLite transaction type so downstream crates
+/// (notably nexus-engine, which doesn't depend on `sqlx`
+/// directly outside dev-deps) can name the parameter type for
+/// the `*_tx` methods added in M6 Phase 4 Step 4.1.
+pub type SqliteTx<'c> = sqlx::Transaction<'c, sqlx::Sqlite>;
+
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -313,6 +319,22 @@ impl Store {
     }
 
     pub async fn upsert_camera(&self, cam: &CameraConfig) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await?;
+        self.upsert_camera_tx(&mut tx, cam).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// M6 Phase 4 Step 4.1 — tx-aware upsert. Runs the same
+    /// INSERT-OR-UPDATE as [`Store::upsert_camera`] inside a
+    /// caller-supplied transaction so the handler can pair the
+    /// domain mutation with an `audit_log` insert and commit them
+    /// atomically. A failed commit rolls back both halves.
+    pub async fn upsert_camera_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        cam: &CameraConfig,
+    ) -> Result<(), StoreError> {
         let json = serde_json::to_string(cam)?;
         sqlx::query(
             "INSERT INTO cameras (id, name, url, enabled, config_json) VALUES (?, ?, ?, ?, ?)
@@ -325,15 +347,28 @@ impl Store {
         .bind(cam.ingest.url.to_string())
         .bind(cam.ingest.enabled as i64)
         .bind(&json)
-        .execute(&self.pool)
+        .execute(&mut **tx)
         .await?;
         Ok(())
     }
 
     pub async fn delete_camera(&self, id: CameraId) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await?;
+        self.delete_camera_tx(&mut tx, id).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// M6 Phase 4 Step 4.1 — tx-aware delete. See
+    /// [`Store::upsert_camera_tx`] for the tx-merge rationale.
+    pub async fn delete_camera_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        id: CameraId,
+    ) -> Result<(), StoreError> {
         sqlx::query("DELETE FROM cameras WHERE id = ?")
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut **tx)
             .await?;
         Ok(())
     }
@@ -351,6 +386,19 @@ impl Store {
     }
 
     pub async fn upsert_rule(&self, rule: &RuleConfig) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await?;
+        self.upsert_rule_tx(&mut tx, rule).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// M6 Phase 4 Step 4.1 — tx-aware upsert. See
+    /// [`Store::upsert_camera_tx`] for the tx-merge rationale.
+    pub async fn upsert_rule_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        rule: &RuleConfig,
+    ) -> Result<(), StoreError> {
         let json = serde_json::to_string(rule)?;
         sqlx::query(
             "INSERT INTO rules (id, name, enabled, config_json) VALUES (?, ?, ?, ?)
@@ -362,15 +410,28 @@ impl Store {
         .bind(&rule.name)
         .bind(rule.enabled as i64)
         .bind(&json)
-        .execute(&self.pool)
+        .execute(&mut **tx)
         .await?;
         Ok(())
     }
 
     pub async fn delete_rule(&self, id: &RuleId) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await?;
+        self.delete_rule_tx(&mut tx, id).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// M6 Phase 4 Step 4.1 — tx-aware delete. See
+    /// [`Store::upsert_camera_tx`] for the tx-merge rationale.
+    pub async fn delete_rule_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        id: &RuleId,
+    ) -> Result<(), StoreError> {
         sqlx::query("DELETE FROM rules WHERE id = ?")
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut **tx)
             .await?;
         Ok(())
     }
@@ -787,6 +848,19 @@ impl Store {
         &self,
         settings: &DeliverySettings,
     ) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await?;
+        self.delivery_settings_put_tx(&mut tx, settings).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// M6 Phase 4 Step 4.1 — tx-aware put. See
+    /// [`Store::upsert_camera_tx`] for the tx-merge rationale.
+    pub async fn delivery_settings_put_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        settings: &DeliverySettings,
+    ) -> Result<(), StoreError> {
         if let Some(s) = &settings.schedule {
             s.validate()
                 .map_err(|e| StoreError::Decode(e.to_string()))?;
@@ -807,7 +881,7 @@ impl Store {
         .bind(schedule_json)
         .bind(&settings.timezone)
         .bind(Utc::now().to_rfc3339())
-        .execute(&self.pool)
+        .execute(&mut **tx)
         .await?;
         Ok(())
     }
@@ -872,6 +946,21 @@ impl Store {
         rule_id: &RuleId,
         policy: Option<&RuleDeliveryPolicy>,
     ) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await?;
+        self.rule_delivery_policy_put_tx(&mut tx, rule_id, policy)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// M6 Phase 4 Step 4.1 — tx-aware put. See
+    /// [`Store::upsert_camera_tx`] for the tx-merge rationale.
+    pub async fn rule_delivery_policy_put_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        rule_id: &RuleId,
+        policy: Option<&RuleDeliveryPolicy>,
+    ) -> Result<(), StoreError> {
         if let Some(p) = policy {
             if let Some(s) = &p.schedule {
                 s.validate()
@@ -890,11 +979,29 @@ impl Store {
         )
         .bind(blob)
         .bind(rule_id)
-        .execute(&self.pool)
+        .execute(&mut **tx)
         .await?;
         if res.rows_affected() == 0 {
             return Err(StoreError::NotFound(format!("rule {rule_id:?}")));
         }
+        Ok(())
+    }
+
+    /// M6 Phase 4 Step 4.1 — open a new transaction on the
+    /// underlying pool. Admin handlers use this to bracket a
+    /// domain mutation + audit-log insert in one tx so a crash
+    /// between the two cannot leave them out of sync.
+    pub async fn begin_tx(&self) -> Result<sqlx::Transaction<'_, sqlx::Sqlite>, StoreError> {
+        Ok(self.pool.begin().await?)
+    }
+
+    /// M6 Phase 4 Step 4.1 — commit a transaction opened via
+    /// [`Store::begin_tx`]. Lifted out as an associated
+    /// function so downstream crates (notably `nexus-engine`,
+    /// which does not depend on `sqlx` outside dev-deps) can
+    /// finalise a tx without having to name `sqlx::Error`.
+    pub async fn commit_tx(tx: sqlx::Transaction<'_, sqlx::Sqlite>) -> Result<(), StoreError> {
+        tx.commit().await?;
         Ok(())
     }
 }

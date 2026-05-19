@@ -518,40 +518,49 @@ async fn upsert_camera(
     let after_str = serde_json::to_string(&cam).ok();
     let before_str = before.as_ref().and_then(|b| serde_json::to_string(b).ok());
     let resource_id = id.to_string();
-    let outcome = match s.store.upsert_camera(&cam).await {
-        Ok(()) => nexus_store::audit::AuditOutcome::Success,
-        Err(e) => {
-            // Failure-path audit — record the attempt + error
-            // before bubbling so operators can investigate.
-            crate::auth::admin_audit::audit_admin_action(
-                &s.store,
-                session.as_ref(),
-                &headers,
-                peer.ip(),
-                "camera.upsert",
-                "camera",
-                Some(resource_id.as_str()),
-                nexus_store::audit::AuditOutcome::Failure,
-                before_str.as_deref(),
-                None,
-            )
-            .await;
-            return Err(e.into());
-        }
-    };
-    crate::auth::admin_audit::audit_admin_action(
-        &s.store,
-        session.as_ref(),
-        &headers,
-        peer.ip(),
-        "camera.upsert",
-        "camera",
-        Some(resource_id.as_str()),
-        outcome,
-        before_str.as_deref(),
-        after_str.as_deref(),
-    )
+    // M6 Phase 4 Step 4.1 (tx-merge) — the domain mutation
+    // and the success audit row commit together in one SQLite
+    // tx. If the audit write fails, the tx drops and the camera
+    // upsert is rolled back too — so the audit log can never
+    // be missing a row for a mutation that actually landed.
+    let tx_res: Result<(), nexus_store::StoreError> = async {
+        let mut tx = s.store.begin_tx().await?;
+        s.store.upsert_camera_tx(&mut tx, &cam).await?;
+        crate::auth::admin_audit::audit_admin_action_in_tx(
+            &s.store,
+            &mut tx,
+            session.as_ref(),
+            &headers,
+            peer.ip(),
+            "camera.upsert",
+            "camera",
+            Some(resource_id.as_str()),
+            before_str.as_deref(),
+            after_str.as_deref(),
+        )
+        .await?;
+        nexus_store::Store::commit_tx(tx).await?;
+        Ok(())
+    }
     .await;
+    if let Err(e) = tx_res {
+        // Failure-path audit — standalone tx, so it survives even
+        // if the in-tx audit was what failed above.
+        crate::auth::admin_audit::audit_admin_action(
+            &s.store,
+            session.as_ref(),
+            &headers,
+            peer.ip(),
+            "camera.upsert",
+            "camera",
+            Some(resource_id.as_str()),
+            nexus_store::audit::AuditOutcome::Failure,
+            before_str.as_deref(),
+            None,
+        )
+        .await;
+        return Err(e.into());
+    }
     // Fire-and-forget: the engine's `config.changed` reconciler
     // listens for this and hot-starts a supervisor + pre-roll
     // ingester for the new (or modified) camera. `action` lets the
@@ -581,7 +590,28 @@ async fn delete_camera(
         .and_then(|all| all.into_iter().find(|c| c.id == id));
     let before_str = before.as_ref().and_then(|b| serde_json::to_string(b).ok());
     let resource_id = id.to_string();
-    if let Err(e) = s.store.delete_camera(id).await {
+    // M6 Phase 4 Step 4.1 (tx-merge) — see upsert_camera.
+    let tx_res: Result<(), nexus_store::StoreError> = async {
+        let mut tx = s.store.begin_tx().await?;
+        s.store.delete_camera_tx(&mut tx, id).await?;
+        crate::auth::admin_audit::audit_admin_action_in_tx(
+            &s.store,
+            &mut tx,
+            session.as_ref(),
+            &headers,
+            peer.ip(),
+            "camera.delete",
+            "camera",
+            Some(resource_id.as_str()),
+            before_str.as_deref(),
+            None,
+        )
+        .await?;
+        nexus_store::Store::commit_tx(tx).await?;
+        Ok(())
+    }
+    .await;
+    if let Err(e) = tx_res {
         crate::auth::admin_audit::audit_admin_action(
             &s.store,
             session.as_ref(),
@@ -597,19 +627,6 @@ async fn delete_camera(
         .await;
         return Err(e.into());
     }
-    crate::auth::admin_audit::audit_admin_action(
-        &s.store,
-        session.as_ref(),
-        &headers,
-        peer.ip(),
-        "camera.delete",
-        "camera",
-        Some(resource_id.as_str()),
-        nexus_store::audit::AuditOutcome::Success,
-        before_str.as_deref(),
-        None,
-    )
-    .await;
     // Same channel as upsert — the reconciler diffs the live set
     // against the DB and aborts the supervisor for any removed id.
     let _ = s
@@ -676,7 +693,28 @@ async fn upsert_rule(
     let before_str = before.as_ref().and_then(|b| serde_json::to_string(b).ok());
     let after_str = serde_json::to_string(&rule).ok();
     let rule_id_str = id.to_string();
-    if let Err(e) = s.store.upsert_rule(&rule).await {
+    // M6 Phase 4 Step 4.1 (tx-merge) — see upsert_camera.
+    let tx_res: Result<(), nexus_store::StoreError> = async {
+        let mut tx = s.store.begin_tx().await?;
+        s.store.upsert_rule_tx(&mut tx, &rule).await?;
+        crate::auth::admin_audit::audit_admin_action_in_tx(
+            &s.store,
+            &mut tx,
+            session.as_ref(),
+            &headers,
+            peer.ip(),
+            "rule.upsert",
+            "rule",
+            Some(rule_id_str.as_str()),
+            before_str.as_deref(),
+            after_str.as_deref(),
+        )
+        .await?;
+        nexus_store::Store::commit_tx(tx).await?;
+        Ok(())
+    }
+    .await;
+    if let Err(e) = tx_res {
         crate::auth::admin_audit::audit_admin_action(
             &s.store,
             session.as_ref(),
@@ -692,19 +730,6 @@ async fn upsert_rule(
         .await;
         return Err(e.into());
     }
-    crate::auth::admin_audit::audit_admin_action(
-        &s.store,
-        session.as_ref(),
-        &headers,
-        peer.ip(),
-        "rule.upsert",
-        "rule",
-        Some(rule_id_str.as_str()),
-        nexus_store::audit::AuditOutcome::Success,
-        before_str.as_deref(),
-        after_str.as_deref(),
-    )
-    .await;
     reload_rules_into_evaluator(&s, "upsert", &id).await;
     Ok(Json(rule))
 }
@@ -724,7 +749,28 @@ async fn delete_rule(
         .and_then(|all| all.into_iter().find(|r| r.id == id));
     let before_str = before.as_ref().and_then(|b| serde_json::to_string(b).ok());
     let rule_id_str = id.to_string();
-    if let Err(e) = s.store.delete_rule(&id).await {
+    // M6 Phase 4 Step 4.1 (tx-merge) — see upsert_camera.
+    let tx_res: Result<(), nexus_store::StoreError> = async {
+        let mut tx = s.store.begin_tx().await?;
+        s.store.delete_rule_tx(&mut tx, &id).await?;
+        crate::auth::admin_audit::audit_admin_action_in_tx(
+            &s.store,
+            &mut tx,
+            session.as_ref(),
+            &headers,
+            peer.ip(),
+            "rule.delete",
+            "rule",
+            Some(rule_id_str.as_str()),
+            before_str.as_deref(),
+            None,
+        )
+        .await?;
+        nexus_store::Store::commit_tx(tx).await?;
+        Ok(())
+    }
+    .await;
+    if let Err(e) = tx_res {
         crate::auth::admin_audit::audit_admin_action(
             &s.store,
             session.as_ref(),
@@ -740,19 +786,6 @@ async fn delete_rule(
         .await;
         return Err(e.into());
     }
-    crate::auth::admin_audit::audit_admin_action(
-        &s.store,
-        session.as_ref(),
-        &headers,
-        peer.ip(),
-        "rule.delete",
-        "rule",
-        Some(rule_id_str.as_str()),
-        nexus_store::audit::AuditOutcome::Success,
-        before_str.as_deref(),
-        None,
-    )
-    .await;
     reload_rules_into_evaluator(&s, "delete", &id).await;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -2580,20 +2613,45 @@ async fn put_storage_cold(
         "throttle_bps": current.throttle_bps,
     }))
     .ok();
-    if let Err(e) = s
-        .store
-        .write_cold_replica(req.handle.as_deref(), throttle)
+    // M6 Phase 4 Step 4.1 (tx-merge) — the cold-replica UPDATE
+    // and its audit row commit together. Mapping FK errors to
+    // 400 has to happen inside the async block so the error
+    // surfaces from the same `?` chain.
+    let tx_res: Result<(), ApiError> = async {
+        let mut tx = s.store.begin_tx().await.map_err(ApiError::from)?;
+        s.store
+            .write_cold_replica_tx(&mut tx, req.handle.as_deref(), throttle)
+            .await
+            .map_err(|e| match e {
+                nexus_store::StoreError::Sqlx(ref se) if se.to_string().contains("FOREIGN KEY") => {
+                    ApiError(
+                        StatusCode::BAD_REQUEST,
+                        format!("cold backend handle does not exist: {e}"),
+                    )
+                }
+                other => other.into(),
+            })?;
+        crate::auth::admin_audit::audit_admin_action_in_tx(
+            &s.store,
+            &mut tx,
+            Some(&session),
+            &headers,
+            peer.ip(),
+            "storage.cold.put",
+            "admin/storage/cold",
+            Some("singleton"),
+            before_str.as_deref(),
+            after_str.as_deref(),
+        )
         .await
-        .map_err(|e| match e {
-            nexus_store::StoreError::Sqlx(ref se) if se.to_string().contains("FOREIGN KEY") => {
-                ApiError(
-                    StatusCode::BAD_REQUEST,
-                    format!("cold backend handle does not exist: {e}"),
-                )
-            }
-            other => other.into(),
-        })
-    {
+        .map_err(ApiError::from)?;
+        nexus_store::Store::commit_tx(tx)
+            .await
+            .map_err(ApiError::from)?;
+        Ok(())
+    }
+    .await;
+    if let Err(e) = tx_res {
         crate::auth::admin_audit::audit_admin_action(
             &s.store,
             Some(&session),
@@ -2609,19 +2667,6 @@ async fn put_storage_cold(
         .await;
         return Err(e);
     }
-    crate::auth::admin_audit::audit_admin_action(
-        &s.store,
-        Some(&session),
-        &headers,
-        peer.ip(),
-        "storage.cold.put",
-        "admin/storage/cold",
-        Some("singleton"),
-        nexus_store::audit::AuditOutcome::Success,
-        before_str.as_deref(),
-        after_str.as_deref(),
-    )
-    .await;
     let _ = s
         .bus
         .publish(
@@ -2710,11 +2755,36 @@ async fn put_storage_backend(
     let after_str =
         serde_json::to_string(&serde_json::json!({ "kind": req.kind, "config": audited_config }))
             .ok();
-    if let Err(e) = s
-        .store
-        .upsert_storage_backend(&handle, &req.kind, &config_json)
-        .await
-    {
+    // M6 Phase 4 Step 4.1 (tx-merge) — upsert + audit commit
+    // together. `rebuild_registry` stays outside the tx because
+    // it only updates in-memory state; if it fails after commit
+    // the reconciler picks it up on next tick.
+    let tx_res: Result<(), nexus_store::StoreError> = async {
+        let mut tx = s.store.begin_tx().await?;
+        s.store
+            .upsert_storage_backend_tx(&mut tx, &handle, &req.kind, &config_json)
+            .await?;
+        // Audit log: redact the encrypted refresh token blob even
+        // though it's only ciphertext — it's still operator
+        // credential material and ops logs should not carry it.
+        crate::auth::admin_audit::audit_admin_action_in_tx(
+            &s.store,
+            &mut tx,
+            Some(&session),
+            &headers,
+            peer.ip(),
+            "storage.backend.put",
+            "admin/storage/backend",
+            Some(handle.as_str()),
+            None,
+            after_str.as_deref(),
+        )
+        .await?;
+        nexus_store::Store::commit_tx(tx).await?;
+        Ok(())
+    }
+    .await;
+    if let Err(e) = tx_res {
         crate::auth::admin_audit::audit_admin_action(
             &s.store,
             Some(&session),
@@ -2731,22 +2801,6 @@ async fn put_storage_backend(
         return Err(e.into());
     }
     rebuild_registry(&s).await?;
-    // Audit log: redact the encrypted refresh token blob even though
-    // it's only ciphertext — it's still operator credential material
-    // and ops logs should not carry it.
-    crate::auth::admin_audit::audit_admin_action(
-        &s.store,
-        Some(&session),
-        &headers,
-        peer.ip(),
-        "storage.backend.put",
-        "admin/storage/backend",
-        Some(handle.as_str()),
-        nexus_store::audit::AuditOutcome::Success,
-        None,
-        after_str.as_deref(),
-    )
-    .await;
     let _ = s
         .bus
         .publish(
@@ -2782,28 +2836,57 @@ async fn delete_storage_backend(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     session: crate::auth::require_role::SessionContext,
 ) -> Result<StatusCode, ApiError> {
-    if let Err(e) = s
-        .store
-        .delete_storage_backend(&handle)
-        .await
-        .map_err(|e| match e {
-            nexus_store::DeleteBackendError::InUse(h) => ApiError(
-                StatusCode::CONFLICT,
-                format!("backend '{h}' is referenced by motion_clips; clear cold pointers first"),
-            ),
-            nexus_store::DeleteBackendError::ActiveCold(h) => ApiError(
-                StatusCode::CONFLICT,
-                format!(
-                    "backend '{h}' is the active cold replica; PUT /admin/storage/cold {{handle:null}} first"
+    // M6 Phase 4 Step 4.1 (tx-merge) — the DELETE and its audit
+    // commit together. The pre-checks (local-handle reject,
+    // active-cold replica, in-use motion_clips) run inside the
+    // tx so a concurrent change can't slip past us between
+    // check and delete. `rebuild_registry` stays outside the
+    // tx — see put_storage_backend.
+    let tx_res: Result<(), ApiError> = async {
+        let mut tx = s.store.begin_tx().await.map_err(ApiError::from)?;
+        s.store
+            .delete_storage_backend_tx(&mut tx, &handle)
+            .await
+            .map_err(|e| match e {
+                nexus_store::DeleteBackendError::InUse(h) => ApiError(
+                    StatusCode::CONFLICT,
+                    format!(
+                        "backend '{h}' is referenced by motion_clips; clear cold pointers first"
+                    ),
                 ),
-            ),
-            nexus_store::DeleteBackendError::Local(h) => ApiError(
-                StatusCode::BAD_REQUEST,
-                format!("backend '{h}' is the implicit local backend and cannot be deleted"),
-            ),
-            nexus_store::DeleteBackendError::Store(e) => e.into(),
-        })
-    {
+                nexus_store::DeleteBackendError::ActiveCold(h) => ApiError(
+                    StatusCode::CONFLICT,
+                    format!(
+                        "backend '{h}' is the active cold replica; PUT /admin/storage/cold {{handle:null}} first"
+                    ),
+                ),
+                nexus_store::DeleteBackendError::Local(h) => ApiError(
+                    StatusCode::BAD_REQUEST,
+                    format!("backend '{h}' is the implicit local backend and cannot be deleted"),
+                ),
+                nexus_store::DeleteBackendError::Store(e) => e.into(),
+            })?;
+        crate::auth::admin_audit::audit_admin_action_in_tx(
+            &s.store,
+            &mut tx,
+            Some(&session),
+            &headers,
+            peer.ip(),
+            "storage.backend.delete",
+            "admin/storage/backend",
+            Some(handle.as_str()),
+            None,
+            None,
+        )
+        .await
+        .map_err(ApiError::from)?;
+        nexus_store::Store::commit_tx(tx)
+            .await
+            .map_err(ApiError::from)?;
+        Ok(())
+    }
+    .await;
+    if let Err(e) = tx_res {
         crate::auth::admin_audit::audit_admin_action(
             &s.store,
             Some(&session),
@@ -2820,19 +2903,6 @@ async fn delete_storage_backend(
         return Err(e);
     }
     rebuild_registry(&s).await?;
-    crate::auth::admin_audit::audit_admin_action(
-        &s.store,
-        Some(&session),
-        &headers,
-        peer.ip(),
-        "storage.backend.delete",
-        "admin/storage/backend",
-        Some(handle.as_str()),
-        nexus_store::audit::AuditOutcome::Success,
-        None,
-        None,
-    )
-    .await;
     let _ = s
         .bus
         .publish(
@@ -3058,11 +3128,34 @@ async fn put_usb_preferred(
     // Persist first so a crash between the in-memory flip and the
     // SQLite write doesn't leave the recorder pointed at a label
     // the next boot won't reconstruct.
-    if let Err(e) = s
-        .store
-        .write_runtime_setting("preferred_usb_label", normalised.as_deref())
-        .await
-    {
+    //
+    // M6 Phase 4 Step 4.1 (tx-merge) — setting + audit commit
+    // together. The in-memory `preferred_usb_label.set(...)` stays
+    // OUTSIDE the tx so a commit failure cannot leave the cache
+    // pointing at a value the DB doesn't agree with.
+    let tx_res: Result<(), nexus_store::StoreError> = async {
+        let mut tx = s.store.begin_tx().await?;
+        s.store
+            .write_runtime_setting_tx(&mut tx, "preferred_usb_label", normalised.as_deref())
+            .await?;
+        crate::auth::admin_audit::audit_admin_action_in_tx(
+            &s.store,
+            &mut tx,
+            Some(&session),
+            &headers,
+            peer.ip(),
+            "runtime.usb_preferred.put",
+            "admin/runtime/usb_preferred",
+            Some("singleton"),
+            before_str.as_deref(),
+            after_str.as_deref(),
+        )
+        .await?;
+        nexus_store::Store::commit_tx(tx).await?;
+        Ok(())
+    }
+    .await;
+    if let Err(e) = tx_res {
         crate::auth::admin_audit::audit_admin_action(
             &s.store,
             Some(&session),
@@ -3079,19 +3172,6 @@ async fn put_usb_preferred(
         return Err(e.into());
     }
     s.preferred_usb_label.set(normalised.clone());
-    crate::auth::admin_audit::audit_admin_action(
-        &s.store,
-        Some(&session),
-        &headers,
-        peer.ip(),
-        "runtime.usb_preferred.put",
-        "admin/runtime/usb_preferred",
-        Some("singleton"),
-        nexus_store::audit::AuditOutcome::Success,
-        before_str.as_deref(),
-        after_str.as_deref(),
-    )
-    .await;
     Ok(Json(UsbPreferredOut { label: normalised }))
 }
 
@@ -3183,7 +3263,30 @@ async fn put_admin_delivery(
     // default StoreError conversion — that's fine because the
     // caller has no way to produce a malformed grid through a
     // well-formed JSON body unless they bypassed the UI.
-    if let Err(e) = s.store.delivery_settings_put(&settings).await {
+    //
+    // M6 Phase 4 Step 4.1 (tx-merge) — settings + audit commit
+    // together.
+    let tx_res: Result<(), nexus_store::StoreError> = async {
+        let mut tx = s.store.begin_tx().await?;
+        s.store.delivery_settings_put_tx(&mut tx, &settings).await?;
+        crate::auth::admin_audit::audit_admin_action_in_tx(
+            &s.store,
+            &mut tx,
+            Some(&session),
+            &headers,
+            peer.ip(),
+            "delivery.settings.put",
+            "admin/delivery",
+            Some("singleton"),
+            before_str.as_deref(),
+            after_str.as_deref(),
+        )
+        .await?;
+        nexus_store::Store::commit_tx(tx).await?;
+        Ok(())
+    }
+    .await;
+    if let Err(e) = tx_res {
         crate::auth::admin_audit::audit_admin_action(
             &s.store,
             Some(&session),
@@ -3199,19 +3302,6 @@ async fn put_admin_delivery(
         .await;
         return Err(e.into());
     }
-    crate::auth::admin_audit::audit_admin_action(
-        &s.store,
-        Some(&session),
-        &headers,
-        peer.ip(),
-        "delivery.settings.put",
-        "admin/delivery",
-        Some("singleton"),
-        nexus_store::audit::AuditOutcome::Success,
-        before_str.as_deref(),
-        after_str.as_deref(),
-    )
-    .await;
     // Sentinel payload — the reload task always re-reads the
     // store. `_ =`d so a saturated bus doesn't fail the write.
     let _ = s
@@ -3288,15 +3378,38 @@ async fn put_rule_delivery(
     let before = s.store.rule_delivery_policy_get(&rule_id).await.ok();
     let before_str = before.as_ref().and_then(|b| serde_json::to_string(b).ok());
     let after_str = serde_json::to_string(&req.policy).ok();
-    if let Err(e) = s
-        .store
-        .rule_delivery_policy_put(&rule_id, req.policy.as_ref())
+    // M6 Phase 4 Step 4.1 (tx-merge) — policy + audit commit
+    // together. `NotFound` from the store still maps to 404.
+    let tx_res: Result<(), ApiError> = async {
+        let mut tx = s.store.begin_tx().await.map_err(ApiError::from)?;
+        s.store
+            .rule_delivery_policy_put_tx(&mut tx, &rule_id, req.policy.as_ref())
+            .await
+            .map_err(|e| match e {
+                nexus_store::StoreError::NotFound(msg) => ApiError(StatusCode::NOT_FOUND, msg),
+                other => other.into(),
+            })?;
+        crate::auth::admin_audit::audit_admin_action_in_tx(
+            &s.store,
+            &mut tx,
+            session.as_ref(),
+            &headers,
+            peer.ip(),
+            "rule.delivery.put",
+            "rule/delivery",
+            Some(rule_id_str.as_str()),
+            before_str.as_deref(),
+            after_str.as_deref(),
+        )
         .await
-        .map_err(|e| match e {
-            nexus_store::StoreError::NotFound(msg) => ApiError(StatusCode::NOT_FOUND, msg),
-            other => other.into(),
-        })
-    {
+        .map_err(ApiError::from)?;
+        nexus_store::Store::commit_tx(tx)
+            .await
+            .map_err(ApiError::from)?;
+        Ok(())
+    }
+    .await;
+    if let Err(e) = tx_res {
         crate::auth::admin_audit::audit_admin_action(
             &s.store,
             session.as_ref(),
@@ -3312,19 +3425,6 @@ async fn put_rule_delivery(
         .await;
         return Err(e);
     }
-    crate::auth::admin_audit::audit_admin_action(
-        &s.store,
-        session.as_ref(),
-        &headers,
-        peer.ip(),
-        "rule.delivery.put",
-        "rule/delivery",
-        Some(rule_id_str.as_str()),
-        nexus_store::audit::AuditOutcome::Success,
-        before_str.as_deref(),
-        after_str.as_deref(),
-    )
-    .await;
     let _ = s
         .bus
         .publish(

@@ -1038,6 +1038,21 @@ impl Store {
         backend_handle: Option<&str>,
         throttle_bps: i64,
     ) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await?;
+        self.write_cold_replica_tx(&mut tx, backend_handle, throttle_bps)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// M6 Phase 4 Step 4.1 — tx-aware update. See
+    /// [`Store::upsert_camera_tx`] for the tx-merge rationale.
+    pub async fn write_cold_replica_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        backend_handle: Option<&str>,
+        throttle_bps: i64,
+    ) -> Result<(), StoreError> {
         let res = sqlx::query(
             "UPDATE storage_cold_replica
                 SET backend_handle = ?, throttle_bps = ?,
@@ -1047,7 +1062,7 @@ impl Store {
         .bind(backend_handle)
         .bind(throttle_bps)
         .bind(Utc::now().to_rfc3339())
-        .execute(&self.pool)
+        .execute(&mut **tx)
         .await?;
         if res.rows_affected() == 0 {
             return Err(StoreError::NotFound(
@@ -1082,6 +1097,22 @@ impl Store {
         kind: &str,
         config_json: &str,
     ) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await?;
+        self.upsert_storage_backend_tx(&mut tx, handle, kind, config_json)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// M6 Phase 4 Step 4.1 — tx-aware upsert. See
+    /// [`Store::upsert_camera_tx`] for the tx-merge rationale.
+    pub async fn upsert_storage_backend_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        handle: &str,
+        kind: &str,
+        config_json: &str,
+    ) -> Result<(), StoreError> {
         sqlx::query(
             "INSERT INTO storage_backends (handle, kind, config_json, updated_at)
                   VALUES (?, ?, ?, ?)
@@ -1094,7 +1125,7 @@ impl Store {
         .bind(kind)
         .bind(config_json)
         .bind(Utc::now().to_rfc3339())
-        .execute(&self.pool)
+        .execute(&mut **tx)
         .await?;
         Ok(())
     }
@@ -1109,14 +1140,44 @@ impl Store {
     /// the implicit `'local'` backend (engine-owned, never
     /// removable).
     pub async fn delete_storage_backend(&self, handle: &str) -> Result<(), DeleteBackendError> {
+        let mut tx = self.pool.begin().await.map_err(StoreError::from)?;
+        self.delete_storage_backend_tx(&mut tx, handle).await?;
+        tx.commit().await.map_err(StoreError::from)?;
+        Ok(())
+    }
+
+    /// M6 Phase 4 Step 4.1 — tx-aware delete. Runs the same
+    /// pre-checks ([`DeleteBackendError::Local`] / `ActiveCold` /
+    /// `InUse`) and the DELETE inside the caller's transaction.
+    /// The pre-check reads are issued through the same
+    /// transaction so they observe any prior writes the caller
+    /// has already issued in the same tx; in practice nothing
+    /// here is the caller wrote, but doing it consistently keeps
+    /// the implementation honest and serialises cleanly under
+    /// SQLite's `BEGIN IMMEDIATE` semantics.
+    pub async fn delete_storage_backend_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        handle: &str,
+    ) -> Result<(), DeleteBackendError> {
         if handle == "local" {
             return Err(DeleteBackendError::Local(handle.to_string()));
         }
 
-        // Pre-check: is this the active cold replica?
-        let cold = self.read_cold_replica().await?;
-        if cold.backend_handle.as_deref() == Some(handle) {
-            return Err(DeleteBackendError::ActiveCold(handle.to_string()));
+        // Pre-check: is this the active cold replica? Read inside
+        // the tx so a concurrent write to storage_cold_replica
+        // can't slip past us.
+        let cold_row = sqlx::query("SELECT backend_handle FROM storage_cold_replica WHERE id = 1")
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(StoreError::from)?;
+        if let Some(row) = cold_row {
+            let active: Option<String> = row
+                .try_get::<Option<String>, _>(0)
+                .map_err(StoreError::from)?;
+            if active.as_deref() == Some(handle) {
+                return Err(DeleteBackendError::ActiveCold(handle.to_string()));
+            }
         }
 
         // Pre-check: any clip rows referencing it?
@@ -1126,7 +1187,7 @@ impl Store {
         )
         .bind(handle)
         .bind(handle)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut **tx)
         .await
         .map_err(StoreError::from)?;
         if in_use.0 > 0 {
@@ -1135,7 +1196,7 @@ impl Store {
 
         let res = sqlx::query("DELETE FROM storage_backends WHERE handle = ?")
             .bind(handle)
-            .execute(&self.pool)
+            .execute(&mut **tx)
             .await
             .map_err(StoreError::from)?;
         if res.rows_affected() == 0 {
@@ -1178,6 +1239,20 @@ impl Store {
         key: &str,
         value: Option<&str>,
     ) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await?;
+        self.write_runtime_setting_tx(&mut tx, key, value).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// M6 Phase 4 Step 4.1 — tx-aware upsert. See
+    /// [`Store::upsert_camera_tx`] for the tx-merge rationale.
+    pub async fn write_runtime_setting_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        key: &str,
+        value: Option<&str>,
+    ) -> Result<(), StoreError> {
         sqlx::query(
             "INSERT INTO engine_runtime_settings (key, value, updated_at)
                   VALUES (?, ?, ?)
@@ -1188,7 +1263,7 @@ impl Store {
         .bind(key)
         .bind(value)
         .bind(Utc::now().to_rfc3339())
-        .execute(&self.pool)
+        .execute(&mut **tx)
         .await?;
         Ok(())
     }
