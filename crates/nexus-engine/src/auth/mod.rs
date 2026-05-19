@@ -24,10 +24,15 @@
 //!   /api/v1/admin/users/:id`, `POST .../reset-password`,
 //!   `POST .../unlock`) that let an admin manage the local-user
 //!   roster (Phase 2 Step 2.8).
+//! * [`oidc`] — OIDC discovery + JWKS cache + ID-token
+//!   verification primitives. Backs the Step 3.3 auth-code
+//!   flow handler (Phase 3 Step 3.1).
 //!
 //! Future siblings (planned in [`docs/M6_IDENTITY.md`](../../../docs/M6_IDENTITY.md)):
 //!
-//! * `oidc` — Phase 3.
+//! * (none — Phase 3 lands `oidc::role_map` + the auth-code
+//!   handler in upcoming sub-steps and they live inside the
+//!   `oidc` module.)
 //!
 //! Keeping each concern as a tiny leaf module under `auth/`
 //! lets the login handler set compose them without pulling in
@@ -36,6 +41,12 @@
 pub mod bootstrap;
 pub mod lockout;
 pub mod login;
+// `oidc` lands ahead of its in-tree consumers (Step 3.3 wires
+// the auth-code handler + Step 3.2 the role mapper). Allow the
+// dead code so the parallel rollout doesn't fail clippy; this
+// allow disappears the moment Step 3.3 imports `OidcClient`.
+#[allow(dead_code)]
+pub mod oidc;
 pub mod passwords;
 pub mod require_role;
 pub mod sessions;
