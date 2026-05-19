@@ -225,6 +225,31 @@ pub fn router(state: ApiState) -> Router {
             "/v1/admin/discovery/sessions/{session_id}/probe-rtsp",
             axum::routing::post(discovery::post_probe_rtsp),
         )
+        // M6 Phase 2 Step 2.8 — local-user roster admin. Lives
+        // behind both the admin_auth gate AND the per-handler
+        // `AdminContext` extractor: a valid HS256 JWT signed
+        // with the configured secret passes the gate, but a
+        // bearer whose `role` claim is not `admin` is 403'd by
+        // the extractor before the handler body runs. Defense
+        // in depth — the gate authenticates, the extractor
+        // authorises.
+        .route(
+            "/v1/admin/users",
+            get(crate::auth::users_admin::list_users).post(crate::auth::users_admin::create_user),
+        )
+        .route(
+            "/v1/admin/users/{id}",
+            put(crate::auth::users_admin::update_user)
+                .delete(crate::auth::users_admin::delete_user),
+        )
+        .route(
+            "/v1/admin/users/{id}/reset-password",
+            axum::routing::post(crate::auth::users_admin::reset_password),
+        )
+        .route(
+            "/v1/admin/users/{id}/unlock",
+            axum::routing::post(crate::auth::users_admin::unlock_user),
+        )
         .route_layer(axum::middleware::from_fn_with_state(
             state.admin_auth.clone(),
             admin_auth::admin_auth_layer,

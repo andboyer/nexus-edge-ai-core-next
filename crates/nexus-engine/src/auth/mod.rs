@@ -19,11 +19,14 @@
 //! * [`login`] — the four HTTP handlers (`/login`, `/refresh`,
 //!   `/logout`, `/change-password`) that compose every other
 //!   primitive in this module (Phase 2 Step 2.7).
+//! * [`users_admin`] — six HTTP handlers
+//!   (`GET/POST /api/v1/admin/users`, `PUT/DELETE
+//!   /api/v1/admin/users/:id`, `POST .../reset-password`,
+//!   `POST .../unlock`) that let an admin manage the local-user
+//!   roster (Phase 2 Step 2.8).
 //!
 //! Future siblings (planned in [`docs/M6_IDENTITY.md`](../../../docs/M6_IDENTITY.md)):
 //!
-//! * `users_admin` — `GET/POST/PUT/DELETE /api/v1/admin/users`
-//!   + the unlock + reset-password actions (Phase 2 Step 2.8).
 //! * `oidc` — Phase 3.
 //!
 //! Keeping each concern as a tiny leaf module under `auth/`
@@ -36,3 +39,4 @@ pub mod login;
 pub mod passwords;
 pub mod require_role;
 pub mod sessions;
+pub mod users_admin;

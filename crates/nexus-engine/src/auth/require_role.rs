@@ -137,10 +137,11 @@ impl SessionContext {
 /// instead of inside the handler body. The inner [`SessionContext`]
 /// is still available via `.0` for audit-log writes.
 //
-// dead_code: these three role-newtypes are consumed by the
-// admin user-CRUD handlers landing in Step 2.8 (`GET/POST/PUT
-// /admin/users`, etc.). Drop these allows the moment 2.8 lands.
-#[allow(dead_code)]
+// AdminContext is consumed by `auth::users_admin` (Step 2.8).
+// OperatorContext / ViewerContext are reserved for the
+// state-mutating + read-only handlers that Phase 4 audits will
+// move under; we keep them defined now so the role-newtype
+// shape is stable.
 #[derive(Debug, Clone)]
 pub struct AdminContext(pub SessionContext);
 
