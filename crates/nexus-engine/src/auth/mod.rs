@@ -27,12 +27,16 @@
 //! * [`oidc`] — OIDC discovery + JWKS cache + ID-token
 //!   verification primitives. Backs the Step 3.3 auth-code
 //!   flow handler (Phase 3 Step 3.1).
+//! * [`oidc_role_map`] — pure function that turns a verified
+//!   ID token into a Nexus [`nexus_types::Role`] using the
+//!   `auth.oidc.role_claims` + `auth.oidc.role_map` config
+//!   (Phase 3 Step 3.2).
 //!
 //! Future siblings (planned in [`docs/M6_IDENTITY.md`](../../../docs/M6_IDENTITY.md)):
 //!
-//! * (none — Phase 3 lands `oidc::role_map` + the auth-code
-//!   handler in upcoming sub-steps and they live inside the
-//!   `oidc` module.)
+//! * (none — Phase 3 lands the auth-code handler in upcoming
+//!   sub-steps and it lives inside the existing `oidc`
+//!   module.)
 //!
 //! Keeping each concern as a tiny leaf module under `auth/`
 //! lets the login handler set compose them without pulling in
@@ -47,6 +51,11 @@ pub mod login;
 // allow disappears the moment Step 3.3 imports `OidcClient`.
 #[allow(dead_code)]
 pub mod oidc;
+// Same parking pattern as `oidc` — `map_role` is exercised by
+// its own unit tests; the Step 3.3 callback handler will be the
+// in-tree consumer. Drop the allow when that handler lands.
+#[allow(dead_code)]
+pub mod oidc_role_map;
 pub mod passwords;
 pub mod require_role;
 pub mod sessions;
