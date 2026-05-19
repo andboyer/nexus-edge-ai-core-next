@@ -10,6 +10,17 @@ use thiserror::Error;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+/// Width of the RGB frame the `RtspSource` produces after
+/// `videoscale`. Every downstream consumer (detector, tracker,
+/// motion_events bbox, frame cache, JPEG endpoint) sees pixels in
+/// this coordinate space. The bbox values written into
+/// `motion_events` are in this same space, so the clip-overlay UI
+/// must scale them against `<video>.videoWidth` (which is the
+/// CAMERA's native H.264 resolution, NOT this).
+pub const RTSP_SOURCE_FRAME_WIDTH: u32 = 960;
+/// See [`RTSP_SOURCE_FRAME_WIDTH`].
+pub const RTSP_SOURCE_FRAME_HEIGHT: u32 = 540;
+
 #[derive(Debug, Error)]
 pub enum FrameSourceError {
     #[error("source closed")]
@@ -206,8 +217,10 @@ impl RtspSource {
             "rtspsrc location=\"{url_safe}\" latency=500 protocols=tcp \
              ! decodebin force-sw-decoders=true \
              ! videoconvert ! videoscale ! videorate \
-             ! video/x-raw,format=RGB,width=960,height=540,framerate={fr}/1 \
-             ! appsink name=sink emit-signals=false sync=false drop=true max-buffers=4"
+             ! video/x-raw,format=RGB,width={w},height={h},framerate={fr}/1 \
+             ! appsink name=sink emit-signals=false sync=false drop=true max-buffers=4",
+            w = RTSP_SOURCE_FRAME_WIDTH,
+            h = RTSP_SOURCE_FRAME_HEIGHT,
         );
 
         let pipeline = gst::parse::launch(&desc)

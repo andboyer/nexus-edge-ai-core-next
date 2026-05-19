@@ -37,7 +37,7 @@ use nexus_bus::{topic, Bus, BusExt};
 use nexus_config::{CameraConfig, RuleConfig};
 use nexus_inference::{BackendStatus, DetectorPool};
 use nexus_pipeline::LatestFrameCache;
-use nexus_rules::{CelEngine, RuleEngine, RulesError};
+use nexus_rules::{CelEngine, RuleEngine, RuleEvaluator, RulesError};
 use nexus_store::Store;
 use nexus_types::{AlertEvent, CameraId, FrameMetadata, PixelFormat, RuleId};
 use tower_http::compression::CompressionLayer;
@@ -53,6 +53,14 @@ use crate::discovery::{self, DiscoverySessions};
 pub struct ApiState {
     pub store: Arc<Store>,
     pub bus: Arc<dyn Bus>,
+    /// Shared with every per-camera supervisor. The admin
+    /// `PUT /api/rules/:id` + `DELETE /api/rules/:id` handlers
+    /// call `reload()` on this after the DB write so rule edits
+    /// take effect on the next frame without an engine restart.
+    /// Without this wire-up the engine kept evaluating with the
+    /// rules it compiled at boot, silently ignoring every edit
+    /// the operator made through the UI.
+    pub evaluator: Arc<RuleEvaluator>,
     pub cache: Arc<LatestFrameCache>,
     pub pool: Option<Arc<DetectorPool>>,
     pub ui_root: PathBuf,
@@ -119,6 +127,24 @@ pub struct ApiState {
     /// [`crate::discovery::SESSION_TTL`]. Cheap to clone — wraps
     /// an `Arc<DashMap<Uuid, _>>` internally.
     pub discovery_sessions: DiscoverySessions,
+    /// M-Admin Phase 5 — detector prompt catalog. Boot-time
+    /// snapshot of every kind the [`InferenceRouter`] knows about
+    /// plus its vocabulary (read from `models-manifest.json` for
+    /// open-vocab detectors, hard-coded for closed-vocab COCO).
+    /// Served verbatim by `GET /api/v1/models/prompts`; the UI
+    /// uses it so the camera + rules forms show the labels the
+    /// active detector actually emits instead of a stale
+    /// hard-coded list. Cheap to clone — wraps the whole catalog
+    /// in a single Arc.
+    pub model_prompts: Arc<crate::models_catalog::ModelPromptsCatalog>,
+    /// M7 Step 6 — alert sink registry shared with the
+    /// dispatcher. The `GET /api/v1/admin/sinks/health` handler
+    /// uses [`nexus_sinks::SinkRegistry::ids`] to ensure the
+    /// response carries a card per *configured* sink, even when
+    /// that sink hasn't seen traffic in the requested window
+    /// (so the UI doesn't appear to forget a freshly-added sink
+    /// just because no alerts have fired yet).
+    pub sink_registry: Arc<nexus_sinks::SinkRegistry>,
 }
 
 pub fn router(state: ApiState) -> Router {
@@ -138,6 +164,20 @@ pub fn router(state: ApiState) -> Router {
         // PreferredUsbLabel handle in one go so the next clip
         // honours the change without a restart.
         .route("/v1/admin/runtime/usb_preferred", put(put_usb_preferred))
+        // M7 Step 6 — global delivery settings (singleton). GET
+        // is admin-gated for symmetry with PUT (the schedule
+        // shape is mildly sensitive operational info). PUT
+        // emits `delivery.settings.changed` on the bus; the
+        // `delivery_reload` task in main.rs re-hydrates the
+        // dispatcher's policy cache without a restart.
+        .route(
+            "/v1/admin/delivery",
+            get(get_admin_delivery).put(put_admin_delivery),
+        )
+        // M7 Step 6 — sinks health card. Per-sink status counts
+        // over a 1h + 24h window, plus the registry list so
+        // configured-but-quiet sinks still get a card.
+        .route("/v1/admin/sinks/health", get(get_admin_sinks_health))
         // M2.2 closeout: core-next-native OAuth auth-code dance for
         // cloud cold backends. `start` and `status` are gated; the
         // `callback` route is registered outside the gate (the
@@ -211,8 +251,30 @@ pub fn router(state: ApiState) -> Router {
         )
         .route("/v1/clips/{id}", get(get_clip))
         .route("/v1/clips/{id}/thumbnail", get(get_clip_thumbnail))
+        .route("/v1/clips/{id}/tracks", get(get_clip_tracks))
+        .route("/v1/events/{event_id}/clip", get(get_event_clip_lookup))
+        // M7 Step 6 — per-event delivery history. Read-only.
+        // Returns every outbox row for the event (sink × attempt
+        // × status). Powers the per-event badge strip in the alert
+        // detail view.
+        .route("/v1/events/{event_id}/delivery", get(get_event_delivery))
+        // M7 Step 6 — per-rule delivery policy. GET returns the
+        // override (if any) + the resolved effective policy after
+        // the global cascade. PUT sets or clears the override and
+        // emits `rule.delivery_policy.changed` so the dispatcher
+        // re-hydrates the in-memory cache. Mirrors the existing
+        // `/api/rules/{id}` shape — not gated, since the rules
+        // CRUD it lives next to isn't either.
+        .route(
+            "/v1/rules/{id}/delivery",
+            get(get_rule_delivery).put(put_rule_delivery),
+        )
         // M2.2 cold-mirror — combined hot+cold view (read-only).
         .route("/v1/storage", get(get_storage))
+        // M-Admin Phase 5 — detector prompt catalog (read-only).
+        // Lets the UI render kind-appropriate label pickers in
+        // the camera + rules forms.
+        .route("/v1/models/prompts", get(get_model_prompts))
         // M2.2 closeout: OAuth callback for the auth-code dance.
         // Registered OUTSIDE the admin gate (provider redirects a
         // browser here; authentication is via the unguessable
@@ -220,6 +282,16 @@ pub fn router(state: ApiState) -> Router {
         .route("/v1/admin/oauth/{provider}/callback", get(oauth_callback))
         // Admin writes (gated) merged in last so they share state.
         .merge(admin);
+
+    // M7 Step 6F2 — dev-only event-injection endpoint. Lives
+    // OUTSIDE the admin gate by design (the e2e fixture runs
+    // under `auth.mode = "none"` on loopback). Compiled out
+    // entirely unless the `test-injection` cargo feature is on.
+    #[cfg(feature = "test-injection")]
+    let api = api.route(
+        "/v1/_test/inject_event",
+        axum::routing::post(crate::test_inject::post_inject_event),
+    );
 
     let static_dir = ServeDir::new(state.ui_root.clone()).append_index_html_on_directories(true);
 
@@ -354,6 +426,7 @@ async fn upsert_rule(
             &serde_json::to_value(&rule).unwrap_or(serde_json::Value::Null),
         )
         .await?;
+    reload_rules_into_evaluator(&s, "upsert", &id).await;
     Ok(Json(rule))
 }
 
@@ -370,7 +443,58 @@ async fn delete_rule(
             &serde_json::json!({}),
         )
         .await?;
+    reload_rules_into_evaluator(&s, "delete", &id).await;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Push the current rule set from the store into the shared
+/// [`RuleEvaluator`] so the next frame evaluated by every
+/// per-camera supervisor sees the edit. Best-effort: we already
+/// returned success to the admin caller (DB write + audit
+/// succeeded), so a reload failure here is logged at WARN but
+/// does not fail the response. On next engine restart the rules
+/// are recompiled from the store regardless, so this is
+/// strictly a hot-reload accelerator — never the source of
+/// truth.
+///
+/// Failure modes:
+///   * `store.list_rules` fails — almost certainly a DB-level
+///     issue that the caller's previous write would also have
+///     surfaced; log it.
+///   * `evaluator.reload` fails — a *different* rule in the
+///     store has an invalid `when` clause that `compile_cel_safely`
+///     never had a chance to catch (e.g. it was written by an
+///     older build that didn't validate). Log the offending
+///     rule id so the operator can find and fix it.
+async fn reload_rules_into_evaluator(s: &ApiState, op: &str, rule_id: &RuleId) {
+    match s.store.list_rules().await {
+        Ok(rules) => {
+            if let Err(e) = s.evaluator.reload(&rules) {
+                tracing::warn!(
+                    op,
+                    rule = %rule_id,
+                    "rule {op} persisted but evaluator reload failed: {e}; \
+                     supervisors will keep using the previously-compiled \
+                     rule set until next engine restart"
+                );
+            } else {
+                tracing::info!(
+                    op,
+                    rule = %rule_id,
+                    count = rules.len(),
+                    "rule {op}: evaluator reloaded"
+                );
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                op,
+                rule = %rule_id,
+                "rule {op} persisted but re-reading rules from store \
+                 for evaluator reload failed: {e}"
+            );
+        }
+    }
 }
 
 /// M-Admin Phase 5 — compile-only CEL validation endpoint.
@@ -1064,6 +1188,22 @@ async fn get_backends(State(s): State<ApiState>) -> Json<BackendsResponse> {
 }
 
 // ---------------------------------------------------------------------------
+// M-Admin Phase 5 — detector prompt catalog (read-only).
+// ---------------------------------------------------------------------------
+
+/// `GET /api/v1/models/prompts` — surface the prompt vocabulary the
+/// engine's currently-loaded detector kinds will actually emit. The
+/// UI uses this so the camera + rules forms render a kind-appropriate
+/// chip strip (closed-vocab COCO) or free-text + suggestions box
+/// (open-vocab yolo_world). See `models_catalog.rs` for how the
+/// catalog is built.
+async fn get_model_prompts(
+    State(s): State<ApiState>,
+) -> Json<crate::models_catalog::ModelPromptsCatalog> {
+    Json((*s.model_prompts).clone())
+}
+
+// ---------------------------------------------------------------------------
 // M2.1 Stage A — storage / motion / clips endpoints
 // ---------------------------------------------------------------------------
 
@@ -1700,6 +1840,147 @@ async fn generate_thumbnail_or_err(
         StatusCode::SERVICE_UNAVAILABLE,
         "thumbnails require the 'gstreamer' feature".to_string(),
     ))
+}
+
+/// Response body for `GET /api/v1/clips/:id/tracks`.
+///
+/// Powers the per-clip bbox overlay on the UI clip-modal player.
+/// We bundle a small `clip` summary (`id`, `camera_id`, `started_at`,
+/// `ended_at`, `duration_ms`) alongside the per-event rows so the
+/// UI can map each event's wall-clock `captured_at` to a
+/// `<video>.currentTime` offset without a second round-trip.
+///
+/// Bbox coordinates in each event are in **supervisor-frame
+/// pixels** (currently a hardcoded 960×540 set by `RtspSource`'s
+/// videoscale caps), NOT the MP4 clip's native resolution. The
+/// `source_width`/`source_height` fields publish those dimensions
+/// so the UI can scale per draw call:
+///   `pixelOnVideo = bbox.x * (videoWidth / source_width)`.
+/// Without this rescale the boxes would render at half-size in
+/// the top-left quadrant on any camera whose RTSP feed is wider
+/// than 960×540 (i.e. essentially all of them).
+///
+/// `trigger_track_ids` is the de-duplicated set of `events.track_id`
+/// values whose alert rows were stamped against this `clip_id`.
+/// The UI filters the draw loop to ONLY these tracks so reviewers
+/// see the object that triggered the alert, not every passing car
+/// or shadow that the tracker happened to label during the clip
+/// window. Empty when the clip has no linked alerts (motion-only
+/// recording, or all alert rows have NULL track_id) — the UI
+/// shows the bare video with no overlay in that case.
+#[derive(serde::Serialize)]
+struct ClipTracksResponse {
+    clip: ClipTracksSummary,
+    /// Pixel width of the coordinate space the bbox values live
+    /// in. See struct-level doc for why this is NOT the MP4's
+    /// `videoWidth`.
+    source_width: u32,
+    /// See [`ClipTracksResponse::source_width`].
+    source_height: u32,
+    /// Track ids that triggered an alert linked to this clip.
+    /// See struct-level doc for the UI's filtering contract.
+    trigger_track_ids: Vec<i64>,
+    events: Vec<nexus_store::MotionEventRow>,
+}
+
+#[derive(serde::Serialize)]
+struct ClipTracksSummary {
+    id: i64,
+    camera_id: CameraId,
+    started_at: chrono::DateTime<chrono::Utc>,
+    ended_at: Option<chrono::DateTime<chrono::Utc>>,
+    duration_ms: i64,
+}
+
+/// `GET /api/v1/clips/:id/tracks` — return the per-track lifecycle
+/// rows recorded against this clip (`born` / `updated` / `died`),
+/// in `captured_at ASC` order. Used by the UI clip player to draw
+/// bounding boxes on a transparent `<canvas>` synced to the video
+/// timeline; see [`ClipTracksResponse`] above for the wire shape.
+///
+/// 404 when the clip row is missing. We do NOT 404 on "clip exists
+/// but has zero motion_events" — the UI still wants the summary
+/// so it can render the bare video without overlays.
+async fn get_clip_tracks(
+    State(s): State<ApiState>,
+    Path(clip_id): Path<i64>,
+) -> Result<Json<ClipTracksResponse>, ApiError> {
+    let clip = s
+        .store
+        .get_clip(clip_id)
+        .await
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("clip {clip_id} not found")))?;
+
+    let events = s
+        .store
+        .list_motion_events_for_clip(clip_id)
+        .await
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let trigger_track_ids = s
+        .store
+        .list_event_track_ids_for_clip(clip_id)
+        .await
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(ClipTracksResponse {
+        clip: ClipTracksSummary {
+            id: clip.id,
+            camera_id: clip.camera_id,
+            started_at: clip.started_at,
+            ended_at: clip.ended_at,
+            duration_ms: clip.duration_ms,
+        },
+        source_width: nexus_pipeline::RTSP_SOURCE_FRAME_WIDTH,
+        source_height: nexus_pipeline::RTSP_SOURCE_FRAME_HEIGHT,
+        trigger_track_ids,
+        events,
+    }))
+}
+
+/// Response body for `GET /api/v1/events/:event_id/clip`.
+///
+/// Tiny lookup the live-alert ticker calls when the user hits the
+/// "play" button on a card. The SSE alert payload itself can't
+/// carry `clip_id` because the supervisor links events to clips
+/// AFTER the bus broadcast (see `link_event_to_clip` in
+/// `supervisor.rs`); this endpoint closes the loop on demand.
+#[derive(serde::Serialize)]
+struct EventClipResponse {
+    clip_id: i64,
+}
+
+/// `GET /api/v1/events/:event_id/clip` — return the clip id the
+/// supervisor stamped against this alert, if any.
+///
+/// Status codes:
+///   * 200 + `{clip_id}` — event exists AND has a linked clip.
+///   * 404 — event doesn't exist, OR exists but `clip_id IS NULL`
+///     (the link race lost OR the alert fired on a frame with no
+///     open recorder). The UI treats both the same way: "no clip
+///     to open right now".
+async fn get_event_clip_lookup(
+    State(s): State<ApiState>,
+    Path(event_id): Path<String>,
+) -> Result<Json<EventClipResponse>, ApiError> {
+    let clip_id = s
+        .store
+        .get_event_clip_id(&event_id)
+        .await
+        .map_err(|e| match e {
+            nexus_store::StoreError::NotFound(_) => {
+                ApiError(StatusCode::NOT_FOUND, format!("event {event_id} not found"))
+            }
+            other => ApiError(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+        })?
+        .ok_or_else(|| {
+            ApiError(
+                StatusCode::NOT_FOUND,
+                format!("event {event_id} has no linked clip"),
+            )
+        })?;
+    Ok(Json(EventClipResponse { clip_id }))
 }
 
 // ---------------------------------------------------------------------------
@@ -2373,6 +2654,283 @@ async fn put_usb_preferred(
         )
         .await?;
     Ok(Json(UsbPreferredOut { label: normalised }))
+}
+
+// ===========================================================================
+// M7 Step 6 — delivery-policy admin surface.
+//
+// Five HTTP endpoints wire the `CascadingPolicy` (steps 1–5) to the
+// admin UI:
+//
+//   GET  /api/v1/admin/delivery                 — global settings + schedule
+//   PUT  /api/v1/admin/delivery                 — atomic update; bus signal
+//   GET  /api/v1/admin/sinks/health             — per-sink counts (1h, 24h)
+//   GET  /api/v1/rules/{id}/delivery            — override + effective policy
+//   PUT  /api/v1/rules/{id}/delivery            — set/clear override
+//   GET  /api/v1/events/{event_id}/delivery     — per-sink × attempt history
+//
+// All writes round-trip through `Store::*` (the source of truth)
+// and publish on the bus so `delivery_reload.rs` picks them up;
+// the API handler never touches `CascadingPolicy` directly.
+// ===========================================================================
+
+/// `PUT /api/v1/admin/delivery` request body. We accept exactly
+/// what the GET returns minus `updated_at` (server-stamped). Both
+/// `schedule` and `timezone` are optional in the wire shape so the
+/// UI can ship a "toggle only" PUT without re-sending the grid;
+/// missing fields collapse to the obvious defaults
+/// (schedule=None, timezone="UTC").
+#[derive(serde::Deserialize)]
+struct PutAdminDeliveryReq {
+    enabled: bool,
+    #[serde(default)]
+    schedule: Option<nexus_types::DeliverySchedule>,
+    #[serde(default)]
+    timezone: Option<String>,
+}
+
+async fn get_admin_delivery(
+    State(s): State<ApiState>,
+) -> Result<Json<nexus_types::DeliverySettings>, ApiError> {
+    let settings = s.store.delivery_settings_get().await?;
+    Ok(Json(settings))
+}
+
+async fn put_admin_delivery(
+    State(s): State<ApiState>,
+    Json(req): Json<PutAdminDeliveryReq>,
+) -> Result<Json<nexus_types::DeliverySettings>, ApiError> {
+    let timezone = req
+        .timezone
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "UTC".to_string());
+    // Defend the dispatcher: a tz string we can't parse would
+    // silently fall back to UTC inside the policy with a warn.
+    // 400'ing here surfaces operator typos at form-submit time.
+    if timezone.parse::<chrono_tz::Tz>().is_err() {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            format!("unknown IANA timezone: {timezone:?}"),
+        ));
+    }
+    let settings = nexus_types::DeliverySettings {
+        enabled: req.enabled,
+        schedule: req.schedule,
+        timezone,
+        updated_at: chrono::Utc::now(),
+    };
+    // `delivery_settings_put` re-validates the schedule grid
+    // (7 × 48) and surfaces a 500 on shape mismatch via the
+    // default StoreError conversion — that's fine because the
+    // caller has no way to produce a malformed grid through a
+    // well-formed JSON body unless they bypassed the UI.
+    s.store.delivery_settings_put(&settings).await?;
+    s.store
+        .write_audit(
+            "api",
+            "put",
+            "admin/delivery",
+            &serde_json::to_value(&settings).unwrap_or(serde_json::Value::Null),
+        )
+        .await?;
+    // Sentinel payload — the reload task always re-reads the
+    // store. `_ =`d so a saturated bus doesn't fail the write.
+    let _ = s
+        .bus
+        .publish(topic::DELIVERY_SETTINGS_CHANGED, &serde_json::json!({}))
+        .await;
+    Ok(Json(settings))
+}
+
+/// Response body for `GET /api/v1/rules/{id}/delivery`. The
+/// `effective` block is the same shape regardless of inheritance,
+/// so the UI can render it without a conditional. `inherited =
+/// true` ⇔ `policy = null`.
+#[derive(serde::Serialize)]
+struct RuleDeliveryResp {
+    /// The per-rule override exactly as stored. `None` means the
+    /// rule inherits global.
+    policy: Option<nexus_types::RuleDeliveryPolicy>,
+    /// Resolved policy after the cascade: rule.enabled (or
+    /// global.enabled if no override), rule.schedule (or
+    /// global.schedule if no rule schedule).
+    effective: nexus_types::RuleDeliveryPolicy,
+    /// True ⇔ `policy is None`. Convenience so the UI doesn't
+    /// have to introspect.
+    inherited: bool,
+}
+
+async fn get_rule_delivery(
+    State(s): State<ApiState>,
+    Path(rule_id): Path<RuleId>,
+) -> Result<Json<RuleDeliveryResp>, ApiError> {
+    let policy = s.store.rule_delivery_policy_get(&rule_id).await?;
+    let settings = s.store.delivery_settings_get().await?;
+    let effective = nexus_types::RuleDeliveryPolicy {
+        // Both gates must be open for delivery; the dispatcher's
+        // cascade lives in `nexus_sinks::policy::evaluate_cascade`.
+        // Here we just project the same logic into a UI shape.
+        enabled: settings.enabled && policy.as_ref().map(|p| p.enabled).unwrap_or(true),
+        // Rule schedule REPLACES global (does not intersect),
+        // matching the dispatcher's resolution order.
+        schedule: policy
+            .as_ref()
+            .and_then(|p| p.schedule.clone())
+            .or_else(|| settings.schedule.clone()),
+    };
+    let inherited = policy.is_none();
+    Ok(Json(RuleDeliveryResp {
+        policy,
+        effective,
+        inherited,
+    }))
+}
+
+/// `PUT /api/v1/rules/{id}/delivery` body. Use `{"policy": null}`
+/// to clear the override and revert the rule to inheriting global;
+/// use `{"policy": { ... }}` to set/replace it. A bare-null body
+/// is technically valid JSON but tends to surprise callers, so we
+/// require the wrapper.
+#[derive(serde::Deserialize)]
+struct PutRuleDeliveryReq {
+    #[serde(default)]
+    policy: Option<nexus_types::RuleDeliveryPolicy>,
+}
+
+async fn put_rule_delivery(
+    State(s): State<ApiState>,
+    Path(rule_id): Path<RuleId>,
+    Json(req): Json<PutRuleDeliveryReq>,
+) -> Result<StatusCode, ApiError> {
+    s.store
+        .rule_delivery_policy_put(&rule_id, req.policy.as_ref())
+        .await
+        .map_err(|e| match e {
+            nexus_store::StoreError::NotFound(msg) => ApiError(StatusCode::NOT_FOUND, msg),
+            other => other.into(),
+        })?;
+    s.store
+        .write_audit(
+            "api",
+            "put",
+            &format!("rules/{rule_id}/delivery"),
+            &serde_json::to_value(&req.policy).unwrap_or(serde_json::Value::Null),
+        )
+        .await?;
+    let _ = s
+        .bus
+        .publish(
+            topic::RULE_DELIVERY_POLICY_CHANGED,
+            &serde_json::json!({ "rule_id": rule_id }),
+        )
+        .await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn get_event_delivery(
+    State(s): State<ApiState>,
+    Path(event_id): Path<String>,
+) -> Result<Json<Vec<nexus_store::OutboxRow>>, ApiError> {
+    let rows = s.store.outbox_for_event(&event_id).await?;
+    Ok(Json(rows))
+}
+
+/// Response body for `GET /api/v1/admin/sinks/health`. The window
+/// labels (`1h`, `24h`) double as object keys so the UI can index
+/// directly without a switch on numeric seconds.
+#[derive(serde::Serialize)]
+struct SinksHealthResp {
+    /// Window definitions for the UI's tab strip / column headers.
+    /// Order matches the `last_*` keys on `SinkHealthRow.counts`
+    /// so a future "last 7d" tab is a one-line add.
+    windows: Vec<SinksHealthWindow>,
+    /// One row per sink. Rows are union of (configured sinks,
+    /// historical sinks present in the outbox) so the UI shows a
+    /// card for a freshly-added sink that hasn't seen traffic AND
+    /// for an orphan from a deleted sink (so operators can
+    /// reconcile).
+    sinks: Vec<SinkHealthRow>,
+}
+
+#[derive(serde::Serialize)]
+struct SinksHealthWindow {
+    label: &'static str,
+    secs: i64,
+}
+
+#[derive(serde::Serialize)]
+struct SinkHealthRow {
+    sink_id: String,
+    /// True ⇔ this sink id is present in the live `SinkRegistry`.
+    /// False ⇔ the rows belong to a deleted sink (still listed so
+    /// operators can see the orphan and run the dead-letter purge).
+    configured: bool,
+    /// Counts keyed by window label.
+    counts: std::collections::BTreeMap<&'static str, nexus_store::OutboxSinkCounts>,
+}
+
+const HEALTH_WINDOWS: &[(&str, i64)] = &[("1h", 3_600), ("24h", 86_400)];
+
+async fn get_admin_sinks_health(
+    State(s): State<ApiState>,
+) -> Result<Json<SinksHealthResp>, ApiError> {
+    let now = chrono::Utc::now();
+    // Per-window stats keyed by sink_id.
+    let mut by_sink: std::collections::BTreeMap<
+        String,
+        std::collections::BTreeMap<&'static str, nexus_store::OutboxSinkCounts>,
+    > = std::collections::BTreeMap::new();
+    for (label, secs) in HEALTH_WINDOWS {
+        let since = now - chrono::Duration::seconds(*secs);
+        let rows = s.store.outbox_counts_since(since).await?;
+        for r in rows {
+            by_sink
+                .entry(r.sink_id.clone())
+                .or_default()
+                .insert(*label, r);
+        }
+    }
+    // Union with the live registry so configured-but-quiet sinks
+    // still appear. `SinkId::to_string()` matches the format the
+    // outbox stores.
+    let configured: std::collections::BTreeSet<String> = s
+        .sink_registry
+        .ids()
+        .into_iter()
+        .map(|id| id.to_string())
+        .collect();
+    for id in &configured {
+        by_sink.entry(id.clone()).or_default();
+    }
+
+    let sinks = by_sink
+        .into_iter()
+        .map(|(sink_id, mut counts)| {
+            // Backfill every window so the UI doesn't have to
+            // null-check — a window with no rows shows as zeros.
+            for (label, _) in HEALTH_WINDOWS {
+                counts
+                    .entry(*label)
+                    .or_insert_with(|| nexus_store::OutboxSinkCounts {
+                        sink_id: sink_id.clone(),
+                        ..Default::default()
+                    });
+            }
+            SinkHealthRow {
+                configured: configured.contains(&sink_id),
+                sink_id,
+                counts,
+            }
+        })
+        .collect();
+
+    let windows = HEALTH_WINDOWS
+        .iter()
+        .map(|(label, secs)| SinksHealthWindow { label, secs: *secs })
+        .collect();
+
+    Ok(Json(SinksHealthResp { windows, sinks }))
 }
 
 // ===========================================================================
@@ -3562,9 +4120,18 @@ mod tests {
         let usb_registry = UsbRegistry::new();
         let preferred_usb_label = nexus_pipeline::recorder::PreferredUsbLabel::new(None);
         let admin_auth = Arc::new(AdminAuthState::from_secret_bytes(admin_secret, false));
+        let rules_cfg = nexus_config::RulesConfig {
+            backend: nexus_config::RulesBackendKind::Cel,
+            inline: vec![],
+        };
+        let evaluator = Arc::new(
+            nexus_rules::RuleEvaluator::new(&rules_cfg, &[])
+                .expect("empty rule set always compiles"),
+        );
         let state = super::ApiState {
             store: store.clone(),
             bus,
+            evaluator,
             cache,
             pool: None,
             ui_root: dir.path().join("ui-unused"),
@@ -3579,6 +4146,17 @@ mod tests {
             admin_auth,
             oauth_sessions: crate::oauth_sessions::OAuthSessions::new(),
             discovery_sessions: crate::discovery::DiscoverySessions::new(),
+            // Empty catalog — tests don't exercise
+            // `GET /v1/models/prompts`; the engine integration
+            // tests cover it end-to-end.
+            model_prompts: Arc::new(crate::models_catalog::ModelPromptsCatalog {
+                default_kind: "mock".into(),
+                kinds: vec![],
+            }),
+            // M7 Step 6 — empty sink registry by default; the
+            // delivery-policy tests below populate it when they
+            // exercise the sinks-health endpoint.
+            sink_registry: Arc::new(nexus_sinks::SinkRegistry::new()),
         };
         let app = super::router(state);
         (app, store, dir)
@@ -3802,5 +4380,414 @@ mod tests {
             StatusCode::NOT_FOUND,
             "unknown session id should be NOT_FOUND, not 405/405"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // M7 Step 6 — delivery-policy admin surface tests.
+    //
+    // Each test stands up its own router so the inserted rows
+    // (rules, motion_events, outbox entries) don't leak. We exercise
+    // the HTTP round-trip rather than the handler fn directly so the
+    // admin auth gate, the route layout, and the JSON shapes are all
+    // covered end-to-end.
+    // -------------------------------------------------------------------
+
+    /// GET /api/v1/admin/delivery returns the seeded singleton row
+    /// (migration 0007 seeds `enabled=1, schedule=null, tz=UTC`).
+    #[tokio::test]
+    async fn admin_delivery_get_returns_seeded_defaults() {
+        use axum::body::to_bytes;
+        const SECRET: &[u8] = b"m7-admin-delivery-get-secret";
+        let (app, _store, _dir) = build_test_router(Some(SECRET)).await;
+        let token = sign_admin_jwt(SECRET);
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/admin/delivery")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = to_bytes(res.into_body(), 64 * 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["enabled"], serde_json::Value::Bool(true));
+        assert_eq!(v["timezone"], serde_json::Value::String("UTC".into()));
+        assert!(v["schedule"].is_null());
+    }
+
+    /// PUT /api/v1/admin/delivery writes a 7×48 schedule, then the
+    /// follow-up GET reads it back. Round-trips through SQLite.
+    #[tokio::test]
+    async fn admin_delivery_put_then_get_round_trip() {
+        use axum::body::to_bytes;
+        const SECRET: &[u8] = b"m7-admin-delivery-put-secret";
+        let (app, _store, _dir) = build_test_router(Some(SECRET)).await;
+        let token = sign_admin_jwt(SECRET);
+
+        // Build a never-schedule then flip a single slot true so we
+        // can detect a misindex in the round-trip.
+        let mut grid = vec![vec![false; 48]; 7];
+        grid[3][10] = true; // Thursday, 05:00–05:30
+        let put_body = serde_json::json!({
+            "enabled": true,
+            "timezone": "America/Los_Angeles",
+            "schedule": { "grid": grid },
+        });
+        let mut req = Request::builder()
+            .method(Method::PUT)
+            .uri("/api/v1/admin/delivery")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from(put_body.to_string()))
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // Now GET and confirm.
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/admin/delivery")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = to_bytes(res.into_body(), 64 * 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["enabled"], serde_json::Value::Bool(true));
+        assert_eq!(
+            v["timezone"],
+            serde_json::Value::String("America/Los_Angeles".into())
+        );
+        assert_eq!(v["schedule"]["grid"][3][10], serde_json::Value::Bool(true));
+        assert_eq!(v["schedule"]["grid"][3][9], serde_json::Value::Bool(false));
+    }
+
+    /// PUT /api/v1/admin/delivery rejects an unknown IANA tz with a
+    /// 400 so the operator catches typos at form-submit time
+    /// (otherwise the policy silently falls back to UTC).
+    #[tokio::test]
+    async fn admin_delivery_put_rejects_unknown_timezone() {
+        const SECRET: &[u8] = b"m7-admin-delivery-bad-tz-secret";
+        let (app, _store, _dir) = build_test_router(Some(SECRET)).await;
+        let token = sign_admin_jwt(SECRET);
+        let body = serde_json::json!({
+            "enabled": true,
+            "timezone": "Mars/Olympus_Mons",
+            "schedule": null,
+        });
+        let mut req = Request::builder()
+            .method(Method::PUT)
+            .uri("/api/v1/admin/delivery")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// Admin gate: PUT without a bearer is 401. The handler must
+    /// never run; we don't bother checking the body.
+    #[tokio::test]
+    async fn admin_delivery_put_requires_bearer() {
+        const SECRET: &[u8] = b"m7-admin-delivery-gate-secret";
+        let (app, _store, _dir) = build_test_router(Some(SECRET)).await;
+        let mut req = Request::builder()
+            .method(Method::PUT)
+            .uri("/api/v1/admin/delivery")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({"enabled": false}).to_string(),
+            ))
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// GET /api/v1/rules/{id}/delivery for a rule that has no
+    /// override returns `inherited=true` with `policy=null` and an
+    /// `effective` block resolved from global. Default seed:
+    /// enabled=true, schedule=null → effective enabled=true,
+    /// schedule=null.
+    #[tokio::test]
+    async fn rule_delivery_get_inherits_global_when_no_override() {
+        use axum::body::to_bytes;
+        const SECRET: &[u8] = b"m7-rule-delivery-inherit-secret";
+        let (app, store, _dir) = build_test_router(Some(SECRET)).await;
+
+        // Need an actual rule row so the FK check on
+        // rule_delivery_policy_put would pass — but the GET path
+        // also works for rule ids that don't exist (treated as
+        // "inherit global"). Insert one anyway so the test mirrors
+        // the realistic flow.
+        store
+            .upsert_rule(&nexus_config::RuleConfig {
+                id: "rule_test".into(),
+                name: "test rule".into(),
+                predicate: nexus_config::RulePredicate {
+                    when: "true".into(),
+                    severity: "low".into(),
+                },
+                gates: nexus_config::RuleGates::default(),
+                debounce: nexus_config::RuleDebounce {
+                    min_track_age_ms: 0,
+                    consecutive_frames: 1,
+                    cooldown_ms: 0,
+                },
+                enabled: true,
+            })
+            .await
+            .unwrap();
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/rules/rule_test/delivery")
+            .body(Body::empty())
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = to_bytes(res.into_body(), 64 * 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(v["policy"].is_null(), "no override → policy must be null");
+        assert_eq!(v["inherited"], serde_json::Value::Bool(true));
+        assert_eq!(v["effective"]["enabled"], serde_json::Value::Bool(true));
+        assert!(v["effective"]["schedule"].is_null());
+    }
+
+    /// PUT /api/v1/rules/{id}/delivery with a payload, then GET
+    /// reads it back. `inherited` flips to false. The rule's own
+    /// schedule REPLACES the (still-null) global one.
+    #[tokio::test]
+    async fn rule_delivery_put_then_get_round_trip() {
+        use axum::body::to_bytes;
+        const SECRET: &[u8] = b"m7-rule-delivery-put-secret";
+        let (app, store, _dir) = build_test_router(Some(SECRET)).await;
+        store
+            .upsert_rule(&nexus_config::RuleConfig {
+                id: "rule_put".into(),
+                name: "put".into(),
+                predicate: nexus_config::RulePredicate {
+                    when: "true".into(),
+                    severity: "low".into(),
+                },
+                gates: nexus_config::RuleGates::default(),
+                debounce: nexus_config::RuleDebounce {
+                    min_track_age_ms: 0,
+                    consecutive_frames: 1,
+                    cooldown_ms: 0,
+                },
+                enabled: true,
+            })
+            .await
+            .unwrap();
+
+        let mut grid = vec![vec![false; 48]; 7];
+        grid[0][24] = true; // Monday noon
+        let put_body = serde_json::json!({
+            "policy": { "enabled": true, "schedule": { "grid": grid } }
+        });
+        let req = Request::builder()
+            .method(Method::PUT)
+            .uri("/api/v1/rules/rule_put/delivery")
+            .header("content-type", "application/json")
+            .body(Body::from(put_body.to_string()))
+            .unwrap();
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/rules/rule_put/delivery")
+            .body(Body::empty())
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = to_bytes(res.into_body(), 64 * 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["inherited"], serde_json::Value::Bool(false));
+        assert_eq!(v["policy"]["enabled"], serde_json::Value::Bool(true));
+        assert_eq!(
+            v["policy"]["schedule"]["grid"][0][24],
+            serde_json::Value::Bool(true)
+        );
+        // Rule schedule replaces global (which is null), so
+        // `effective.schedule` mirrors the rule's grid exactly.
+        assert_eq!(
+            v["effective"]["schedule"]["grid"][0][24],
+            serde_json::Value::Bool(true)
+        );
+    }
+
+    /// PUT /api/v1/rules/{id}/delivery with `{"policy": null}`
+    /// clears the override. GET then reports `inherited=true`.
+    #[tokio::test]
+    async fn rule_delivery_put_null_clears_override() {
+        use axum::body::to_bytes;
+        const SECRET: &[u8] = b"m7-rule-delivery-clear-secret";
+        let (app, store, _dir) = build_test_router(Some(SECRET)).await;
+        store
+            .upsert_rule(&nexus_config::RuleConfig {
+                id: "rule_clear".into(),
+                name: "clear".into(),
+                predicate: nexus_config::RulePredicate {
+                    when: "true".into(),
+                    severity: "low".into(),
+                },
+                gates: nexus_config::RuleGates::default(),
+                debounce: nexus_config::RuleDebounce {
+                    min_track_age_ms: 0,
+                    consecutive_frames: 1,
+                    cooldown_ms: 0,
+                },
+                enabled: true,
+            })
+            .await
+            .unwrap();
+
+        // Set then clear.
+        for body in [
+            serde_json::json!({"policy":{"enabled":false}}),
+            serde_json::json!({"policy": null}),
+        ] {
+            let req = Request::builder()
+                .method(Method::PUT)
+                .uri("/api/v1/rules/rule_clear/delivery")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            let res = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        }
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/rules/rule_clear/delivery")
+            .body(Body::empty())
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = to_bytes(res.into_body(), 64 * 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["inherited"], serde_json::Value::Bool(true));
+        assert!(v["policy"].is_null());
+    }
+
+    /// PUT /api/v1/rules/{id}/delivery for an unknown rule returns
+    /// 404. The store layer surfaces NotFound; the handler maps to
+    /// the right status (instead of leaking as a 500).
+    #[tokio::test]
+    async fn rule_delivery_put_unknown_rule_returns_404() {
+        const SECRET: &[u8] = b"m7-rule-delivery-404-secret";
+        let (app, _store, _dir) = build_test_router(Some(SECRET)).await;
+        let req = Request::builder()
+            .method(Method::PUT)
+            .uri("/api/v1/rules/no_such_rule/delivery")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({"policy":{"enabled":false}}).to_string(),
+            ))
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// GET /api/v1/events/{event_id}/delivery returns the outbox
+    /// rows for that event. We hand-craft the outbox by going
+    /// through the store's `record_event_and_enqueue` path so the
+    /// returned rows match exactly what the dispatcher would see.
+    #[tokio::test]
+    async fn event_delivery_lists_outbox_rows() {
+        use axum::body::to_bytes;
+        const SECRET: &[u8] = b"m7-event-delivery-secret";
+        let (app, store, _dir) = build_test_router(Some(SECRET)).await;
+
+        // Need a camera so the event FK is satisfied.
+        store
+            .upsert_camera(&nexus_config::CameraConfig {
+                id: 1,
+                name: "front".into(),
+                ingest: nexus_config::CameraIngest {
+                    url: url::Url::parse("rtsp://127.0.0.1/s").unwrap(),
+                    enabled: true,
+                    max_fps: 0,
+                },
+                detector: nexus_config::CameraDetector {
+                    prompts: vec![],
+                    model_override: None,
+                },
+                behavior: nexus_config::CameraBehavior {
+                    parking_lot_mode: false,
+                },
+                zones: vec![],
+            })
+            .await
+            .unwrap();
+        let ev = nexus_types::AlertEvent {
+            event_id: uuid::Uuid::now_v7(),
+            camera_id: 1,
+            rule_id: "rule_event_delivery".into(),
+            track_id: None,
+            label: "person".into(),
+            severity: nexus_types::Severity::Low,
+            bbox: None,
+            frame_id: 1,
+            captured_at: chrono::Utc::now(),
+            trace_id: "trace-test".into(),
+            artifacts: nexus_types::Artifacts::default(),
+            context: serde_json::Map::new(),
+        };
+        store
+            .record_event_and_enqueue(&ev, &["webhook:foo"])
+            .await
+            .unwrap();
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri(format!("/api/v1/events/{}/delivery", ev.event_id))
+            .body(Body::empty())
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = to_bytes(res.into_body(), 64 * 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let rows = v.as_array().expect("array");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["sink_id"], "webhook:foo");
+        assert_eq!(rows[0]["status"], "pending");
+        assert_eq!(rows[0]["attempts"], 0);
+    }
+
+    /// GET /api/v1/admin/sinks/health returns a card for every
+    /// configured sink even when the outbox is empty. With no
+    /// configured sinks and an empty outbox, `sinks` is `[]`.
+    #[tokio::test]
+    async fn sinks_health_empty_returns_window_grid() {
+        use axum::body::to_bytes;
+        const SECRET: &[u8] = b"m7-sinks-health-empty-secret";
+        let (app, _store, _dir) = build_test_router(Some(SECRET)).await;
+        let token = sign_admin_jwt(SECRET);
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/admin/sinks/health")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = to_bytes(res.into_body(), 64 * 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let windows = v["windows"].as_array().expect("windows array");
+        // We ship 1h + 24h windows by default.
+        assert_eq!(windows.len(), 2);
+        assert_eq!(windows[0]["label"], "1h");
+        assert_eq!(windows[1]["label"], "24h");
+        assert_eq!(v["sinks"].as_array().unwrap().len(), 0);
     }
 }

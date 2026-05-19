@@ -27,6 +27,11 @@ node_modules
 ui/dist
 ui/*.tsbuildinfo
 
+# Playwright e2e (M7 Step 6F)
+ui/playwright-report
+ui/test-results
+ui/e2e/.engine-state.json
+
 # Tooling caches
 .venv
 .venv-*

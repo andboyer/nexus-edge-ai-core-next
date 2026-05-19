@@ -23,6 +23,14 @@ ep-cuda = ["nexus-inference/ep-cuda"]
 ep-tensorrt = ["nexus-inference/ep-tensorrt"]
 ep-coreml = ["nexus-inference/ep-coreml"]
 ep-directml = ["nexus-inference/ep-directml"]
+# M7 Step 6F2 — dev-only event-injection endpoint at
+# `POST /api/v1/_test/inject_event`. Lets the Playwright e2e suite
+# fire AlertEvents into the outbox without needing a live RTSP
+# source + a deterministic-on-demand person track. NEVER enable in
+# production builds — the endpoint sits OUTSIDE the admin-auth gate
+# (so the e2e fixture can hit it under `auth.mode = "none"`) and
+# would let any caller inject arbitrary events. Off by default.
+test-injection = []
 
 [[bin]]
 name = "nexus-engine"
@@ -47,6 +55,14 @@ nexus-tracker = { workspace = true }
 nexus-inference = { workspace = true }
 nexus-pipeline = { workspace = true }
 nexus-storage = { workspace = true }
+# M7 — alert delivery. Defines `AlertSink`, `SinkRegistry`, and the
+# `SinkDispatcher` background task that drains `alert_sink_outbox`.
+# nexus-engine just spawns the dispatcher in main.rs; the timer loop
+# lives in `nexus_sinks::dispatcher` so it's library-testable.
+# The `webhook` feature pulls reqwest + hmac + sha2 + hex for the
+# JSON-POST sink — engines that ship without HTTP egress (rare in
+# practice) can drop it.
+nexus-sinks = { workspace = true, features = ["webhook"] }
 # Cloud cold backends (Google Drive, OneDrive). Brings reqwest +
 # OAuth + per-provider HTTP. The crate is always-on in nexus-engine
 # even though LAN-only deployments never instantiate a cloud
@@ -69,6 +85,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 chrono = { workspace = true }
+chrono-tz = { workspace = true }
 uuid = { workspace = true }
 url = { workspace = true }
 parking_lot = { workspace = true }
@@ -115,7 +132,10 @@ md-5 = { workspace = true }
 # per-process file-descriptor cap at startup before the LAN
 # discovery sweep opens ~3× concurrency sockets in parallel.
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.29", default-features = false, features = ["fs", "resource"] }
+nix = { version = "0.29", default-features = false, features = [
+    "fs",
+    "resource",
+] }
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -10,7 +10,11 @@ import { openDialog, dialogFooter, type DialogHandle } from "../lib/dialog.js";
 import { toast } from "../lib/toast.js";
 import { icon, iconButton } from "../lib/icons.js";
 import { openRuleForm } from "./rules-form.js";
-import type { CameraConfig, RuleConfig } from "../api/types.js";
+import type {
+  CameraConfig,
+  RuleConfig,
+  RuleDeliveryResponse,
+} from "../api/types.js";
 
 export async function renderRules(root: HTMLElement): Promise<void> {
   clear(root);
@@ -106,6 +110,22 @@ async function renderTable(
   const camById = new Map<number, string>();
   for (const c of cameras) camById.set(c.id, c.name);
 
+  // M7 Step 6E — per-rule delivery summaries for the Delivery
+  // column chip. N parallel GETs is fine at expected rule counts
+  // (~10s); a 404 on a newly-renamed rule swallows to `null` so
+  // the table still renders rather than going blank. The chip
+  // falls back to "—" for any null entry.
+  const policyById = new Map<string, RuleDeliveryResponse | null>();
+  const policyResults = await Promise.all(
+    rules.map((r) =>
+      api.delivery
+        .getRule(r.id)
+        .then((p) => [r.id, p] as const)
+        .catch(() => [r.id, null] as const),
+    ),
+  );
+  for (const [id, p] of policyResults) policyById.set(id, p);
+
   const tbl = h(
     "table",
     { class: "admin-table" },
@@ -121,13 +141,16 @@ async function renderTable(
         h("th", null, "Cameras"),
         h("th", null, "When"),
         h("th", null, "Enabled"),
+        h("th", null, "Delivery"),
         h("th", null, ""),
       ),
     ),
     h(
       "tbody",
       null,
-      ...rules.map((r) => row(r, rules, cameras, camById, onChange)),
+      ...rules.map((r) =>
+        row(r, rules, cameras, camById, policyById.get(r.id) ?? null, onChange),
+      ),
     ),
   );
   host.append(tbl);
@@ -138,6 +161,7 @@ function row(
   list: RuleConfig[],
   cameras: CameraConfig[],
   camById: Map<number, string>,
+  policy: RuleDeliveryResponse | null,
   onChange: () => Promise<void>,
 ): HTMLElement {
   const camerasCell =
@@ -160,6 +184,48 @@ function row(
         "disabled",
       );
 
+  // M7 Step 6E — Delivery column chip. Three visual states:
+  //   * Inherit (no per-rule policy on the server)
+  //   * Override (per-rule policy exists)
+  //   * Unknown (the per-rule GET failed; render "—" with the
+  //     reason in the tooltip so operators have something to
+  //     paste into a bug report)
+  let deliveryChip: HTMLElement;
+  if (policy === null) {
+    deliveryChip = h(
+      "span",
+      {
+        class: "state-pill",
+        title:
+          "Could not load this rule's delivery policy. Open the rule editor → Delivery section to inspect.",
+      },
+      "—",
+    );
+  } else if (policy.inherited) {
+    deliveryChip = h(
+      "span",
+      {
+        class: "state-pill delivery-chip-inherit",
+        title: "This rule uses the global delivery policy from the Alert Delivery tab.",
+      },
+      "inherit",
+    );
+  } else {
+    const parts: string[] = [];
+    parts.push(policy.effective.enabled ? "enabled" : "DISABLED");
+    parts.push(policy.effective.schedule ? "schedule" : "no schedule");
+    deliveryChip = h(
+      "span",
+      {
+        class:
+          "state-pill delivery-chip-override" +
+          (policy.effective.enabled ? "" : " delivery-chip-disabled"),
+        title: `Per-rule override (${parts.join(", ")}).`,
+      },
+      "override",
+    );
+  }
+
   return h(
     "tr",
     null,
@@ -169,6 +235,7 @@ function row(
     h("td", null, camerasCell),
     h("td", { class: "rule-when-cell" }, h("code", { class: "mono" }, r.when)),
     h("td", null, enabledPill),
+    h("td", null, deliveryChip),
     h(
       "td",
       { class: "actions" },

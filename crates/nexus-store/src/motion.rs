@@ -605,6 +605,65 @@ impl Store {
         rows.into_iter().map(motion_event_row_from_row).collect()
     }
 
+    /// Triggering track ids for a given clip — i.e. the
+    /// `events.track_id` values of every alert row that was
+    /// stamped against this `clip_id` by the supervisor's
+    /// `link_event_to_clip` call.
+    ///
+    /// Powers the "show only the alerting object" filter on the
+    /// per-clip overlay: the UI keeps the full event lifecycle
+    /// (born/updated/died) on every track but skips drawing
+    /// anything whose `track_id` isn't in this set. Empty result
+    /// means the clip exists with no linked alerts (motion-only
+    /// recording, or all alert rows have NULL track_id) — the UI
+    /// then draws no overlay.
+    ///
+    /// Rows with `track_id IS NULL` are filtered out; result is
+    /// de-duplicated since a single track can trigger multiple
+    /// alerts (different rules) on the same clip.
+    pub async fn list_event_track_ids_for_clip(
+        &self,
+        clip_id: ClipId,
+    ) -> Result<Vec<i64>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT DISTINCT track_id
+               FROM events
+              WHERE clip_id = ? AND track_id IS NOT NULL",
+        )
+        .bind(clip_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| r.get::<i64, _>("track_id"))
+            .collect())
+    }
+
+    /// Single-clip lookup. Powers the per-clip overlay endpoint
+    /// `GET /api/v1/clips/:id/tracks` — the UI player draws bboxes
+    /// on a canvas synced to `<video>.currentTime`, and each event
+    /// row carries the bbox + label + lifecycle kind needed to do
+    /// that drawing without re-querying. Rows are ordered by
+    /// `captured_at ASC` so the UI can walk forward in time as the
+    /// video plays without re-sorting.
+    pub async fn list_motion_events_for_clip(
+        &self,
+        clip_id: ClipId,
+    ) -> Result<Vec<MotionEventRow>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT id, camera_id, clip_id, track_id, kind, captured_at,
+                    bbox_x1, bbox_y1, bbox_x2, bbox_y2,
+                    label, confidence, attributes_json
+               FROM motion_events
+              WHERE clip_id = ?
+              ORDER BY captured_at ASC",
+        )
+        .bind(clip_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(motion_event_row_from_row).collect()
+    }
+
     /// Cross-camera timeline lookup. Powers the rule-preview endpoint
     /// (`POST /v1/admin/rules/preview`) — operators need to see "what
     /// past detections would my new rule have matched", regardless of

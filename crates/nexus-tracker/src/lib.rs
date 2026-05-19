@@ -30,7 +30,10 @@ pub mod zone_filter;
 pub use annotator::TrackAnnotator;
 pub use bytetrack::ByteTrackTracker;
 pub use motion::{MotionDecision, MotionEventEmitter, MotionKind};
-pub use static_object::StaticObjectFilter;
+pub use static_object::{
+    is_object_static, StaticObjectFilter, EMA_ATTRIBUTE_KEY, MOVING_FRAMES_ATTRIBUTE_KEY,
+    STATIC_ATTRIBUTE_KEY, STATIC_FRAMES_ATTRIBUTE_KEY,
+};
 pub use zone_filter::filter_excluded_zones;
 
 // ---------------------------------------------------------------------------

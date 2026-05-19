@@ -7,6 +7,7 @@
 
 #![forbid(unsafe_code)]
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use nexus_types::CameraId;
@@ -93,6 +94,13 @@ pub struct Config {
     pub bus: BusConfig,
     #[serde(default)]
     pub cameras: Vec<CameraConfig>,
+    /// M7 alert-delivery sinks. Each entry maps 1:1 onto a
+    /// registered `nexus_sinks::AlertSink`. Empty list (the
+    /// default) means “engine records every alert locally but
+    /// never ships anything off the box” — the dispatcher still
+    /// runs and the outbox stays empty.
+    #[serde(default)]
+    pub sinks: Vec<SinkConfig>,
 }
 
 impl Config {
@@ -153,6 +161,22 @@ impl Config {
                     cam.ingest.url.scheme()
                 )));
             }
+        }
+        // M7 — sink ids must be unique. The dispatcher keys every
+        // `alert_sink_outbox` row by `<kind>:<name>`; duplicates
+        // would make outbox rows ambiguous and the registry would
+        // silently drop one of the duplicates on `replace()`.
+        let mut seen = HashSet::new();
+        for sink in &self.sinks {
+            let key = (sink.kind(), sink.name());
+            if !seen.insert(key) {
+                return Err(ConfigError::Validation(format!(
+                    "duplicate sink id '{}:{}' (each <kind>:<name>) pair must be unique)",
+                    sink.kind(),
+                    sink.name()
+                )));
+            }
+            sink.validate()?;
         }
         Ok(())
     }
@@ -918,6 +942,14 @@ pub struct StaticObjectConfig {
     /// persistent anchor. v1 default: 40.
     #[serde(default = "default_static_object_match_distance_pixels")]
     pub match_distance_pixels: u32,
+    /// Pixel jump above which the per-track FSM state is wiped on the
+    /// assumption that the upstream tracker has recycled this
+    /// `track_id` onto a different physical object. Without this the
+    /// new vehicle inherits the previous track's `static_promoted`
+    /// flag and gets suppressed despite never having been parked.
+    /// Set to `0` to disable the guard. Default: 60.
+    #[serde(default = "default_static_object_track_id_reuse_reset_pixels")]
+    pub track_id_reuse_reset_pixels: u32,
     /// When true, write/load the per-camera anchor registry to disk
     /// under `runtime.state_dir`. v1 default: true.
     #[serde(default = "default_true")]
@@ -932,6 +964,7 @@ impl Default for StaticObjectConfig {
             significant_movement_frames: default_static_object_significant_movement_frames(),
             movement_ema_alpha: default_static_object_movement_ema_alpha(),
             match_distance_pixels: default_static_object_match_distance_pixels(),
+            track_id_reuse_reset_pixels: default_static_object_track_id_reuse_reset_pixels(),
             persistence_enabled: true,
         }
     }
@@ -951,6 +984,9 @@ fn default_static_object_movement_ema_alpha() -> f32 {
 }
 fn default_static_object_match_distance_pixels() -> u32 {
     40
+}
+fn default_static_object_track_id_reuse_reset_pixels() -> u32 {
+    60
 }
 
 // ---------------------------------------------------------------------------
@@ -1100,6 +1136,136 @@ pub enum BusBackendKind {
 
 fn default_bus_capacity() -> usize {
     1024
+}
+
+// ---------------------------------------------------------------------------
+// Sinks (M7 alert delivery)
+// ---------------------------------------------------------------------------
+
+/// One configured alert-delivery sink. Tagged by `kind` so the
+/// engine knows which `nexus_sinks::AlertSink` to build at boot;
+/// `name` is operator-chosen and is the half of the `<kind>:<name>`
+/// SinkId every `alert_sink_outbox` row references.
+///
+/// Wire shape:
+///
+/// ```toml
+/// [[sinks]]
+/// kind = "webhook"
+/// name = "primary"
+/// url  = "https://example.com/nexus"
+/// hmac_secret = "shared-secret"  # optional
+/// timeout_secs = 10              # optional, default 10
+///
+/// [sinks.headers]                # optional
+/// "X-Tenant" = "acme"
+/// ```
+///
+/// Renaming a sink (changing `name` while keeping `kind`) is
+/// forbidden in M7 because outbox rows reference the historical
+/// id by string; the engine rejects validation if two entries
+/// share `(kind, name)`. Operators MUST delete + re-add to rename.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SinkConfig {
+    /// Generic HTTP webhook with optional HMAC-SHA256 signature.
+    /// v1 parity port of `webhook_retry_queue.cpp`.
+    Webhook(WebhookSinkConfig),
+}
+
+impl SinkConfig {
+    /// Discriminator — matches `nexus_sinks::AlertSink::kind`.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            SinkConfig::Webhook(_) => "webhook",
+        }
+    }
+
+    /// Operator-chosen identifier — the `<name>` half of the
+    /// `<kind>:<name>` SinkId every outbox row references.
+    pub fn name(&self) -> &str {
+        match self {
+            SinkConfig::Webhook(cfg) => &cfg.name,
+        }
+    }
+
+    /// Per-kind validation invoked from `Config::validate`. Cheap
+    /// structural checks only — the sink crate does protocol-level
+    /// validation lazily on first `deliver()` call.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        match self {
+            SinkConfig::Webhook(cfg) => cfg.validate(),
+        }
+    }
+}
+
+/// HTTP webhook sink configuration. JSON POST of the `AlertEvent`
+/// payload, optional shared-secret HMAC-SHA256 signature shipped
+/// in the `X-Nexus-Signature: sha256=<hex>` header (GitHub style),
+/// optional custom headers fan-out.
+///
+/// Retry + backoff lives in the dispatcher
+/// (`nexus_sinks::dispatcher`), not the sink — the sink does at
+/// most one HTTP attempt per `deliver()` call and classifies the
+/// outcome as `Transient` (5xx, 408, 429, network) or `Permanent`
+/// (other 4xx).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebhookSinkConfig {
+    /// Operator-chosen identifier (the `<name>` of the SinkId).
+    /// Must be unique across the `[[sinks]]` list. Stable across
+    /// config reloads — outbox rows reference it by string.
+    pub name: String,
+    /// Target HTTP(S) endpoint. The webhook sink POSTs the alert
+    /// JSON to this URL on every delivery attempt.
+    pub url: Url,
+    /// Optional custom request headers. Common use: tenant tags,
+    /// auth bearer tokens (set the `Authorization` header here).
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+    /// Optional shared secret. When set, the sink computes
+    /// `hex(hmac_sha256(secret, body))` and ships it in the
+    /// `X-Nexus-Signature: sha256=<hex>` header.
+    #[serde(default)]
+    pub hmac_secret: Option<String>,
+    /// Per-attempt HTTP timeout in seconds. The dispatcher's
+    /// retry backoff (500ms → 60s, 8 attempts) wraps this.
+    #[serde(default = "default_webhook_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+impl WebhookSinkConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.name.is_empty() {
+            return Err(ConfigError::Validation(
+                "webhook sink name must be non-empty".into(),
+            ));
+        }
+        if self.name.contains(':') {
+            return Err(ConfigError::Validation(format!(
+                "webhook sink name '{}' must not contain ':' (reserved as SinkId separator)",
+                self.name
+            )));
+        }
+        if self.url.scheme() != "http" && self.url.scheme() != "https" {
+            return Err(ConfigError::Validation(format!(
+                "webhook sink '{}' url scheme '{}' is not http(s)",
+                self.name,
+                self.url.scheme()
+            )));
+        }
+        if self.timeout_secs == 0 {
+            return Err(ConfigError::Validation(format!(
+                "webhook sink '{}' timeout_secs must be > 0",
+                self.name
+            )));
+        }
+        Ok(())
+    }
+}
+
+fn default_webhook_timeout_secs() -> u64 {
+    10
 }
 
 // ---------------------------------------------------------------------------

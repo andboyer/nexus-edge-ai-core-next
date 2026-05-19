@@ -1,0 +1,34 @@
+-- M7 alert delivery (Step 5): per-rule delivery policy override.
+--
+-- Adds a nullable JSON column to `rules`. When NULL the rule
+-- inherits the global `delivery_settings` verbatim (the common
+-- case). When non-NULL the value is a `RuleDeliveryPolicy`:
+--
+--   {
+--     "enabled":  bool,
+--     "schedule": { "grid": bool[7][48] } | null
+--   }
+--
+-- Cascade (from docs/M7_DELIVERY.md):
+--
+--   - `enabled = false` → every outbox row for this rule is
+--     suppressed with reason 'rule_disabled'. Global schedule
+--     irrelevant.
+--   - `schedule = Some(s)` → use `s` (REPLACES, does not
+--     intersect, the global schedule). Off-slot → suppressed
+--     with reason 'off_schedule_rule'.
+--   - `schedule = None` → fall through to the global schedule
+--     (suppression reason becomes 'off_schedule_global').
+--
+-- Why a JSON column instead of a side table:
+--   - Per-rule policy is read-mostly; the dispatcher pulls all of
+--     them into an in-memory cache (`Arc<ArcSwap<HashMap<RuleId,
+--     RuleDeliveryPolicy>>>`) at boot and reloads on the
+--     `rule.delivery_policy.changed` bus topic. There's no
+--     hot-path JOIN that would benefit from a normalised table.
+--   - The shape is already small and operator-edited as one
+--     blob (the UI's Delivery tab posts the whole struct).
+--   - Keeps the `rules` table a single source of truth — every
+--     other rule field is a JSON blob already (`config_json`).
+
+ALTER TABLE rules ADD COLUMN delivery_policy_json TEXT;

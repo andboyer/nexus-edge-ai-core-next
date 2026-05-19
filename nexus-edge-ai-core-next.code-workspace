@@ -3,6 +3,10 @@
     {
       "name": "nexus-edge-ai-core-next",
       "path": "."
+    },
+    {
+      "name": "nexus-cloud-console",
+      "path": "../nexus-cloud-console"
     }
   ],
   "settings": {

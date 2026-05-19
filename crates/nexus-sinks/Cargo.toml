@@ -1,0 +1,74 @@
+[package]
+name = "nexus-sinks"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# M7 alert delivery: defines the `AlertSink` trait, the `SinkId`
+# wire format, and the `SinkRegistry` the dispatcher reads on every
+# outbox row. Concrete impls (WebhookSink, SureViewSink) live behind
+# cargo features so a deployment that only needs one of them does
+# not pull the other's transitive deps.
+#
+# Plugin shape mirrors `nexus-tracker` / `nexus-rules`: a thin trait
+# crate, with impls as feature-gated modules in the same crate.
+# Promote to sibling crates only if a third-party sink shows up.
+
+[dependencies]
+nexus-types = { workspace = true }
+# Outbox CRUD + OutboxRow types. nexus-rules already depends on
+# nexus-store, so adding it here introduces no new transitive deps
+# for any consumer of `nexus-sinks::AlertSink`.
+nexus-store = { workspace = true }
+# Per-sink TOML config types (WebhookSinkConfig, SinkConfig enum).
+# Concrete sink impls (`WebhookSink::new(&WebhookSinkConfig)`) take
+# these by reference at engine boot.
+nexus-config = { workspace = true }
+async-trait = { workspace = true }
+parking_lot = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+# Dispatcher timer loop + retry math.
+tokio = { workspace = true }
+chrono = { workspace = true }
+# IANA timezone DB. CascadingPolicy resolves the operator-configured
+# DeliverySettings.timezone (e.g. "America/Los_Angeles") to a fixed
+# offset for each `now` it evaluates — handles DST transitions
+# correctly without operators having to think about UTC math.
+chrono-tz = { workspace = true }
+# Lock-free atomic reload of the cached DeliverySettings + per-rule
+# policy map on bus reload events. Pattern mirrors the storage cold
+# replicator's `Registry` swap.
+arc-swap = { workspace = true }
+
+# --- Optional, behind `webhook` feature -----------------------------------
+# The webhook sink pulls reqwest (rustls), hmac+sha2 (HMAC-SHA256
+# signature header), and hex (sig encoding). Operators that don't
+# need HTTP egress can compile nexus-sinks without these.
+reqwest = { workspace = true, optional = true }
+hmac = { version = "0.12", optional = true }
+sha2 = { version = "0.10", optional = true }
+hex = { workspace = true, optional = true }
+# url::Url is exposed in WebhookSink's struct field; reqwest already
+# pulls it transitively, so the only cost here is making it visible
+# to nexus-sinks's own code.
+url = { workspace = true, optional = true }
+
+[features]
+default = []
+# Builds the `WebhookSink` impl (HTTP POST + HMAC-SHA256 signature).
+webhook = ["dep:reqwest", "dep:hmac", "dep:sha2", "dep:hex", "dep:url"]
+
+[dev-dependencies]
+tempfile = { workspace = true }
+sqlx = { workspace = true }
+url = { workspace = true }
+uuid = { workspace = true }
+wiremock = { workspace = true }
+# wiremock spins a real tokio server; the dispatcher tests already
+# pull tokio's `macros` + `rt-multi-thread` via the workspace alias,
+# so just re-declaring the dep here is enough for `#[tokio::test]`.
+tokio = { workspace = true }

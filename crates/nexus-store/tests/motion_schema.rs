@@ -630,6 +630,9 @@ async fn schema_migrations_table_records_apply_order() {
             "0003_events_clip_cascade".to_string(),
             "0004_storage_backends".to_string(),
             "0005_runtime_settings".to_string(),
+            "0006_alert_sink_outbox".to_string(),
+            "0007_delivery_settings".to_string(),
+            "0008_rules_delivery_policy".to_string(),
         ]
     );
 }

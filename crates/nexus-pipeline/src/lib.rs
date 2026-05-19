@@ -37,6 +37,7 @@ pub use recorder::{
     ClipFinal, ClipHandle, ClipMeta, ClipRecorder, OpenClip, RecorderError, StubClipRecorder,
 };
 pub use source::{FailingSource, FrameSource, FrameSourceError, VirtualSource};
+pub use source::{RTSP_SOURCE_FRAME_HEIGHT, RTSP_SOURCE_FRAME_WIDTH};
 pub use supervisor::{spawn_camera, CameraHandle};
 
 #[cfg(feature = "gstreamer")]

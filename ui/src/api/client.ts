@@ -10,22 +10,32 @@ import type {
   CameraId,
   ClipId,
   DiscoverySession,
+  ClipTracksResponse,
+  DeliverySettings,
+  EventClipResponse,
+  EventId,
+  ModelPromptsResponse,
   MotionEventRow,
   MotionHistogramBucket,
   OAuthStartReq,
   OAuthStartResp,
   OAuthStatusResp,
+  OutboxRow,
   ProbeRtspReq,
   ProbeRtspResult,
+  PutAdminDeliveryRequest,
   PutBackendReq,
   PutColdReq,
+  PutRuleDeliveryRequest,
   RuleConfig,
+  RuleDeliveryResponse,
   RuleId,
   RulePreviewRequest,
   RulePreviewResponse,
   RuleValidateResponse,
   ScanReq,
   SessionCreatedResp,
+  SinksHealthResponse,
   StorageBackendOut,
   StorageLocalResponse,
   StorageResponse,
@@ -105,9 +115,27 @@ export const api = {
   events: {
     recent: (limit = 100) =>
       request<AlertEvent[]>(`/events?limit=${limit}`),
+    /// Look up the clip the supervisor linked to an alert event.
+    /// 404 when the event has no linked clip (either the alert
+    /// fired on a frame with no open recorder, or the SSE arrived
+    /// at the UI before the supervisor's `link_event_to_clip`
+    /// call landed). Callers should treat 404 as "no clip yet".
+    clip: (eventId: EventId) =>
+      request<EventClipResponse>(`/v1/events/${eventId}/clip`),
   },
 
   backends: () => request<BackendsResponse>("/backends"),
+
+  // M-Admin Phase 5 — detector prompt catalog. Snapshot taken at
+  // engine boot of every detector kind the router knows about
+  // plus its vocabulary. The camera + rules forms call this to
+  // render kind-appropriate label pickers (closed-vocab chip strip
+  // for COCO; free-text + suggestions for open-vocab yolo_world).
+  // Promise rejects on transport failure; callers should fall back
+  // to "no suggestions" rather than hard-fail the form.
+  models: {
+    prompts: () => request<ModelPromptsResponse>("/v1/models/prompts"),
+  },
 
   // M2.1 Stage B (B5) — motion timeline + on-disk clip storage.
   // Binary endpoints return URLs the caller embeds in <video>/<img>;
@@ -231,6 +259,11 @@ export const api = {
     streamUrl: (clipId: ClipId) => `${BASE}/v1/clips/${clipId}`,
     thumbnailUrl: (clipId: ClipId) =>
       `${BASE}/v1/clips/${clipId}/thumbnail`,
+    // Per-clip bbox overlay payload — the modal player draws
+    // bounding boxes on a transparent <canvas> synced to
+    // <video>.currentTime using these rows.
+    tracks: (clipId: ClipId) =>
+      request<ClipTracksResponse>(`/v1/clips/${clipId}/tracks`),
   },
 
   // M-Admin Phase 1B — camera discovery. Mirrors the four admin
@@ -269,5 +302,62 @@ export const api = {
         `/v1/admin/discovery/sessions/${encodeURIComponent(sessionId)}/probe-rtsp`,
         { method: "POST", body: JSON.stringify(req) },
       ),
+  },
+
+  // M7 Step 6 — alert delivery policy + sinks health.
+  //
+  // The two `admin/` routes go through the HS256 bearer gate (same
+  // `admin_auth_layer` as Storage Admin). The per-rule / per-event
+  // endpoints are ungated to match the rest of `/api/rules/:id`
+  // (admin-by-loopback for v1). `authHeader()` is already applied
+  // by the shared `request` helper for both cases.
+  delivery: {
+    /// Read the singleton `delivery_settings` row. Returns the
+    /// engine-seeded defaults on a fresh install (`enabled = true`,
+    /// `schedule = null`, `timezone = "UTC"`).
+    getAdmin: () => request<DeliverySettings>("/v1/admin/delivery"),
+    /// Atomic update. Engine validates the IANA timezone at the
+    /// API boundary (`400` on unknown) and re-validates the 7×48
+    /// grid shape before persisting. Publishes
+    /// `delivery.settings.changed` so the dispatcher's
+    /// `CascadingPolicy` hot-reloads without restart.
+    putAdmin: (req: PutAdminDeliveryRequest) =>
+      request<DeliverySettings>("/v1/admin/delivery", {
+        method: "PUT",
+        body: JSON.stringify(req),
+      }),
+    /// Per-rule override + cascade-resolved view. `inherited = true`
+    /// ⇔ `policy == null`. `effective` always carries the
+    /// resolved policy the dispatcher would use (cascade rules:
+    /// `enabled = global && (policy ?? true)`,
+    /// `schedule = policy.schedule ?? global.schedule`).
+    getRule: (ruleId: RuleId) =>
+      request<RuleDeliveryResponse>(
+        `/v1/rules/${encodeURIComponent(ruleId)}/delivery`,
+      ),
+    /// Set or clear the per-rule override. `{ policy: null }`
+    /// clears (rule reverts to inheriting global). Returns 204
+    /// and publishes `rule.delivery_policy.changed`. 404 if the
+    /// rule id does not exist.
+    putRule: (ruleId: RuleId, req: PutRuleDeliveryRequest) =>
+      request<void>(
+        `/v1/rules/${encodeURIComponent(ruleId)}/delivery`,
+        { method: "PUT", body: JSON.stringify(req) },
+      ),
+    /// Per-event delivery log — one row per (event × configured
+    /// sink), ordered by `id ASC`. Powers the alert-detail
+    /// delivery badges.
+    listForEvent: (eventId: EventId) =>
+      request<OutboxRow[]>(
+        `/v1/events/${encodeURIComponent(eventId)}/delivery`,
+      ),
+    /// Sinks-health card payload. The `sinks` array unions
+    /// configured-sinks ∪ historical-outbox-sinks; each row is
+    /// tagged with `configured: bool` so the operator sees both
+    /// freshly-added quiet sinks AND orphaned counts from deleted
+    /// sinks. `counts` is keyed by the window labels in
+    /// `windows[].label` (currently `"1h"` + `"24h"`).
+    sinksHealth: () =>
+      request<SinksHealthResponse>("/v1/admin/sinks/health"),
   },
 };

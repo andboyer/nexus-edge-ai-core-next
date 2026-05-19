@@ -319,6 +319,13 @@ export function ChipsInput(opts: {
   value: string[];
   placeholder?: string;
   helpText?: string;
+  /// Optional `<datalist>` source for type-ahead. Useful when the
+  /// underlying detector has a baked vocabulary (open-vocab
+  /// yolo_world): the operator can still type any string, but the
+  /// browser surfaces the known prompts as autocomplete picks so
+  /// they don't fat-finger a label the detector won't emit. Pass
+  /// an empty array (or omit) to disable.
+  suggestions?: ReadonlyArray<string>;
   onChange: (next: string[]) => void;
 }): HTMLElement {
   const value = [...opts.value];
@@ -360,12 +367,16 @@ export function ChipsInput(opts: {
     }
   }
 
+  // Stable, document-unique datalist id so multiple ChipsInputs
+  // on the same form (e.g. prompts + tags) don't pull each other's
+  // suggestions when the browser dedupes by id.
+  const datalistId = `chips-suggest-${++datalistSeq}`;
   const input = h("input", {
     type: "text",
     placeholder: opts.placeholder ?? "Type and press Enter…",
     class: "chip-input-text",
     on: {
-      keydown: (ev) => {
+      keydown: (ev: KeyboardEvent) => {
         const target = ev.currentTarget as HTMLInputElement;
         if (ev.key === "Enter" || ev.key === ",") {
           ev.preventDefault();
@@ -386,13 +397,32 @@ export function ChipsInput(opts: {
       },
     },
   });
+  // `HTMLInputElement.list` is a getter-only DOM property — assigning
+  // to it via h()'s prop bag throws `TypeError: Cannot set property
+  // list ... has only a getter`. Wire the datalist via the attribute
+  // instead.
+  if (opts.suggestions && opts.suggestions.length > 0) {
+    input.setAttribute("list", datalistId);
+  }
 
   renderChips();
-  const wrapper = h("div", { class: "chip-input" }, chips, input);
+  const wrapperChildren: (HTMLElement | Node)[] = [chips, input];
+  if (opts.suggestions && opts.suggestions.length > 0) {
+    const dl = h("datalist", { id: datalistId });
+    for (const s of opts.suggestions) {
+      dl.append(h("option", { value: s }));
+    }
+    wrapperChildren.push(dl);
+  }
+  const wrapper = h("div", { class: "chip-input" }, ...wrapperChildren);
   const meta: FieldMeta = {};
   if (opts.helpText !== undefined) meta.helpText = opts.helpText;
   return wrap(opts.label, wrapper, meta);
 }
+
+// Module-private counter — survives across calls so the IDs are
+// unique even when many ChipsInputs are mounted in the same dialog.
+let datalistSeq = 0;
 
 export function MultiSelect<V extends string>(opts: {
   label: string;

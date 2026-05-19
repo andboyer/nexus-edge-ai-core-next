@@ -49,3 +49,16 @@ spray paint can
 crowbar
 hammer
 shovel
+
+# --- Construction-site equipment (added 2026-05-18 for cam1
+#     "Construction Site" YOLO-World override; appended so existing
+#     class indices 0-34 are preserved per the file-header rule).
+excavator
+crane
+dump truck
+cement mixer
+bulldozer
+wheelbarrow
+traffic cone
+jersey barrier
+scaffolding

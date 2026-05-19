@@ -287,6 +287,157 @@ pub enum PipelineState {
 }
 
 // ---------------------------------------------------------------------------
+// M7 alert delivery (sinks + delivery policy)
+// ---------------------------------------------------------------------------
+//
+// Wire shapes shared by `nexus-sinks` (policy evaluation), `nexus-store`
+// (persistence in `delivery_settings` + `rules.delivery_policy_json`),
+// the Axum admin API, and the UI's `<WeeklyScheduleEditor>`. The two
+// callers that mutate them — `PUT /api/v1/admin/delivery` and
+// `PUT /api/v1/rules/:id/delivery` — round-trip the same JSON the UI
+// edits, so any drift here is caught at the type level.
+
+/// Weekly schedule grid: 7 days × 48 half-hour slots.
+///
+/// `grid[d][s]` is `true` when the slot allows delivery, `false`
+/// when it suppresses. Day index follows
+/// `chrono::Weekday::num_days_from_monday()` — index 0 is Monday,
+/// index 6 is Sunday. Slot index is half-hours since 00:00 local
+/// time: `s = hour * 2 + (minute >= 30 ? 1 : 0)`.
+///
+/// The grid is evaluated in the operator-configured IANA timezone
+/// (`DeliverySettings::timezone`); DST transitions are handled by
+/// `chrono-tz` so a 02:00 → 03:00 spring-forward day still
+/// resolves cleanly.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeliverySchedule {
+    /// `[day_of_week_0_is_monday][half_hour_slot_0_is_midnight]`.
+    pub grid: Vec<Vec<bool>>,
+}
+
+impl DeliverySchedule {
+    /// Slots per day (half-hour grid).
+    pub const SLOTS_PER_DAY: usize = 48;
+    /// Days per week.
+    pub const DAYS: usize = 7;
+
+    /// Construct an "always on" schedule (every slot true). Useful
+    /// as a default when an operator hits *Override* but hasn't
+    /// touched the grid yet.
+    pub fn always() -> Self {
+        Self {
+            grid: vec![vec![true; Self::SLOTS_PER_DAY]; Self::DAYS],
+        }
+    }
+
+    /// Construct an "always off" schedule (every slot false). The
+    /// editor's *Off* preset.
+    pub fn never() -> Self {
+        Self {
+            grid: vec![vec![false; Self::SLOTS_PER_DAY]; Self::DAYS],
+        }
+    }
+
+    /// Validate the grid shape. Cheap structural check used by the
+    /// admin handler and by `nexus-store::delivery_settings_put`
+    /// before persisting. Operators sending a malformed grid get a
+    /// 400, not a corrupt row.
+    pub fn validate(&self) -> Result<(), TypesError> {
+        if self.grid.len() != Self::DAYS {
+            return Err(TypesError::InvalidSchedule(format!(
+                "grid outer length must be {} (one per day), got {}",
+                Self::DAYS,
+                self.grid.len()
+            )));
+        }
+        for (i, row) in self.grid.iter().enumerate() {
+            if row.len() != Self::SLOTS_PER_DAY {
+                return Err(TypesError::InvalidSchedule(format!(
+                    "grid[{i}] length must be {} (half-hour slots), got {}",
+                    Self::SLOTS_PER_DAY,
+                    row.len()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolve `(weekday_from_monday, half_hour_slot)` → allow.
+    /// Returns `false` when indices are out of range — the policy
+    /// treats malformed lookups as suppressed for safety.
+    pub fn is_allowed(&self, day_from_monday: usize, slot: usize) -> bool {
+        self.grid
+            .get(day_from_monday)
+            .and_then(|row| row.get(slot))
+            .copied()
+            .unwrap_or(false)
+    }
+}
+
+/// Global delivery configuration — one row in `delivery_settings`.
+///
+/// `timezone` is an IANA name (`"America/Los_Angeles"`, `"UTC"`,
+/// …). The default at install time is the host's timezone, falling
+/// back to `"UTC"` if detection fails; operators can change it via
+/// `PUT /api/v1/admin/delivery`. Bare-bones validation lives here;
+/// the store layer adds the timezone-parses check via `chrono-tz`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeliverySettings {
+    /// Master kill switch. `false` suppresses every outbox row
+    /// with `SuppressionReason::GlobalDisabled` — local recording
+    /// continues regardless.
+    pub enabled: bool,
+    /// Optional weekly schedule. `None` means "no schedule" (every
+    /// time is allowed, subject only to `enabled`).
+    pub schedule: Option<DeliverySchedule>,
+    /// IANA timezone name (e.g. `"America/Los_Angeles"`).
+    pub timezone: String,
+    /// Last mutation timestamp. Set by the store on each put.
+    pub updated_at: DateTime<Utc>,
+}
+
+impl Default for DeliverySettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            schedule: None,
+            timezone: "UTC".to_string(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+}
+
+/// Per-rule delivery override — stored in `rules.delivery_policy_json`.
+///
+/// Cascade semantics (from `docs/M7_DELIVERY.md`):
+///
+/// - When the column is `NULL` (no policy set), the rule inherits
+///   the global `DeliverySettings` verbatim.
+/// - When `schedule` is `Some`, it **replaces** (does not
+///   intersect) the global schedule — an "open" rule schedule
+///   delivers even during a "closed" global slot.
+/// - `enabled = false` at the rule level is "this rule's matches
+///   never get delivered." Local recording continues; the global
+///   schedule is irrelevant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuleDeliveryPolicy {
+    pub enabled: bool,
+    /// `None` = no per-rule schedule (inherit global schedule).
+    /// `Some` = use this schedule, ignoring the global schedule.
+    #[serde(default)]
+    pub schedule: Option<DeliverySchedule>,
+}
+
+impl Default for RuleDeliveryPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            schedule: None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
 
@@ -296,6 +447,8 @@ pub enum TypesError {
     InvalidBBox(String),
     #[error("invalid frame buffer length: expected {expected}, got {got}")]
     FrameBufferLen { expected: usize, got: usize },
+    #[error("invalid delivery schedule: {0}")]
+    InvalidSchedule(String),
 }
 
 #[cfg(test)]
@@ -340,5 +493,56 @@ mod tests {
         };
         assert_eq!(a.area(), 24.0);
         assert_eq!(a.center(), (2.0, 3.0));
+    }
+
+    #[test]
+    fn schedule_always_and_never() {
+        let s = DeliverySchedule::always();
+        s.validate().unwrap();
+        assert!(s.is_allowed(0, 0));
+        assert!(s.is_allowed(6, 47));
+
+        let n = DeliverySchedule::never();
+        n.validate().unwrap();
+        assert!(!n.is_allowed(0, 0));
+        assert!(!n.is_allowed(3, 24));
+    }
+
+    #[test]
+    fn schedule_validate_rejects_bad_shape() {
+        let too_few_days = DeliverySchedule {
+            grid: vec![vec![true; 48]; 6],
+        };
+        assert!(too_few_days.validate().is_err());
+
+        let too_few_slots = DeliverySchedule {
+            grid: vec![vec![true; 47]; 7],
+        };
+        assert!(too_few_slots.validate().is_err());
+    }
+
+    #[test]
+    fn schedule_is_allowed_oob_is_false() {
+        // The policy treats malformed lookups as suppressed for safety.
+        let s = DeliverySchedule::always();
+        assert!(!s.is_allowed(7, 0));
+        assert!(!s.is_allowed(0, 48));
+    }
+
+    #[test]
+    fn schedule_round_trip_json() {
+        let mut s = DeliverySchedule::always();
+        s.grid[2][10] = false;
+        s.grid[5][47] = false;
+        let json = serde_json::to_string(&s).unwrap();
+        let back: DeliverySchedule = serde_json::from_str(&json).unwrap();
+        assert_eq!(s, back);
+    }
+
+    #[test]
+    fn rule_policy_default_inherits() {
+        let p = RuleDeliveryPolicy::default();
+        assert!(p.enabled);
+        assert!(p.schedule.is_none());
     }
 }

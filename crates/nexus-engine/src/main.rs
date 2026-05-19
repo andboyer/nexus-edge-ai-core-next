@@ -17,13 +17,20 @@ mod api;
 mod auth_bootstrap;
 mod cold_read_cache;
 mod cold_replicator;
+mod delivery_reload;
 mod discovery;
 #[cfg(unix)]
 mod fd_limit;
+mod models_catalog;
 mod oauth_sessions;
 mod reconciler;
 mod retention;
 mod storage_safety;
+// M7 Step 6F2 — only compiled when the `test-injection` feature
+// is on (off in any production build). Wires the dev-only
+// `POST /api/v1/_test/inject_event` handler.
+#[cfg(feature = "test-injection")]
+mod test_inject;
 mod usb_watch;
 
 /// Default config path used when neither `--config` nor `--tier` is given.
@@ -412,6 +419,50 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
         })
     };
 
+    // M7 alert-sink dispatcher. Drains `alert_sink_outbox` and
+    // ships each row through the registered sinks. The registry
+    // is populated from `cfg.sinks` at boot. Step 5 swaps the
+    // Step 3 `AllowAllPolicy` stub for the real `CascadingPolicy`
+    // (global `delivery_settings` × per-rule
+    // `delivery_policy_json`, see `docs/M7_DELIVERY.md`).
+    // With no `[[sinks]]` in the config the registry is empty
+    // and the dispatcher spins quietly because
+    // `record_event_and_enqueue` enqueues nothing.
+    let sink_registry = std::sync::Arc::new(nexus_sinks::SinkRegistry::new());
+    let configured_sinks = nexus_sinks::build_sinks_from_config(&cfg.sinks)
+        .context("M7: build alert-delivery sinks from cfg.sinks")?;
+    let n_sinks = sink_registry.replace(configured_sinks);
+    if n_sinks > 0 {
+        info!(n_sinks, "M7: alert-delivery sinks registered");
+    }
+    let cascading_policy = std::sync::Arc::new(
+        nexus_sinks::policy::CascadingPolicy::hydrate(&store)
+            .await
+            .context("M7: hydrate delivery policy from store")?,
+    );
+    let delivery_policy: std::sync::Arc<dyn nexus_sinks::dispatcher::DeliveryPolicy> =
+        cascading_policy.clone();
+    let (delivery_reload_handle, delivery_reload_shutdown_tx) =
+        delivery_reload::spawn(bus.clone(), store.clone(), cascading_policy.clone());
+    let (dispatcher_shutdown_tx, dispatcher_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let dispatcher_handle = {
+        let store = store.clone();
+        let sink_registry = sink_registry.clone();
+        let policy = delivery_policy.clone();
+        tokio::spawn(async move {
+            nexus_sinks::dispatcher::run_dispatcher(
+                nexus_sinks::dispatcher::SinkDispatcherConfig::default(),
+                store,
+                sink_registry,
+                policy,
+                async {
+                    let _ = dispatcher_shutdown_rx.await;
+                },
+            )
+            .await;
+        })
+    };
+
     // Camera hot-reload reconciler — subscribes to
     // `topic::CONFIG_CHANGED` and converges the live camera set
     // (DB) with the in-process supervisor / ingester set. Without
@@ -441,9 +492,18 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
         watermark_signal.clone(),
     );
 
+    // Detector prompt catalog — boot-time snapshot of every kind
+    // the router knows about + its vocabulary. The UI calls
+    // `GET /api/v1/models/prompts` so the camera + rules forms can
+    // render kind-appropriate label pickers (chip strip for
+    // closed-vocab COCO, free-text + suggestions for open-vocab
+    // yolo_world). See `models_catalog.rs` for details.
+    let model_prompts = std::sync::Arc::new(models_catalog::build_catalog(&cfg.inference, &router));
+
     let api_state = api::ApiState {
         store: store.clone(),
         bus: bus.clone(),
+        evaluator: evaluator.clone(),
         cache: cache.clone(),
         pool: pool.clone(),
         ui_root: cfg.server.ui_root.clone(),
@@ -455,6 +515,11 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
         cache_jobs: cache_jobs.clone(),
         usb_registry: usb_registry.clone(),
         preferred_usb_label: preferred_usb_label.clone(),
+        model_prompts: model_prompts.clone(),
+        // M7 Step 6 — shared with the dispatcher above so
+        // `/api/v1/admin/sinks/health` can list configured sinks
+        // even if they've never produced an outbox row.
+        sink_registry: sink_registry.clone(),
         // M2.2 closeout — in-memory pending-session cache for the
         // OAuth auth-code dance. Empty at boot; lives only as long
         // as the process. Operators who restart mid-consent just
@@ -513,6 +578,10 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), retention_handle).await;
     let _ = usb_shutdown_tx.send(());
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), usb_watch_handle).await;
+    let _ = dispatcher_shutdown_tx.send(());
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), dispatcher_handle).await;
+    let _ = delivery_reload_shutdown_tx.send(());
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), delivery_reload_handle).await;
     reconciler_handle.abort();
     // Abort every per-camera supervisor. `drain()` empties the map
     // under one lock acquisition; the reconciler is already aborted

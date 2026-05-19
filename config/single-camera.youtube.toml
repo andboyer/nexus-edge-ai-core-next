@@ -114,38 +114,190 @@ capacity = 256
 
 [[cameras]]
 id = 1
-name = "Lofi Girl (RTSP)"
+# Live cam1 was renamed in the DB to "Construction Site" once the
+# YouTube source was repointed at a 24/7 build-site livestream. We
+# track that here so a DB wipe + re-seed reproduces the same shape.
+name = "Construction Site"
 url = "rtsp://127.0.0.1:8554/cam1"
 enabled = true
-prompts = ["person"]
+# YOLO-World prompt subset — every entry below MUST appear in
+# `tools/models/yolo_world_default_prompts.txt` and be baked into
+# `models/yolo_world_v2_s.onnx`. The detector emits raw English
+# labels (no `vehicle.*` / `carried.*` namespace) and this list is
+# the per-camera filter applied AFTER detection.
+prompts = [
+    "person",
+    "hardhat",
+    "helmet",
+    "high-visibility vest",
+    "ladder",
+    "scissor lift",
+    "forklift",
+    "truck",
+    "excavator",
+    "crane",
+    "dump truck",
+    "cement mixer",
+    "bulldozer",
+    "wheelbarrow",
+    "traffic cone",
+    "jersey barrier",
+    "scaffolding",
+]
 # 15 fps strikes the smooth-motion/CPU sweet spot. Below 10 the live
 # viewer looks visibly choppy; above 20 the inference backlog grows on
 # slower hardware. The viewer polls metadata at 10 Hz, so anything ≥10
 # is indistinguishable to a human.
 max_fps = 15
 # CameraBehavior knob — opt-in to the static-object filter from
-# `tracker.static_object.*`. Off for the Lofi Girl stream (no
-# vehicles to promote). Set true on parking-lot / driveway cameras.
+# `tracker.static_object.*`. Off for a construction site (cones,
+# barriers, parked equipment all churn over a workday; the filter
+# was tuned for empty parking lots).
 parking_lot_mode = false
 
-# Polygon zones in normalized (0..1) coordinates. The Lofi Girl
-# composition keeps the studio window roughly in the right third of
-# the frame; this zone is also the target of the second rule above.
-# `kind = "inclusion"` participates in `motion.zone_state` and the
-# per-rule `zones` gate; `"exclusion"` would drop detections inside
-# the polygon at the engine, before rules ever see them.
+# Polygon zones in normalized (0..1) coordinates. The "Street",
+# "Site", and "Parking Lot" zones were drawn against the live
+# construction-site stream framing. `kind = "inclusion"` participates
+# in `motion.zone_state` and the per-rule `zones` gate.
 [[cameras.zones]]
-id = "studio_window"
-name = "Studio window"
-polygon = [[0.60, 0.20], [0.95, 0.20], [0.95, 0.85], [0.60, 0.85]]
+id = "f26bfc07-ca16-42ed-8364-99737d7722c8"
+name = "Street"
+polygon = [
+    [
+        0.0,
+        0.5897436,
+    ],
+    [
+        0.2596154,
+        0.73382175,
+    ],
+    [
+        0.64835167,
+        0.997558,
+    ],
+    [
+        0.0013736264,
+        0.995116,
+    ],
+]
 kind = "inclusion"
 
-# Optional per-camera detector override. Drops the threshold for
-# this camera only — handy if the stream is dim and the global
-# 0.30 misses too many people. Commented out so the camera follows
-# the workspace [inference.model] defaults.
-# [cameras.model_override]
-# kind = "yolo"
-# pack_path = "models"
-# preset = "640"
-# score_threshold = 0.20
+[[cameras.zones]]
+id = "6855698f-50ae-4401-86fa-40fdcb533935"
+name = "Site"
+polygon = [
+    [
+        0.0,
+        0.5970696,
+    ],
+    [
+        0.4217033,
+        0.30891332,
+    ],
+    [
+        0.8131868,
+        0.50183153,
+    ],
+    [
+        0.50137365,
+        0.8925519,
+    ],
+    [
+        0.24038461,
+        0.71916974,
+    ],
+]
+kind = "inclusion"
+
+[[cameras.zones]]
+id = "65e419a8-6615-4f50-9820-a959f3e4ada1"
+name = "Parking Lot"
+polygon = [
+    [
+        0.50274724,
+        0.89194137,
+    ],
+    [
+        0.64972526,
+        0.99694747,
+    ],
+    [
+        0.9958791,
+        0.98717946,
+    ],
+    [
+        0.9958791,
+        0.003052503,
+    ],
+    [
+        0.12912089,
+        0.0,
+    ],
+    [
+        0.15659341,
+        0.081196584,
+    ],
+    [
+        0.22664835,
+        0.11782662,
+    ],
+    [
+        0.41758242,
+        0.21306472,
+    ],
+    [
+        0.4217033,
+        0.30586082,
+    ],
+    [
+        0.80906594,
+        0.501221,
+    ],
+]
+kind = "inclusion"
+
+# Per-camera detector override — swaps cam1 from the workspace
+# default (`yolo` / yolo26n.onnx, COCO 80-class) to YOLO-World v2
+# small with the 44-prompt vocab so construction-site equipment
+# (excavator, crane, dump truck, cement mixer, bulldozer,
+# wheelbarrow, traffic cone, jersey barrier, scaffolding) becomes
+# detectable. `score_threshold = 0.10` is the recommended starting
+# point for YOLO-World — its open-vocabulary scores run lower than
+# the closed-set YOLO baseline.
+#
+# IMPORTANT: changing this requires an engine restart. The router
+# (crates/nexus-inference/src/router.rs) builds one inference layer
+# per distinct `model_override.kind` at boot; the reconciler does
+# NOT rebuild the router when overrides change via API.
+[cameras.model_override]
+kind = "yolo_world"
+pack_path = "models"
+preset = "640"
+input_width = 640
+input_height = 640
+score_threshold = 0.10
+
+# ---------------------------------------------------------------------------
+# M7 alert-delivery sinks (optional). Each `[[sinks]]` entry registers one
+# downstream target. Rows in `alert_sink_outbox` reference `<kind>:<name>`,
+# so a sink rename is forbidden — delete + re-add instead.
+#
+# The webhook sink requires the engine to be built with the `webhook` feature
+# (the workspace `nexus-engine` Cargo.toml already enables it on `nexus-sinks`).
+# When `hmac_secret` is set, the dispatcher ships a GitHub-compatible
+# `X-Nexus-Signature: sha256=<hex>` header computed over the raw JSON body;
+# operator-provided `[sinks.headers]` cannot override it.
+#
+# Uncomment to ship every alert from this engine to a webhook:
+#
+# [[sinks]]
+# kind = "webhook"
+# name = "primary"
+# url  = "https://example.com/nexus-webhook"
+# # hmac_secret  = "shared-secret"            # optional; enables signature
+# # timeout_secs = 10                         # optional; default 10s
+#
+# [sinks.headers]                             # optional; verbatim HTTP headers
+# # "Authorization" = "Bearer xyz"
+# # "X-Tenant"      = "acme"
+# ---------------------------------------------------------------------------

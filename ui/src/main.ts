@@ -6,6 +6,7 @@ import { renderBackends } from "./ui/backends.js";
 import { renderHealth } from "./ui/health.js";
 import { renderStorage } from "./ui/storage.js";
 import { renderAdminStorage } from "./ui/admin-storage.js";
+import { renderAdminDelivery } from "./ui/admin-delivery.js";
 import { renderTimeline } from "./ui/timeline.js";
 import { mountAlertTicker } from "./ui/alert-ticker.js";
 import { api } from "./api/client.js";
@@ -49,6 +50,7 @@ const SECTIONS: SidebarSection[] = [
     items: [
       { id: "storage", label: "Storage", render: renderStorage },
       { id: "admin-storage", label: "Storage Admin", render: renderAdminStorage },
+      { id: "admin-delivery", label: "Alert Delivery", render: renderAdminDelivery },
       { id: "backends", label: "Backends", render: renderBackends },
       { id: "health", label: "Health", render: renderHealth },
     ],

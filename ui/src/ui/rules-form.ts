@@ -26,16 +26,22 @@
 import { api } from "../api/client.js";
 import { h } from "../lib/el.js";
 import { openDialog, dialogFooter, type DialogHandle } from "../lib/dialog.js";
+import { CelEditor } from "../lib/cel-editor.js";
 import {
   TextField,
   NumberField,
-  TextArea,
   Toggle,
   Select,
   MultiSelect,
   FormSection,
   FieldRow,
 } from "../lib/forms.js";
+import {
+  WeeklyScheduleEditor,
+  alwaysSchedule,
+  cloneSchedule,
+  type ScheduleGrid,
+} from "../lib/schedule-editor.js";
 import { toast } from "../lib/toast.js";
 import {
   compileBuilder,
@@ -48,7 +54,10 @@ import {
 import type {
   CameraConfig,
   CameraId,
+  ModelPromptsResponse,
+  PutRuleDeliveryRequest,
   RuleConfig,
+  RuleDeliveryPolicy,
   RuleId,
   RulePreviewMatch,
   Severity,
@@ -86,6 +95,39 @@ interface FormState {
   editor_mode: "builder" | "raw";
   builder_rows: BuilderRow[];
   builder_joiner: Joiner;
+  // M7 Step 6C — per-rule delivery policy. Loaded async on open
+  // (edit mode only); create mode starts inherited and only PUTs
+  // /v1/rules/:id/delivery after the rule.upsert lands if the
+  // operator flipped to override. `dirty` is the diff against the
+  // server snapshot — we skip the second PUT entirely when false
+  // so a routine edit of `name` doesn't churn the dispatcher's
+  // hot-reload cache.
+  delivery: {
+    /// True once the GET has resolved. While false the Delivery
+    /// section shows a placeholder; the rest of the form is fully
+    /// usable.
+    loaded: boolean;
+    /// `true` ⇔ policy is null on the server (inherit global).
+    /// Flipping to `false` reveals the override editor.
+    inherited: boolean;
+    /// Override enabled bit. Persisted to
+    /// `rules.delivery_policy_json.enabled` when `inherited` is
+    /// false. Ignored when `inherited` is true.
+    override_enabled: boolean;
+    /// Override schedule grid. `null` ⇔ "always when enabled"
+    /// (the dispatcher treats a missing schedule as "no time
+    /// restriction"). Cached grid lives in `override_schedule`
+    /// even when the toggle is off so a quick flick doesn't
+    /// destroy the operator's painting work.
+    override_schedule: ScheduleGrid | null;
+    /// Set true on any mutation in the Delivery section. Cleared
+    /// after a successful PUT. Save skips the PUT when false.
+    dirty: boolean;
+    /// Global timezone for the schedule editor's tz strip. Fetched
+    /// best-effort from `/v1/admin/delivery`; falls back to UTC if
+    /// the admin gate rejects the read (non-admin operator).
+    global_tz: string;
+  };
 }
 
 const SEVERITY_OPTIONS: ReadonlyArray<{ value: Severity; label: string }> = [
@@ -105,6 +147,13 @@ export function openRuleForm(opts: OpenRuleFormOpts): Promise<boolean> {
   let dlg: DialogHandle | null = null;
   let saving = false;
 
+  // M-Admin Phase 5 — detector prompt catalog for value-side
+  // autocomplete in the CEL editor (`object.label == '…'`). Loaded
+  // asynchronously; the form stays usable without it (the editor
+  // still does field-side completion). Catalog snapshot at engine
+  // boot — see `crates/nexus-engine/src/models_catalog.rs`.
+  let catalog: ModelPromptsResponse | null = null;
+
   const errors: Record<keyof FormState, string | undefined> = {
     id: undefined,
     name: undefined,
@@ -119,6 +168,7 @@ export function openRuleForm(opts: OpenRuleFormOpts): Promise<boolean> {
     editor_mode: undefined,
     builder_rows: undefined,
     builder_joiner: undefined,
+    delivery: undefined,
   };
 
   const formHost = h("div", { class: "rule-form" });
@@ -156,7 +206,7 @@ export function openRuleForm(opts: OpenRuleFormOpts): Promise<boolean> {
 
   function rerender(): void {
     while (formHost.firstChild) formHost.removeChild(formHost.firstChild);
-    formHost.append(buildForm(state, errors, opts, validateWhen));
+    formHost.append(buildForm(state, errors, opts, validateWhen, catalog));
   }
 
   async function onSave(): Promise<void> {
@@ -170,6 +220,27 @@ export function openRuleForm(opts: OpenRuleFormOpts): Promise<boolean> {
     saving = true;
     try {
       await api.rules.upsert(payload);
+      // M7 Step 6C — second PUT for the per-rule delivery policy
+      // when the operator touched the Delivery section. Skipping
+      // the no-op PUT keeps the dispatcher's hot-reload cache
+      // from churning on every routine rule edit.
+      if (state.delivery.dirty) {
+        try {
+          await api.delivery.putRule(payload.id, buildDeliveryRequest(state));
+          state.delivery.dirty = false;
+        } catch (err) {
+          // Rule did save; only the delivery policy slipped. Tell
+          // the operator clearly so they can retry the Delivery
+          // tab without losing the other field edits.
+          toast.error(
+            `Rule saved, but delivery policy update failed: ${
+              (err as Error).message ?? String(err)
+            }`,
+          );
+          saving = false;
+          return;
+        }
+      }
       toast.success(
         opts.mode === "create"
           ? `Rule ${payload.id} added`
@@ -184,6 +255,62 @@ export function openRuleForm(opts: OpenRuleFormOpts): Promise<boolean> {
   }
 
   rerender();
+
+  // Async catalog fetch for CEL value-completion. Fire-and-forget;
+  // form is usable before it returns.
+  api.models
+    .prompts()
+    .then((cat) => {
+      catalog = cat;
+      rerender();
+    })
+    .catch((err) => {
+      // eslint-disable-next-line no-console
+      console.warn("model prompts catalog unavailable:", err);
+    });
+
+  // M7 Step 6C — best-effort global tz fetch so the schedule
+  // editor's timezone strip matches what the dispatcher will
+  // actually use. `/v1/admin/delivery` is HS256-gated; non-admin
+  // operators get a 401 here and we silently fall back to UTC
+  // (the strip stays informational either way).
+  api.delivery
+    .getAdmin()
+    .then((settings) => {
+      state.delivery.global_tz = settings.timezone || "UTC";
+      rerender();
+    })
+    .catch(() => {
+      // Stays "UTC" — already the seeded default.
+    });
+
+  // Per-rule delivery policy is only loadable once the rule
+  // exists on the server. In create mode we leave `loaded = true`
+  // (already set in `buildInitialState`) so the inherit/override
+  // radio is interactive from the first paint.
+  if (opts.mode === "edit") {
+    api.delivery
+      .getRule(state.id)
+      .then((resp) => {
+        state.delivery.loaded = true;
+        state.delivery.inherited = resp.policy === null;
+        if (resp.policy) {
+          state.delivery.override_enabled = resp.policy.enabled;
+          state.delivery.override_schedule = resp.policy.schedule
+            ? cloneSchedule(resp.policy.schedule.grid)
+            : null;
+        }
+        rerender();
+      })
+      .catch((err) => {
+        // Loaded = true here too so the section renders the error
+        // banner instead of perpetual "Loading…".
+        state.delivery.loaded = true;
+        // eslint-disable-next-line no-console
+        console.warn("per-rule delivery policy unavailable:", err);
+        rerender();
+      });
+  }
 
   const footer = dialogFooter({
     cancelLabel: "Cancel",
@@ -203,6 +330,19 @@ export function openRuleForm(opts: OpenRuleFormOpts): Promise<boolean> {
 }
 
 function buildInitialState(opts: OpenRuleFormOpts): FormState {
+  // Same default-delivery snapshot for create + edit; the real
+  // values land asynchronously once the per-rule GET resolves
+  // (edit mode only — create mode stays inherited until the
+  // operator flips the radio).
+  const initialDelivery: FormState["delivery"] = {
+    loaded: opts.mode === "create", // create has nothing to load
+    inherited: true,
+    override_enabled: true,
+    override_schedule: null,
+    dirty: false,
+    global_tz: "UTC",
+  };
+
   if (opts.mode === "edit" && opts.existing) {
     const r = opts.existing;
     const parsed = tryParseBuilder(r.when);
@@ -220,6 +360,7 @@ function buildInitialState(opts: OpenRuleFormOpts): FormState {
       editor_mode: parsed ? "builder" : "raw",
       builder_rows: parsed ? parsed.rows : [],
       builder_joiner: parsed ? parsed.joiner : "and",
+      delivery: initialDelivery,
     };
   }
   const defaultRows: BuilderRow[] = [defaultRow()];
@@ -237,6 +378,7 @@ function buildInitialState(opts: OpenRuleFormOpts): FormState {
     editor_mode: "builder",
     builder_rows: defaultRows,
     builder_joiner: "and",
+    delivery: initialDelivery,
   };
 }
 
@@ -245,6 +387,7 @@ function buildForm(
   errors: Record<string, string | undefined>,
   opts: OpenRuleFormOpts,
   validateWhen: (value: string) => void,
+  catalog: ModelPromptsResponse | null,
 ): HTMLElement {
   const idField =
     opts.mode === "edit"
@@ -332,7 +475,7 @@ function buildForm(
     ),
     FormSection(
       "Condition",
-      buildConditionSection(state, errors, validateWhen),
+      buildConditionSection(state, errors, validateWhen, catalog),
     ),
     FormSection(
       "Debounce",
@@ -380,6 +523,7 @@ function buildForm(
         }),
       ),
     ),
+    FormSection("Delivery", buildDeliverySection(state, opts.mode)),
     FormSection("Preview", buildPreviewSection(state, opts.cameras)),
   );
 }
@@ -398,6 +542,17 @@ function readOnlyField(label: string, value: string): HTMLElement {
   );
 }
 
+/// De-duplicated union of every detector kind's prompt vocabulary
+/// from the engine boot-time catalog. Used to feed value-side
+/// autocomplete in the CEL editor (`object.label == '…'`).
+function unionLabels(catalog: ModelPromptsResponse): string[] {
+  const set = new Set<string>();
+  for (const kind of catalog.kinds) {
+    for (const p of kind.prompts) set.add(p);
+  }
+  return [...set].sort();
+}
+
 /// Condition section — owns the builder ↔ raw mode toggle. Both
 /// modes write into `state.when`; the outer save flow doesn't need
 /// to know which one was used. The two buttons rerender locally so
@@ -407,6 +562,7 @@ function buildConditionSection(
   state: FormState,
   errors: Record<string, string | undefined>,
   validateWhen: (value: string) => void,
+  catalog: ModelPromptsResponse | null,
 ): HTMLElement {
   const host = h("div", { class: "condition-section" });
 
@@ -458,7 +614,7 @@ function buildConditionSection(
               if (errors["when"] !== undefined) errors["when"] = undefined;
             },
           })
-        : TextArea({
+        : CelEditor({
             label: "when (CEL)",
             value: state.when,
             rows: 4,
@@ -467,6 +623,11 @@ function buildConditionSection(
               "object.label == 'person' && object.attributes['motion.dwell_seconds'] >= 60",
             helpText: CEL_HELP,
             ...(errors["when"] !== undefined ? { error: errors["when"] } : {}),
+            // Union of every detector kind's vocabulary. A rule
+            // can fire across cameras with different detectors so
+            // we don't try to filter by camera_filter here — the
+            // operator still gets to type any string.
+            labelSuggestions: catalog ? unionLabels(catalog) : [],
             onChange: (v) => {
               state.when = v;
             },
@@ -504,6 +665,197 @@ function buildConditionSection(
 
   inner();
   return host;
+}
+
+/// M7 Step 6C — per-rule delivery editor.
+///
+/// Three states the host can show:
+///
+///   1. `loaded === false` (edit mode, GET still in flight) — a
+///      muted placeholder so the operator knows the section
+///      will populate. Rest of the form stays usable.
+///   2. `inherited === true` — radio + a one-line preview saying
+///      the global policy applies as-is. The schedule editor is
+///      rendered in `readOnly: true` mode against an "always"
+///      grid placeholder, which is intentionally a hint, not a
+///      live mirror of global state (which would require a
+///      separate GET on every render). Operators who want to see
+///      the actual global schedule can open the Alert Delivery
+///      page in another tab.
+///   3. `inherited === false` (override) — enabled toggle, a
+///      separate "Restrict to a weekly schedule" toggle (mirrors
+///      the global editor pattern), and the compact
+///      `<WeeklyScheduleEditor>` when the schedule is active.
+///
+/// The cached `override_schedule` grid is preserved in memory
+/// while the "restrict to schedule" toggle is off so flicking it
+/// back doesn't destroy in-progress painting.
+function buildDeliverySection(
+  state: FormState,
+  mode: "create" | "edit",
+): HTMLElement {
+  const host = h("div", { class: "delivery-section" });
+
+  function inner(): void {
+    while (host.firstChild) host.removeChild(host.firstChild);
+
+    if (!state.delivery.loaded) {
+      host.append(
+        h(
+          "p",
+          { class: "muted" },
+          "Loading per-rule delivery policy…",
+        ),
+      );
+      return;
+    }
+
+    // Inherit / Override radio. We render as two <label><input
+    // type=radio>…</label> entries inside a wrapper so a single
+    // click on the label-text toggles the radio.
+    const radioGroupName = `rule-delivery-${state.id || "new"}`;
+    const inheritRadio = h("input", {
+      type: "radio",
+      name: radioGroupName,
+      checked: state.delivery.inherited,
+      on: {
+        change: (ev) => {
+          if (!(ev.currentTarget as HTMLInputElement).checked) return;
+          state.delivery.inherited = true;
+          state.delivery.dirty = true;
+          inner();
+        },
+      },
+    });
+    const overrideRadio = h("input", {
+      type: "radio",
+      name: radioGroupName,
+      checked: !state.delivery.inherited,
+      on: {
+        change: (ev) => {
+          if (!(ev.currentTarget as HTMLInputElement).checked) return;
+          state.delivery.inherited = false;
+          state.delivery.dirty = true;
+          inner();
+        },
+      },
+    });
+    const radios = h(
+      "div",
+      { class: "delivery-mode-radios" },
+      h(
+        "label",
+        { class: "delivery-mode-radio" },
+        inheritRadio,
+        h("span", null, "Inherit from global"),
+      ),
+      h(
+        "label",
+        { class: "delivery-mode-radio" },
+        overrideRadio,
+        h("span", null, "Override for this rule"),
+      ),
+    );
+    host.append(radios);
+
+    if (state.delivery.inherited) {
+      host.append(
+        h(
+          "p",
+          { class: "muted" },
+          "This rule uses the global delivery policy (enable bit + weekly schedule from the Alert Delivery admin tab). Switch to Override above to set a per-rule policy.",
+        ),
+      );
+      if (mode === "create") {
+        host.append(
+          h(
+            "p",
+            { class: "muted" },
+            "New rules default to inheriting; you can also flip this after the rule is created.",
+          ),
+        );
+      }
+      return;
+    }
+
+    // ----- Override mode -----------------------------------------
+    const enabledField = Toggle({
+      label: "Enabled (per rule)",
+      value: state.delivery.override_enabled,
+      helpText:
+        "When off, every delivery for this rule is suppressed (suppression_reason = rule_disabled), regardless of the global enable bit.",
+      onChange: (b) => {
+        state.delivery.override_enabled = b;
+        state.delivery.dirty = true;
+      },
+    });
+    host.append(enabledField);
+
+    const useSchedule = state.delivery.override_schedule !== null;
+    const scheduleToggle = Toggle({
+      label: "Restrict to a weekly schedule",
+      value: useSchedule,
+      helpText:
+        "When off, the rule may deliver at any time the enable bit allows. When on, the grid below REPLACES the global schedule (it does not intersect).",
+      onChange: (b) => {
+        if (b) {
+          state.delivery.override_schedule = state.delivery.override_schedule
+            ? cloneSchedule(state.delivery.override_schedule)
+            : alwaysSchedule();
+        } else {
+          state.delivery.override_schedule = null;
+        }
+        state.delivery.dirty = true;
+        inner();
+      },
+    });
+    host.append(scheduleToggle);
+
+    if (state.delivery.override_schedule) {
+      const editor = WeeklyScheduleEditor({
+        value: state.delivery.override_schedule,
+        timezone: state.delivery.global_tz,
+        onChange: (next) => {
+          state.delivery.override_schedule = next;
+          state.delivery.dirty = true;
+        },
+      });
+      editor.classList.add("compact");
+      host.append(editor);
+    }
+
+    host.append(
+      h(
+        "p",
+        { class: "muted" },
+        "Cascade: a delivery fires when the global enable bit AND this rule's enable bit are both on, and the active schedule (this rule's if set, otherwise global) allows the slot.",
+      ),
+    );
+  }
+
+  inner();
+  return host;
+}
+
+/// Marshal the live override state into the PUT body. Caller is
+/// responsible for skipping the network call when
+/// `state.delivery.dirty` is false (no churn for cosmetic edits).
+function buildDeliveryRequest(state: FormState): PutRuleDeliveryRequest {
+  if (state.delivery.inherited) {
+    return { policy: null };
+  }
+  const policy: RuleDeliveryPolicy = {
+    enabled: state.delivery.override_enabled,
+  };
+  // Only emit `schedule` when the operator opted in. Omitting the
+  // key (vs sending `null`) mirrors the engine-side serde default
+  // — both decode to "inherit the global schedule".
+  if (state.delivery.override_schedule) {
+    policy.schedule = { grid: state.delivery.override_schedule };
+  } else {
+    policy.schedule = null;
+  }
+  return { policy };
 }
 
 function validate(

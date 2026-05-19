@@ -183,11 +183,52 @@ textarea {
   gap: 12px;
 }
 
+.viewer-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  margin: 0 0 8px 0;
+}
+
+.viewer-head h2 {
+  margin: 0;
+}
+
+.viewer-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
 .viewer-cell {
   background: var(--bg-elev);
   border: 1px solid var(--line);
   border-radius: 4px;
   padding: 8px;
+}
+
+.viewer-cell-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  margin: 0 0 8px 0;
+}
+
+.viewer-cell-head h3 {
+  margin: 0;
+  font-size: 13px;
+  color: var(--text-dim);
+  font-weight: 500;
+}
+
+.viewer-expand-btn {
+  padding: 2px 8px;
+  font-size: 14px;
+  line-height: 1;
+  /* Tighter than a normal .ghost button — the icon is its own
+   * visual weight. */
 }
 
 .viewer-cell h3 {
@@ -205,6 +246,66 @@ textarea {
   border-radius: 2px;
 }
 
+/* Fullscreen-ish live viewer modal. Reuses the clip-modal
+ * backdrop pattern but sizes the canvas to fit the viewport so
+ * the source snapshot renders at (up to) its native resolution
+ * instead of the 240px-tall cell. */
+.viewer-modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.88);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 9000;
+}
+
+.viewer-modal-card {
+  background: var(--bg-elev);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 12px;
+  max-width: 96vw;
+  max-height: 96vh;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  box-shadow: var(--shadow);
+}
+
+.viewer-modal-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+}
+
+.viewer-modal-head strong {
+  font-size: 13px;
+  color: var(--text-dim);
+  font-weight: 500;
+}
+
+/* Stage sizes to whichever dimension hits the viewport cap first.
+ * `aspect-ratio` is set inline once the first frame's metadata
+ * arrives so the canvas keeps the camera's native ratio. */
+.viewer-modal-stage {
+  display: block;
+  max-width: 92vw;
+  max-height: 84vh;
+  /* Fallback ratio before the first metadata fetch sets the
+   * real one — keeps the canvas from collapsing to 0×0. */
+  aspect-ratio: 16 / 9;
+  background: #000;
+  border-radius: 3px;
+}
+
+.viewer-modal-canvas {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
 .alert {
   padding: 8px;
   border-left: 3px solid var(--accent);
@@ -218,6 +319,36 @@ textarea {
 .alert.severity-high     { border-left-color: var(--warn); }
 .alert.severity-medium   { border-left-color: var(--accent); }
 .alert.severity-low      { border-left-color: var(--ok); }
+
+.alert-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 2px;
+}
+
+.alert-play-btn {
+  margin-left: auto;
+  padding: 1px 8px;
+  font-size: 12px;
+  line-height: 1.2;
+  background: var(--bg-elev-1);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  cursor: pointer;
+}
+.alert-play-btn:hover:not(:disabled) {
+  background: var(--bg-elev-3, var(--accent));
+}
+.alert-play-btn:disabled {
+  opacity: 0.5;
+  cursor: progress;
+}
+
+.alert-play-status {
+  font-size: 11px;
+}
 
 .muted {
   color: var(--text-dim);
@@ -443,6 +574,36 @@ textarea {
   max-height: 70vh;
   background: #000;
   border-radius: 3px;
+  display: block;
+}
+
+/* Wrapper that lets the bounding-box canvas sit directly on top
+ * of the <video>. Width follows the video's intrinsic aspect
+ * because the <video> is the only sized child; the canvas is
+ * absolutely positioned and stretched to match.
+ *
+ * pointer-events:none on the canvas keeps the native <video>
+ * controls (play/pause, scrubber) clickable underneath. */
+.clip-modal-stage {
+  position: relative;
+  display: inline-block;
+  max-width: 100%;
+  max-height: 70vh;
+}
+
+.clip-modal-overlay-canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  border-radius: 3px;
+}
+
+.clip-modal-actions {
+  display: flex;
+  gap: 6px;
+  align-items: center;
 }
 
 .clip-modal-error {
@@ -1072,6 +1233,18 @@ button.ghost.danger {
 .field.field-error textarea,
 .field.field-error select {
   border-color: var(--crit);
+}
+
+.form-error-banner {
+  padding: 12px;
+  border: 1px solid var(--crit);
+  border-radius: 4px;
+  background: rgba(255, 64, 64, 0.08);
+  color: var(--crit);
+  font-size: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
 }
 
 .field-toggle {
@@ -1874,5 +2047,447 @@ button.chip {
   display: flex;
   flex-wrap: wrap;
   gap: 4px;
+}
+
+/* CEL editor with autocomplete (ui/src/lib/cel-editor.ts).
+   The .cel-editor wrapper anchors the absolutely-positioned
+   completion popup at its bottom-left so the popup tracks the
+   textarea's width as the dialog resizes. */
+.cel-editor {
+  position: relative;
+  width: 100%;
+}
+
+.cel-editor-textarea {
+  width: 100%;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.cel-completions {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  right: 0;
+  z-index: 30;
+  max-height: 220px;
+  overflow-y: auto;
+  background: var(--bg-elev-2);
+  border: 1px solid var(--line);
+  border-top: none;
+  border-radius: 0 0 4px 4px;
+  box-shadow: 0 6px 16px rgba(0, 0, 0, 0.4);
+}
+
+.cel-completion-item {
+  padding: 6px 10px;
+  cursor: pointer;
+  border-bottom: 1px solid var(--line);
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: baseline;
+  column-gap: 8px;
+}
+
+.cel-completion-item:last-child {
+  border-bottom: none;
+}
+
+.cel-completion-active {
+  background: var(--accent-dim);
+  color: var(--text);
+}
+
+.cel-completion-display {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  color: var(--text);
+}
+
+.cel-completion-type {
+  font-size: 10px;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+}
+
+.cel-completion-desc {
+  grid-column: 1 / -1;
+  font-size: 11px;
+  color: var(--text-dim);
+  margin-top: 2px;
+}
+
+/* ---------------------------------------------------------------------- */
+/* M7 Step 6B — weekly schedule editor.                                   */
+/* 7-row × 48-cell grid with click-and-drag paint. The cell size is a    */
+/* CSS var so the per-rule editor can shrink the grid without forking    */
+/* the rules. Defaults sized for a full-width admin tab.                  */
+/* ---------------------------------------------------------------------- */
+.schedule-editor {
+  --schedule-cell-size: 14px;
+  --schedule-cell-gap: 1px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 6px;
+}
+
+.schedule-presets {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.schedule-presets-label {
+  color: var(--text-dim);
+  font-size: 12px;
+  margin-right: 4px;
+}
+
+.schedule-tz-strip {
+  font-size: 12px;
+  color: var(--text);
+}
+
+.schedule-grid {
+  border-collapse: separate;
+  border-spacing: var(--schedule-cell-gap);
+  user-select: none;
+  background: var(--bg-elev);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 6px;
+  /* The grid is wide; horizontal scroll is preferable to fluid
+     wrapping so the day labels stay aligned with their cells. */
+  overflow-x: auto;
+  display: block;
+  max-width: 100%;
+}
+
+.schedule-grid th,
+.schedule-grid td {
+  padding: 0;
+  margin: 0;
+}
+
+.schedule-day-corner {
+  width: 36px;
+  background: transparent;
+}
+
+.schedule-day-label {
+  width: 36px;
+  text-align: right;
+  padding-right: 6px !important;
+  font-size: 11px;
+  color: var(--text-dim);
+  font-weight: 500;
+}
+
+.schedule-tick {
+  width: var(--schedule-cell-size);
+  height: 14px;
+  font-size: 9px;
+  color: var(--text-dim);
+  text-align: left;
+  vertical-align: bottom;
+  font-weight: 400;
+  /* Each tick label sits in its own cell, so the printed hour
+     (00, 02, …) hugs the left edge of the cell it labels. */
+  padding-left: 1px !important;
+}
+
+.schedule-tick-major {
+  color: var(--text);
+}
+
+.schedule-cell {
+  width: var(--schedule-cell-size);
+  height: var(--schedule-cell-size);
+  background: var(--bg-elev-2);
+  border-radius: 2px;
+  cursor: pointer;
+  outline: 1px solid transparent;
+  transition: background 80ms linear, outline-color 80ms linear;
+}
+
+.schedule-cell:hover {
+  outline-color: var(--accent-dim);
+}
+
+.schedule-cell-on {
+  background: var(--accent);
+}
+
+.schedule-cell-on:hover {
+  background: var(--accent);
+  outline-color: var(--accent);
+}
+
+.schedule-cell-now {
+  /* Vertical bar on the leading edge of the "now" half-hour, so
+     the cell's fill colour stays legible regardless of state. */
+  box-shadow: inset 2px 0 0 var(--warn);
+}
+
+/* Tighter sizing for the per-rule editor when embedded inside the
+   rules form. The page slips a `.schedule-editor.compact` class on
+   the root before insertion. */
+.schedule-editor.compact {
+  --schedule-cell-size: 10px;
+}
+
+/* ---------------------------------------------------------------------- */
+/* M7 Step 6B — sinks-health card.                                        */
+/* Renders one row per configured-OR-historical sink × the windows the   */
+/* engine ships in `SinksHealthResponse.windows`. Counts collapse to a   */
+/* single number per cell — clicking a row navigates to the per-sink     */
+/* delivery log (Step 6D, not built yet).                                */
+/* ---------------------------------------------------------------------- */
+.sinks-health-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.sinks-health-table th,
+.sinks-health-table td {
+  text-align: left;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--line);
+}
+
+.sinks-health-table th {
+  color: var(--text-dim);
+  font-weight: 500;
+  background: var(--bg-elev);
+}
+
+.sinks-health-table .sinks-health-num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum" 1;
+}
+
+.sinks-health-pill {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 999px;
+  font-size: 11px;
+  color: var(--bg);
+  background: var(--text-dim);
+  margin-left: 6px;
+}
+
+.sinks-health-pill.health-ok {
+  background: var(--ok);
+}
+
+.sinks-health-pill.health-warn {
+  background: var(--warn);
+}
+
+.sinks-health-pill.health-crit {
+  background: var(--crit);
+}
+
+.sinks-health-pill.health-muted {
+  background: var(--text-dim);
+}
+
+/* ---------------------------------------------------------------------- */
+/* M7 Step 6C — per-rule Delivery section inside the rules form.          */
+/* Same primitives as the Operations / Storage sections; just a thin     */
+/* wrapper so the radio-pair and the embedded compact schedule editor    */
+/* line up with the rest of the form.                                    */
+/* ---------------------------------------------------------------------- */
+.delivery-section {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.delivery-mode-radios {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 16px;
+}
+
+.delivery-mode-radio {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.delivery-mode-radio input[type="radio"] {
+  cursor: pointer;
+}
+
+/* ---------------------------------------------------------------------- */
+/* M7 Step 6D — per-event delivery badges + detail dialog.                */
+/* The dialog opens on demand from the events table; the rest of the     */
+/* table fetches nothing extra. Badges colour-code by status and carry a */
+/* tooltip with the full attempt-history line.                           */
+/* ---------------------------------------------------------------------- */
+.delivery-open-btn {
+  padding: 2px 8px;
+  font-size: 12px;
+}
+
+.delivery-dialog-body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.delivery-badge-stack {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.delivery-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  border: 1px solid var(--line);
+  background: var(--bg-elev);
+  color: var(--text);
+}
+
+.delivery-badge strong {
+  font-weight: 600;
+}
+
+.delivery-badge-icon {
+  font-weight: 700;
+}
+
+.delivery-badge-summary {
+  color: var(--text-dim);
+}
+
+.delivery-badge-sent {
+  border-color: var(--ok);
+}
+.delivery-badge-sent .delivery-badge-icon {
+  color: var(--ok);
+}
+
+.delivery-badge-failed {
+  border-color: var(--warn);
+}
+.delivery-badge-failed .delivery-badge-icon {
+  color: var(--warn);
+}
+
+.delivery-badge-dead {
+  border-color: var(--crit);
+}
+.delivery-badge-dead .delivery-badge-icon {
+  color: var(--crit);
+}
+
+.delivery-badge-suppressed {
+  border-color: var(--text-dim);
+  opacity: 0.85;
+}
+.delivery-badge-suppressed .delivery-badge-icon {
+  color: var(--text-dim);
+}
+
+.delivery-badge-pending {
+  border-color: var(--accent-dim);
+}
+.delivery-badge-pending .delivery-badge-icon {
+  color: var(--accent);
+}
+
+.delivery-detail-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.delivery-detail-table th,
+.delivery-detail-table td {
+  text-align: left;
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--line);
+  vertical-align: top;
+}
+
+.delivery-detail-table th {
+  background: var(--bg-elev);
+  color: var(--text-dim);
+  font-weight: 500;
+}
+
+.delivery-detail-table td.delivery-num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum" 1;
+}
+
+.delivery-status-pill {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.delivery-status-sent {
+  color: var(--bg);
+  background: var(--ok);
+}
+.delivery-status-failed {
+  color: var(--bg);
+  background: var(--warn);
+}
+.delivery-status-dead {
+  color: var(--bg);
+  background: var(--crit);
+}
+.delivery-status-pending {
+  color: var(--bg);
+  background: var(--accent);
+}
+.delivery-status-suppressed {
+  color: var(--bg);
+  background: var(--text-dim);
+}
+
+/* ---------------------------------------------------------------------- */
+/* M7 Step 6E — rules list-page Delivery chip. Sits in the existing      */
+/* `.state-pill` slot so the table column-width math stays unchanged.    */
+/* The `inherit` chip is muted; `override` is accent-coloured so the     */
+/* operator can scan a row of rules and see the few that diverge.        */
+/* ---------------------------------------------------------------------- */
+.delivery-chip-inherit {
+  color: var(--text-dim);
+  border: 1px solid var(--line);
+  background: var(--bg-elev);
+}
+
+.delivery-chip-override {
+  color: var(--bg);
+  background: var(--accent);
+}
+
+/* When the per-rule policy is `override` AND the operator turned
+   the per-rule `enabled` bit off, repaint the chip red so the
+   "every delivery suppressed for this rule" state is obvious. */
+.delivery-chip-override.delivery-chip-disabled {
+  background: var(--crit);
 }
 

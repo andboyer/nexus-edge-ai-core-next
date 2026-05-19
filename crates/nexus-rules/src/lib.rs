@@ -366,6 +366,22 @@ impl RuleEvaluator {
 
                 let severity = parse_severity(&cfg.predicate.severity);
                 debug!(rule = %cfg.id, label = %o.label, "rule fired");
+                // Stamp the detector confidence and the rule's
+                // display name into `context` so consumers (live
+                // SSE ticker, /events recall, audit exports) can
+                // surface them without doing a side lookup against
+                // the rules catalog. `context` is a free-form
+                // serde_json map serialised verbatim into the
+                // events table's `payload_json` column, so this
+                // costs no schema change.
+                let mut context = serde_json::Map::with_capacity(2);
+                context.insert(
+                    "confidence".into(),
+                    serde_json::Number::from_f64(o.confidence as f64)
+                        .map(JsonValue::Number)
+                        .unwrap_or(JsonValue::Null),
+                );
+                context.insert("rule_name".into(), JsonValue::String(cfg.name.clone()));
                 out.push(AlertEvent {
                     event_id: Uuid::now_v7(),
                     camera_id,
@@ -378,7 +394,7 @@ impl RuleEvaluator {
                     captured_at: Utc::now(),
                     trace_id: trace_id.clone(),
                     artifacts: Artifacts::default(),
-                    context: Default::default(),
+                    context,
                 });
             }
         }

@@ -61,6 +61,17 @@ export interface AlertEvent {
   context?: Record<string, unknown>;
 }
 
+/// Response body for `GET /api/v1/events/:event_id/clip`. Powers
+/// the "play" button on the live-alert ticker — the alert SSE
+/// payload itself doesn't carry `clip_id` because the supervisor
+/// stamps the link AFTER the bus broadcast. 404 from this endpoint
+/// means "no clip yet" (race-loss or no recorder open at the time
+/// the alert fired); callers should surface that gracefully rather
+/// than as a hard error.
+export interface EventClipResponse {
+  clip_id: ClipId;
+}
+
 export type PipelineState =
   | "initializing"
   | "running"
@@ -235,6 +246,45 @@ export interface BackendStatus {
 export interface BackendsResponse {
   mode: "in_process" | "pool";
   slots: BackendStatus[];
+}
+
+// ---------------------------------------------------------------------------
+// M-Admin Phase 5 — detector prompt catalog.
+//
+// Mirrors `crates/nexus-engine/src/models_catalog.rs`. Surfaces the
+// prompt vocabulary the engine's currently-loaded detector kinds will
+// actually emit so the camera + rules forms can show kind-appropriate
+// label pickers (closed-vocab COCO chip strip vs open-vocab yolo_world
+// free-text + suggestions). Snapshot at engine boot — does NOT update
+// when a camera's `model_override` changes at runtime.
+// ---------------------------------------------------------------------------
+
+export interface ModelPromptGroup {
+  name: string;
+  labels: string[];
+}
+
+export interface DetectorPromptInfo {
+  kind: string;
+  /// Open-vocab detectors accept any user-supplied prompt string;
+  /// closed-vocab detectors emit a fixed label set.
+  open_vocab: boolean;
+  /// Every label this detector kind is known to emit. Empty for
+  /// detectors whose vocabulary is unknown (`mock`).
+  prompts: string[];
+  /// Optional groupings the UI can render as titled chip rows.
+  /// Empty array means "ungrouped" — render flat.
+  groups: ModelPromptGroup[];
+  /// Human-readable description rendered beneath the chip strip.
+  note?: string | null;
+}
+
+export interface ModelPromptsResponse {
+  /// `inference.model.kind` from the loaded config. The kind every
+  /// camera that does NOT set `model_override` runs against.
+  default_kind: string;
+  /// One entry per detector kind the router has a layer for.
+  kinds: DetectorPromptInfo[];
 }
 
 // ---------------------------------------------------------------------------
@@ -523,6 +573,48 @@ export interface MotionEventRow {
   attributes_json: string;
 }
 
+/// Minimal clip summary returned by `GET /v1/clips/:id/tracks`.
+/// Just what the overlay player needs to map a `captured_at`
+/// timestamp onto a `<video>.currentTime` offset (Δms = captured_at
+/// − started_at). Full clip metadata still lives on the existing
+/// `GET /v1/clips/:id` streaming endpoint; this body is intentionally
+/// stripped so the UI can poll/fetch overlays cheaply.
+export interface ClipTracksSummary {
+  id: ClipId;
+  camera_id: CameraId;
+  started_at: string;
+  ended_at: string | null;
+  duration_ms: number;
+}
+
+/// Response body for `GET /api/v1/clips/:id/tracks`. Events are
+/// ordered `captured_at ASC` so the overlay drawer can walk forward
+/// in time as the video plays. `events: []` is valid (clip has no
+/// recorded motion lifecycle).
+///
+/// `source_width` / `source_height` are the pixel dimensions of the
+/// coordinate space `MotionEventRow.bbox` lives in (currently the
+/// supervisor's fixed 960×540 RGB frame, NOT the MP4 clip's native
+/// resolution). The overlay canvas must scale each bbox by
+/// `(videoWidth/source_width, videoHeight/source_height)` before
+/// rendering, otherwise boxes appear at half-size in the top-left
+/// quadrant on any camera whose RTSP feed is wider than 960×540.
+///
+/// `trigger_track_ids` lists the track ids whose alert rows are
+/// stamped against this clip. The overlay only draws boxes for
+/// these tracks so reviewers see the object that triggered the
+/// alert, not every passing car the tracker happened to label.
+/// Empty when the clip has no linked alerts — the UI then draws
+/// no overlay (intentional; lets motion-only clips render bare
+/// video).
+export interface ClipTracksResponse {
+  clip: ClipTracksSummary;
+  source_width: number;
+  source_height: number;
+  trigger_track_ids: TrackId[];
+  events: MotionEventRow[];
+}
+
 /// Sparse motion-density bucket for the per-camera Timeline grid.
 /// Empty intervals are NOT included; the UI fills zeros client-side.
 /// `bucket_start` is the inclusive lower edge; `bucket` is the
@@ -532,5 +624,139 @@ export interface MotionHistogramBucket {
   bucket_start: string;
   event_count: number;
   clip_count: number;
+}
+
+// ---------------------------------------------------------------------------
+// M7 Step 6 — alert-delivery policy + sinks health.
+//
+// Mirrors:
+//   - nexus_types::{DeliverySchedule, DeliverySettings, RuleDeliveryPolicy}
+//   - nexus_store::outbox::{OutboxRow, OutboxStatus, SuppressionReason,
+//                            OutboxSinkCounts}
+//   - the inline `RuleDeliveryResp` / `SinksHealthResp` / `SinksHealthWindow`
+//     / `SinkHealthRow` shapes defined in crates/nexus-engine/src/api.rs.
+//
+// Wire-level invariants the UI relies on:
+//   * `DeliverySchedule.grid` is exactly 7 outer × 48 inner; the engine
+//     400s any payload that doesn't match (see `DeliverySchedule::validate`).
+//   * Day 0 = Monday (`chrono::Weekday::num_days_from_monday()`); slot index
+//     is half-hours since 00:00 local time, evaluated in the operator's
+//     IANA `timezone` from `DeliverySettings`.
+//   * `effective` mirrors the cascade in `evaluate_cascade`:
+//       enabled  = global.enabled && (rule.enabled ?? true)
+//       schedule = rule.schedule ?? global.schedule   (rule REPLACES global)
+// ---------------------------------------------------------------------------
+
+/// Weekly delivery schedule, 7 days × 48 half-hour slots. `grid[d][s]`
+/// is `true` when the slot allows delivery. Day index follows
+/// `chrono::Weekday::num_days_from_monday()` (0 = Monday, 6 = Sunday);
+/// slot index is `hour * 2 + (minute >= 30 ? 1 : 0)`.
+export interface DeliverySchedule {
+  grid: boolean[][];
+}
+
+/// `GET/PUT /api/v1/admin/delivery` body. `updated_at` is
+/// server-set on every PUT and ignored on inbound writes (the
+/// engine overrides it from `Utc::now()`).
+export interface DeliverySettings {
+  enabled: boolean;
+  schedule: DeliverySchedule | null;
+  timezone: string;
+  updated_at: string;
+}
+
+/// Per-rule override. `enabled = false` blocks every delivery for
+/// the rule; `schedule = null` means "inherit the global schedule".
+/// `schedule = {...}` REPLACES (does not intersect) the global one.
+export interface RuleDeliveryPolicy {
+  enabled: boolean;
+  schedule?: DeliverySchedule | null;
+}
+
+/// `GET /api/v1/rules/:id/delivery` response. `policy = null` ⇔
+/// `inherited = true`. `effective` is the cascade-resolved view —
+/// safe to render directly without additional logic.
+export interface RuleDeliveryResponse {
+  policy: RuleDeliveryPolicy | null;
+  effective: RuleDeliveryPolicy;
+  inherited: boolean;
+}
+
+/// `PUT /api/v1/rules/:id/delivery` body. `policy: null` clears
+/// the override and reverts the rule to inheriting global.
+export interface PutRuleDeliveryRequest {
+  policy: RuleDeliveryPolicy | null;
+}
+
+/// `PUT /api/v1/admin/delivery` body. `timezone` is validated as
+/// an IANA name at the API boundary (400 on `Mars/Olympus_Mons`).
+/// Omitting `timezone` defaults to `"UTC"`.
+export interface PutAdminDeliveryRequest {
+  enabled: boolean;
+  schedule?: DeliverySchedule | null;
+  timezone?: string;
+}
+
+export type OutboxStatus =
+  | "pending"
+  | "sent"
+  | "failed"
+  | "dead"
+  | "suppressed";
+
+export type SuppressionReason =
+  | "global_disabled"
+  | "rule_disabled"
+  | "off_schedule_global"
+  | "off_schedule_rule";
+
+/// One per-sink delivery attempt row. Returned in chronological
+/// order (oldest first) so the alert-detail UI can render the
+/// timeline of attempts left-to-right.
+export interface OutboxRow {
+  id: number;
+  event_id: EventId;
+  sink_id: string;
+  status: OutboxStatus;
+  attempts: number;
+  next_attempt_at: string | null;
+  last_error: string | null;
+  suppression_reason: SuppressionReason | null;
+  created_at: string;
+  delivered_at: string | null;
+}
+
+/// Aggregate counts for one sink over one time window. Powers the
+/// `/admin/delivery` sinks-health card.
+export interface OutboxSinkCounts {
+  sink_id: string;
+  sent: number;
+  failed: number;
+  dead: number;
+  suppressed: number;
+  pending: number;
+}
+
+/// Window definition for the sinks-health card. `secs` is the
+/// inclusive lower edge passed to the SQL `WHERE created_at > ?`
+/// clause; the UI uses `label` as the column header.
+export interface SinksHealthWindow {
+  label: string;
+  secs: number;
+}
+
+/// One row in the sinks-health card. `configured = false` means
+/// the sink id appears in `alert_sink_outbox` but is no longer
+/// listed in `cfg.sinks` (operator deleted it). `counts` is keyed
+/// by `SinksHealthWindow.label`.
+export interface SinkHealthRow {
+  sink_id: string;
+  configured: boolean;
+  counts: Record<string, OutboxSinkCounts>;
+}
+
+export interface SinksHealthResponse {
+  windows: SinksHealthWindow[];
+  sinks: SinkHealthRow[];
 }
 

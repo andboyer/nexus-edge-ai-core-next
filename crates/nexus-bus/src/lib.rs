@@ -96,6 +96,29 @@ pub mod topic {
     /// — that's a hardware-level failure, not something the
     /// recorder can recover from).
     pub const STORAGE_USB_DETACHED: &str = "storage.usb.detached";
+
+    // ---- M7 Step 5 — delivery-policy hot-reload topics ----
+    //
+    // The dispatcher caches `DeliverySettings` and the per-rule
+    // `RuleDeliveryPolicy` map in `ArcSwap`s and reloads on the
+    // signals below. Payloads are metadata-only sentinels; the
+    // dispatcher always re-reads the store on a signal rather
+    // than trusting an inline payload, so a Lagged subscriber
+    // catching up still converges on the right state.
+
+    /// `delivery_settings` row mutated. Payload is the empty
+    /// `DeliverySettingsChangedEvent` sentinel — the dispatcher
+    /// re-reads from `nexus-store::delivery_settings_get` on every
+    /// signal. Emitted ONCE per `PUT /api/v1/admin/delivery`.
+    pub const DELIVERY_SETTINGS_CHANGED: &str = "delivery.settings.changed";
+
+    /// `rules.delivery_policy_json` for some rule mutated. Payload
+    /// is `RuleDeliveryPolicyChangedEvent { rule_id }` so the
+    /// dispatcher can drop the cached entry for that rule and
+    /// reload only it. Emitted ONCE per
+    /// `PUT /api/v1/rules/:id/delivery`. The clear-override case
+    /// uses the same topic.
+    pub const RULE_DELIVERY_POLICY_CHANGED: &str = "rule.delivery_policy.changed";
 }
 
 // ---------------------------------------------------------------------------

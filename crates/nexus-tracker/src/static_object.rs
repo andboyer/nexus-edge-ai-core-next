@@ -27,7 +27,39 @@ use std::path::PathBuf;
 use nexus_config::StaticObjectConfig;
 use nexus_types::{CameraId, Frame, TrackId, TrackedObject};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tracing::warn;
+
+/// Attribute key stamped on a `TrackedObject` by [`StaticObjectFilter::classify`]
+/// when the track has been promoted to "static" (parked vehicle, etc.).
+/// Lives in `TrackedObject.attributes` so the wire schema doesn't need a
+/// dedicated field and so the existing `motion.*` / `dwell.*` namespace
+/// pattern is preserved.
+///
+/// The supervisor partitions on this attribute BEFORE invoking the rule
+/// evaluator + motion lifecycle, so a `true` value here means "the live
+/// viewer should still draw this box (de-emphasised) but no rule / clip
+/// / motion event will fire on it".
+pub const STATIC_ATTRIBUTE_KEY: &str = "tracker.is_static";
+
+/// Diagnostic attribute keys stamped on every vehicle-labelled
+/// `TrackedObject` that the filter has seen this frame. Exposes the
+/// FSM's internal state so the live viewer can render an overlay
+/// explaining why a given box was (or wasn't) promoted to static.
+/// Cheap: three JSON numbers per vehicle track per frame.
+pub const EMA_ATTRIBUTE_KEY: &str = "tracker.movement_ema";
+pub const STATIC_FRAMES_ATTRIBUTE_KEY: &str = "tracker.static_frames";
+pub const MOVING_FRAMES_ATTRIBUTE_KEY: &str = "tracker.moving_consecutive_frames";
+
+/// Helper that mirrors the convention used by the supervisor: returns
+/// `true` iff `o.attributes[STATIC_ATTRIBUTE_KEY] == true`. Centralised
+/// here so callers don't reimplement the JSON unwrap pattern.
+pub fn is_object_static(o: &TrackedObject) -> bool {
+    matches!(
+        o.attributes.get(STATIC_ATTRIBUTE_KEY),
+        Some(Value::Bool(true))
+    )
+}
 
 /// In-memory per-track state for the suppression FSM.
 #[derive(Debug, Default, Clone)]
@@ -107,12 +139,19 @@ impl StaticObjectFilter {
         &self.anchors
     }
 
-    /// Drop tracks from `objects` whose smoothed motion has settled
-    /// below threshold for `dwell_frames` consecutive frames (or that
-    /// match a persisted anchor and aren't moving again yet).
-    /// Mutates `objects` in place; mutates internal per-track state
-    /// and the persistent anchor registry.
-    pub fn filter(&mut self, _frame: &Frame, objects: &mut Vec<TrackedObject>) {
+    /// Classify each track in `objects` as static-or-not, and stamp
+    /// [`STATIC_ATTRIBUTE_KEY`] = `true` on the attributes map of any
+    /// object that the suppression FSM has promoted (or that matches
+    /// a persisted anchor and isn't moving again yet). Does NOT
+    /// remove anything from `objects` — production callers want the
+    /// static tracks to flow through to the live viewer with a
+    /// "static" visual indicator, even though the supervisor will
+    /// hide them from rules + the motion lifecycle.
+    ///
+    /// Mutates `objects` in place (only the attributes maps of
+    /// suppressed tracks); mutates internal per-track state and the
+    /// persistent anchor registry.
+    pub fn classify(&mut self, _frame: &Frame, objects: &mut [TrackedObject]) {
         let mut dirty = false;
 
         // Walk the object list, classifying each. Borrow-checker: pull
@@ -122,20 +161,41 @@ impl StaticObjectFilter {
         let cfg_sig_frames = self.cfg.significant_movement_frames.max(1);
         let cfg_alpha = self.cfg.movement_ema_alpha.clamp(0.01, 1.0) as f64;
         let cfg_match_dist = self.cfg.match_distance_pixels.max(1) as f32;
+        let cfg_reset_px = self.cfg.track_id_reuse_reset_pixels as f64;
         let cfg_persistence = self.cfg.persistence_enabled;
 
-        // Build a "suppress?" verdict per-index without removing yet,
-        // because we touch `self.anchors` from inside the loop.
-        let mut to_drop: Vec<bool> = Vec::with_capacity(objects.len());
+        // Build a "static?" verdict per-index without touching the
+        // objects yet, because we mutate `self.anchors` inside the
+        // loop.
+        let mut suppress_verdict: Vec<bool> = Vec::with_capacity(objects.len());
 
         for o in objects.iter() {
             if !is_vehicle_label(&o.label) {
-                to_drop.push(false);
+                suppress_verdict.push(false);
                 continue;
             }
 
             let center = o.bbox.center();
             let state = self.state_by_track.entry(o.track_id).or_default();
+
+            // ---- ID-reuse guard ----
+            // If the apparent center jumped further than the
+            // configured threshold in one frame, the upstream tracker
+            // has almost certainly recycled this `track_id` onto a
+            // different physical object (occlusion -> mis-association,
+            // or a stale ID re-fired after a gap). Wipe the per-track
+            // state so the new vehicle doesn't inherit a stale
+            // `static_promoted = true` from the previous occupant.
+            // `cfg_reset_px == 0` disables the guard entirely.
+            if cfg_reset_px > 0.0 {
+                if let Some((px, py)) = state.last_center {
+                    let dx = (center.0 - px) as f64;
+                    let dy = (center.1 - py) as f64;
+                    if (dx * dx + dy * dy).sqrt() > cfg_reset_px {
+                        *state = PerTrackState::default();
+                    }
+                }
+            }
 
             // ---- update movement EMA ----
             let instant_movement = match state.last_center {
@@ -204,20 +264,56 @@ impl StaticObjectFilter {
                 dirty = true;
             }
 
-            to_drop.push(suppress);
+            suppress_verdict.push(suppress);
         }
 
-        // Apply the verdict.
-        let mut idx = 0;
-        objects.retain(|_| {
-            let keep = !to_drop[idx];
-            idx += 1;
-            keep
-        });
+        // Stamp the attribute on suppressed tracks, plus the
+        // diagnostic EMA / counter triple on every vehicle-labelled
+        // track. The UI's static-debug toggle reads the diagnostic
+        // attrs to show *why* the FSM made the call it did (so an
+        // operator can tell `ema = 5.0` (truly slow) apart from
+        // `ema = 35.99` (just under the cliff)).
+        for (o, suppress) in objects.iter_mut().zip(suppress_verdict.iter().copied()) {
+            if suppress {
+                o.attributes
+                    .insert(STATIC_ATTRIBUTE_KEY.to_string(), Value::Bool(true));
+            }
+            if is_vehicle_label(&o.label) {
+                if let Some(state) = self.state_by_track.get(&o.track_id) {
+                    // `f64 -> serde_json::Number` may fail for NaN /
+                    // Inf; `from_f64` returns `Option`. EMA should
+                    // never be either but be defensive.
+                    if let Some(n) = serde_json::Number::from_f64(state.movement_ema) {
+                        o.attributes
+                            .insert(EMA_ATTRIBUTE_KEY.to_string(), Value::Number(n));
+                    }
+                    o.attributes.insert(
+                        STATIC_FRAMES_ATTRIBUTE_KEY.to_string(),
+                        Value::Number(state.static_frames.into()),
+                    );
+                    o.attributes.insert(
+                        MOVING_FRAMES_ATTRIBUTE_KEY.to_string(),
+                        Value::Number(state.moving_consecutive_frames.into()),
+                    );
+                }
+            }
+        }
 
         if dirty {
             self.save_registry();
         }
+    }
+
+    /// Back-compat wrapper around [`classify`](Self::classify) that
+    /// physically removes suppressed tracks from `objects`. Used by
+    /// the in-crate unit tests and any caller that wants the v1
+    /// "drop entirely" semantics. Production code in
+    /// `nexus-pipeline::supervisor` calls `classify` instead so the
+    /// live viewer can still render static objects with a distinct
+    /// style.
+    pub fn filter(&mut self, frame: &Frame, objects: &mut Vec<TrackedObject>) {
+        self.classify(frame, objects);
+        objects.retain(|o| !is_object_static(o));
     }
 
     // ---------------------------------------------------------------------
@@ -422,6 +518,7 @@ mod tests {
             significant_movement_frames: 2,
             movement_ema_alpha: 1.0,
             match_distance_pixels: 5,
+            track_id_reuse_reset_pixels: 0,
             persistence_enabled: false,
         };
         let mut f = StaticObjectFilter::new(cfg, 1, None);
@@ -448,6 +545,7 @@ mod tests {
             significant_movement_frames: 2,
             movement_ema_alpha: 1.0,
             match_distance_pixels: 5,
+            track_id_reuse_reset_pixels: 0,
             persistence_enabled: false,
         };
         let mut f = StaticObjectFilter::new(cfg, 1, None);
@@ -469,6 +567,7 @@ mod tests {
             significant_movement_frames: 1,
             movement_ema_alpha: 1.0,
             match_distance_pixels: 5,
+            track_id_reuse_reset_pixels: 0,
             persistence_enabled: false,
         };
         let mut f = StaticObjectFilter::new(cfg, 1, None);
@@ -487,6 +586,7 @@ mod tests {
             significant_movement_frames: 2,
             movement_ema_alpha: 1.0,
             match_distance_pixels: 20,
+            track_id_reuse_reset_pixels: 0,
             persistence_enabled: true,
         };
         let mut f = StaticObjectFilter::new(cfg, 1, None);
@@ -510,6 +610,7 @@ mod tests {
             significant_movement_frames: 2,
             movement_ema_alpha: 1.0,
             match_distance_pixels: 30,
+            track_id_reuse_reset_pixels: 0,
             persistence_enabled: true,
         };
         let mut f = StaticObjectFilter::new(cfg, 1, None);
@@ -535,6 +636,7 @@ mod tests {
             significant_movement_frames: 2,
             movement_ema_alpha: 1.0,
             match_distance_pixels: 30,
+            track_id_reuse_reset_pixels: 0,
             persistence_enabled: true,
         };
         let mut f = StaticObjectFilter::new(cfg, 1, None);
@@ -579,6 +681,7 @@ mod tests {
             significant_movement_frames: 2,
             movement_ema_alpha: 1.0,
             match_distance_pixels: 20,
+            track_id_reuse_reset_pixels: 0,
             persistence_enabled: true,
         };
         // Writer phase.
@@ -606,5 +709,82 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.subsec_nanos())
             .unwrap_or(0)
+    }
+
+    #[test]
+    fn track_id_reuse_resets_state() {
+        // Promote a track at (500, 500), then on the next frame the
+        // same `track_id` shows up 400 px away. With the reset guard
+        // enabled the new occupant must NOT inherit `static_promoted`.
+        let cfg = StaticObjectConfig {
+            dwell_frames: 2,
+            significant_movement_pixels: 10,
+            significant_movement_frames: 2,
+            movement_ema_alpha: 1.0,
+            match_distance_pixels: 5,
+            // Disable persistence so an anchor at the old location
+            // can't independently suppress the new one.
+            persistence_enabled: false,
+            // Guard at 100 px — well below the 400 px jump below.
+            track_id_reuse_reset_pixels: 100,
+        };
+        let mut f = StaticObjectFilter::new(cfg, 1, None);
+
+        // Park track 99 at (500, 500) for 3 frames -> promoted.
+        for i in 0..3 {
+            let mut objs = vec![vehicle(99, 500.0, 500.0)];
+            f.filter(&frame(1, i, i as i64 * 33), &mut objs);
+            if i >= 1 {
+                assert!(objs.is_empty(), "frame {i}: should be suppressed");
+            }
+        }
+
+        // Frame 3: the same `track_id` 99 reappears 400 px away. The
+        // reset guard should wipe the FSM state -> the new occupant
+        // is NOT static and the box must pass through.
+        let mut objs = vec![vehicle(99, 900.0, 500.0)];
+        f.filter(&frame(1, 3, 99), &mut objs);
+        assert_eq!(
+            objs.len(),
+            1,
+            "track-id-reuse guard should let the new physical object through"
+        );
+
+        // And it should stay through on the very next frame (state
+        // truly cleared, not just one-shot).
+        let mut objs = vec![vehicle(99, 910.0, 500.0)];
+        f.filter(&frame(1, 4, 132), &mut objs);
+        assert_eq!(objs.len(), 1, "second frame must also pass");
+    }
+
+    #[test]
+    fn track_id_reuse_guard_disabled_when_zero() {
+        // Same scenario as above but with `track_id_reuse_reset_pixels: 0`
+        // — the guard is off, so the new occupant DOES inherit the
+        // promoted state. Verifies the kill switch.
+        let cfg = StaticObjectConfig {
+            dwell_frames: 2,
+            significant_movement_pixels: 10,
+            significant_movement_frames: 2,
+            movement_ema_alpha: 1.0,
+            match_distance_pixels: 5,
+            persistence_enabled: false,
+            track_id_reuse_reset_pixels: 0,
+        };
+        let mut f = StaticObjectFilter::new(cfg, 1, None);
+        for i in 0..3 {
+            let mut objs = vec![vehicle(99, 500.0, 500.0)];
+            f.filter(&frame(1, i, i as i64 * 33), &mut objs);
+        }
+        // Same track_id, huge jump — but moving_consecutive_frames
+        // climbs to 1 from this single fast move (instant_movement =
+        // 400 px >= 10 px threshold). With sig_frames = 2 the
+        // suppression should still hold for this one frame.
+        let mut objs = vec![vehicle(99, 900.0, 500.0)];
+        f.filter(&frame(1, 3, 99), &mut objs);
+        assert!(
+            objs.is_empty(),
+            "with guard disabled, the new occupant inherits suppression"
+        );
     }
 }

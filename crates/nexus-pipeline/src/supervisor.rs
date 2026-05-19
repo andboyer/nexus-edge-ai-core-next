@@ -14,10 +14,10 @@ use nexus_inference::Detector;
 use nexus_rules::RuleEvaluator;
 use nexus_store::{EventStore, MotionEventKind, NewMotionEvent, Store};
 use nexus_tracker::{
-    filter_excluded_zones, MotionDecision, MotionEventEmitter, MotionKind, StaticObjectFilter,
-    TrackAnnotator, Tracker,
+    filter_excluded_zones, is_object_static, MotionDecision, MotionEventEmitter, MotionKind,
+    StaticObjectFilter, TrackAnnotator, Tracker,
 };
-use nexus_types::{CameraId, Frame, FrameMetadata, PipelineState, PipelineStatus};
+use nexus_types::{CameraId, Frame, FrameMetadata, PipelineState, PipelineStatus, TrackedObject};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, info_span, warn, Instrument};
@@ -264,7 +264,13 @@ async fn run_camera(
             }
             if let Some(sf) = static_filter.as_mut() {
                 let _g = info_span!("frame.static_filter", filter = sf.name()).entered();
-                sf.filter(&frame, &mut tracked);
+                // Mark suppressed tracks (writes
+                // `tracker.is_static = true` into the object's
+                // attributes map) but do NOT remove them. The live
+                // viewer needs to see them to render the
+                // "static" indicator; the partition below keeps
+                // them out of rule eval + the motion lifecycle.
+                sf.classify(&frame, &mut tracked);
             }
             let tracked_arc = Arc::new(tracked.clone());
 
@@ -283,6 +289,24 @@ async fn run_camera(
             };
             let _ = bus.publish(topic::FRAME_METADATA, &meta).await;
 
+            // Partition: rules and the motion lifecycle only see
+            // non-static tracks. A parked car shouldn't keep firing
+            // rules or generating motion_events rows, but it MUST
+            // still appear in the L7 cache + FRAME_METADATA above
+            // so the live viewer can draw it (de-emphasised) and
+            // so the operator can see the static-suppression in
+            // action. When `static_filter` is `None`, no object can
+            // be marked static so we just clone the full slice.
+            let dynamic_tracked: Vec<TrackedObject> = if static_filter.is_some() {
+                tracked
+                    .iter()
+                    .filter(|t| !is_object_static(t))
+                    .cloned()
+                    .collect()
+            } else {
+                tracked.clone()
+            };
+
             let events = {
                 let _g = info_span!("frame.rules").entered();
                 evaluator.evaluate(
@@ -292,7 +316,7 @@ async fn run_camera(
                     frame.width,
                     frame.height,
                     &zones,
-                    &tracked,
+                    &dynamic_tracked,
                 )
             };
             // Record + publish the events now so the row exists.
@@ -321,7 +345,7 @@ async fn run_camera(
             // across recorder/store awaits because EnteredSpan is
             // !Send and would break tokio::spawn.
             let decisions = info_span!("frame.motion")
-                .in_scope(|| emitter.tick(cfg.id, &tracked, frame.captured_at));
+                .in_scope(|| emitter.tick(cfg.id, &dynamic_tracked, frame.captured_at));
             for d in &decisions {
                 let should_open = current_clip.is_none()
                     && (matches!(d.kind, MotionKind::Born) || force_reopen_after_rotation);

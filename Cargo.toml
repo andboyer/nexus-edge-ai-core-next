@@ -11,6 +11,7 @@ members = [
     "crates/nexus-inference",
     "crates/nexus-storage",
     "crates/nexus-storage-cloud",
+    "crates/nexus-sinks",
     "crates/nexus-pipeline",
     "crates/nexus-engine",
     "crates/nexus-probe",
@@ -48,6 +49,9 @@ anyhow = "1"
 thiserror = "2"
 uuid = { version = "1", features = ["v7", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
+# IANA timezone DB. Used by M7 alert-delivery scheduler to resolve
+# weekly schedules into the operator-configured local timezone.
+chrono-tz = { version = "0.10", features = ["serde"] }
 
 # Tracing / OTEL
 tracing = "0.1"
@@ -189,6 +193,7 @@ nexus-tracker = { path = "crates/nexus-tracker" }
 nexus-inference = { path = "crates/nexus-inference" }
 nexus-storage = { path = "crates/nexus-storage" }
 nexus-storage-cloud = { path = "crates/nexus-storage-cloud" }
+nexus-sinks = { path = "crates/nexus-sinks" }
 nexus-pipeline = { path = "crates/nexus-pipeline" }
 nexus-probe = { path = "crates/nexus-probe" }
 
