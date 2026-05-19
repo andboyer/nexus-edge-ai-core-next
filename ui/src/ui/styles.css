@@ -2491,3 +2491,150 @@ button.chip {
   background: var(--crit);
 }
 
+
+/* ==========================================================
+   M6 Phase 2 Step 2.9 — login overlay + topbar session widget.
+   The overlay is a fixed full-viewport flexbox so it covers
+   the shell completely. Stacked above modals (z-index 9500
+   vs. the existing 9000 dialog backdrop) because the login
+   surface must outrank any in-progress UI dialog.
+   ========================================================== */
+.auth-overlay {
+  position: fixed;
+  inset: 0;
+  background: var(--bg);
+  display: none;
+  align-items: center;
+  justify-content: center;
+  z-index: 9500;
+  padding: 16px;
+}
+
+.auth-card {
+  background: var(--bg-elev);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  box-shadow: var(--shadow);
+  width: 380px;
+  max-width: 100%;
+  padding: 28px 28px 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.auth-brand {
+  font-size: 20px;
+  font-weight: 600;
+  letter-spacing: 0.4px;
+  color: var(--accent);
+}
+
+.auth-subtitle {
+  font-size: 13px;
+  color: var(--text-dim);
+  margin-bottom: 4px;
+}
+
+.auth-form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.auth-label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.auth-input {
+  background: var(--bg);
+  border: 1px solid var(--line);
+  color: var(--text);
+  border-radius: 4px;
+  padding: 8px 10px;
+  font-size: 14px;
+  font-family: inherit;
+}
+
+.auth-input:focus {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+}
+
+.auth-submit {
+  background: var(--accent);
+  color: #06262d;
+  border: none;
+  border-radius: 4px;
+  padding: 9px 12px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  font-family: inherit;
+}
+
+.auth-submit:disabled {
+  opacity: 0.6;
+  cursor: progress;
+}
+
+.auth-submit:hover:not(:disabled) {
+  background: #5becff;
+}
+
+.auth-secondary {
+  background: transparent;
+  color: var(--text-dim);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 7px 10px;
+  font-size: 12px;
+  cursor: pointer;
+  font-family: inherit;
+}
+
+.auth-secondary:hover:not(:disabled) {
+  color: var(--text);
+  border-color: var(--text-dim);
+}
+
+.auth-error {
+  background: rgba(239, 71, 111, 0.08);
+  border: 1px solid var(--crit);
+  color: var(--crit);
+  border-radius: 4px;
+  padding: 8px 10px;
+  font-size: 12px;
+}
+
+/* Topbar session widget (current-user chip + sign-out
+   button) — sits between the dev-token paste-field and the
+   auth-status pill. Only rendered when a session exists. */
+.topbar-user {
+  font-size: 12px;
+  color: var(--text-dim);
+  padding: 4px 8px;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  font-family: ui-monospace, "JetBrains Mono", "Fira Code", monospace;
+}
+
+.topbar-signout {
+  background: transparent;
+  color: var(--text-dim);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  padding: 4px 10px;
+  font-size: 12px;
+  cursor: pointer;
+  font-family: inherit;
+}
+
+.topbar-signout:hover {
+  color: var(--text);
+  border-color: var(--text-dim);
+}

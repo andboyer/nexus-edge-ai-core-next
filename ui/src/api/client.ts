@@ -2,7 +2,7 @@
 // `./types.ts`, so callers can never confuse the API shape with the UI's
 // own state.
 
-import { authHeader, reportRequestOutcome } from "../lib/auth.js";
+import { authHeader, reportRequestOutcome, tryRefresh, getSession } from "../lib/auth.js";
 import type {
   AlertEvent,
   BackendsResponse,
@@ -44,16 +44,39 @@ import type {
 
 const BASE = "/api";
 
+/// One-shot fetch wrapper. Auto-refreshes a stale session token
+/// once on 401 (M6 Phase 2 Step 2.9) and retries the original
+/// request. If refresh fails the second 401 propagates as a
+/// thrown Error — the topbar status pill flips red and the
+/// auth overlay decides whether to re-prompt for login.
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const method = (init?.method ?? "GET").toUpperCase();
-  const res = await fetch(BASE + path, {
-    ...init,
-    headers: {
-      "Content-Type": "application/json",
-      ...authHeader(),
-      ...(init?.headers ?? {}),
-    },
-  });
+
+  const doFetch = (): Promise<Response> =>
+    fetch(BASE + path, {
+      ...init,
+      headers: {
+        "Content-Type": "application/json",
+        ...authHeader(),
+        ...(init?.headers ?? {}),
+      },
+    });
+
+  let res = await doFetch();
+
+  // Auto-refresh path: only attempt when we hold a session AND
+  // the engine actually said 401 (don't try to refresh a 403,
+  // which means the bearer is fine but the role is wrong). We
+  // also DON'T touch the auth endpoints themselves — they're
+  // their own recovery path; refreshing on a 401 from `/login`
+  // would be circular.
+  if (res.status === 401 && getSession() && !path.startsWith("/v1/auth/")) {
+    const refreshed = await tryRefresh();
+    if (refreshed) {
+      res = await doFetch();
+    }
+  }
+
   reportRequestOutcome(method, res.status);
   if (!res.ok) {
     const text = await res.text().catch(() => "");

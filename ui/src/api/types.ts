@@ -760,3 +760,69 @@ export interface SinksHealthResponse {
   sinks: SinkHealthRow[];
 }
 
+// ---------------------------------------------------------------------------
+// M6 Phase 2 — auth wire types. Mirror of the Rust shapes in
+// `crates/nexus-engine/src/auth/login.rs` (LoginRequest,
+// RefreshRequest, LogoutRequest, ChangePasswordRequest,
+// TokenResponse, SessionUser) and of `get_auth_info` in
+// `crates/nexus-engine/src/api.rs`. Keep these literal: a typo
+// here silently breaks login.
+// ---------------------------------------------------------------------------
+
+/// `auth.mode` from `nexus.toml`, snapshotted at engine boot.
+/// Drives which login surface the SPA renders.
+export type AuthMode = "none" | "dev_token" | "local" | "oidc" | "hybrid";
+
+/// `GET /api/v1/auth/info` — public probe. No bearer required.
+export interface AuthInfoResponse {
+  mode: AuthMode;
+  allows_local: boolean;
+  allows_oidc: boolean;
+}
+
+export type Role = "admin" | "operator" | "viewer";
+
+export interface SessionUser {
+  id: number;
+  username: string;
+  role: Role;
+  force_password_reset: boolean;
+}
+
+/// `POST /api/v1/auth/login` body.
+export interface LoginRequest {
+  username: string;
+  password: string;
+}
+
+/// `POST /api/v1/auth/refresh` body.
+export interface RefreshRequest {
+  refresh_token: string;
+}
+
+/// `POST /api/v1/auth/logout` body. Both fields optional; logout
+/// also reads the session cookie. The SPA only ever calls this
+/// with `{refresh_token}`.
+export interface LogoutRequest {
+  refresh_token?: string;
+}
+
+/// `POST /api/v1/auth/change-password` body. Used by the
+/// force-password-reset modal AND by the future self-serve
+/// password change form.
+export interface ChangePasswordRequest {
+  old_password: string;
+  new_password: string;
+}
+
+/// Mirror of `auth::login::TokenResponse`. Returned by both
+/// `/login` and `/refresh`. `expires_in` / `refresh_expires_in`
+/// are seconds-until-expiry (OAuth 2.0 convention).
+export interface TokenResponse {
+  access_token: string;
+  refresh_token: string;
+  expires_in: number;
+  refresh_expires_in: number;
+  user: SessionUser;
+}
+

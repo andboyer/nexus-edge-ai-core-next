@@ -10,7 +10,22 @@ import { renderAdminDelivery } from "./ui/admin-delivery.js";
 import { renderTimeline } from "./ui/timeline.js";
 import { mountAlertTicker } from "./ui/alert-ticker.js";
 import { api } from "./api/client.js";
-import { getToken, setToken, onAuthStatusChange } from "./lib/auth.js";
+import {
+  getSession,
+  getToken,
+  loadAuthInfo,
+  logout,
+  onAuthStatusChange,
+  onAuthInfoChange,
+  onSessionChange,
+  setToken,
+} from "./lib/auth.js";
+import { mountForcePasswordResetModal } from "./ui/change-password-modal.js";
+import {
+  hideLoginOverlay,
+  hasUsableSession,
+  showLoginOverlay,
+} from "./ui/login.js";
 
 type TabRender = (root: HTMLElement) => void | Promise<void>;
 
@@ -108,14 +123,29 @@ function buildSidebar(sidebar: HTMLElement): void {
   }
 }
 
-function mountTokenField(): void {
-  const input = document.getElementById("admin-token") as HTMLInputElement | null;
-  const pill = document.getElementById("token-pill") as HTMLSpanElement | null;
-  if (!input || !pill) return;
+/// M6 Phase 2 Step 2.9 — mode-aware topbar.
+///
+/// * `none` / `dev_token`: legacy paste-field stays visible
+///   (loopback mode + dev workflows). Status pill driven by
+///   the legacy bearer.
+/// * `local` / `oidc` / `hybrid`: hide the paste-field, show
+///   the current user + role + a Sign-out link instead. Status
+///   pill is driven by the session.
+function mountTopbarAuth(): void {
+  const inputEl = document.getElementById("admin-token") as HTMLInputElement | null;
+  const pillEl = document.getElementById("token-pill") as HTMLSpanElement | null;
+  const authBoxEl = document.getElementById("topbar-auth") as HTMLElement | null;
+  if (!inputEl || !pillEl || !authBoxEl) return;
+  // Re-alias to non-null bindings so nested closures don't
+  // need `!` everywhere — TS can't propagate the early-return
+  // narrowing across function boundaries.
+  const input: HTMLInputElement = inputEl;
+  const pill: HTMLSpanElement = pillEl;
+  const authBox: HTMLElement = authBoxEl;
 
+  // Legacy paste-field — preserved exactly as before so dev
+  // workflows keep working.
   input.value = getToken() ?? "";
-
-  // Debounce so we don't write to localStorage on every keystroke.
   let timer: number | undefined;
   input.addEventListener("input", () => {
     if (timer != null) window.clearTimeout(timer);
@@ -124,12 +154,99 @@ function mountTokenField(): void {
     }, 300);
   });
 
+  // User-info chip (rendered next to the pill when a session
+  // exists). Lazily created so we don't pollute the DOM when
+  // we're in dev-token mode.
+  let userChip: HTMLElement | null = null;
+  let signOutBtn: HTMLElement | null = null;
+
+  function renderSessionWidget(): void {
+    const session = getSession();
+    if (session) {
+      input.style.display = "none";
+      if (!userChip) {
+        userChip = document.createElement("span");
+        userChip.id = "topbar-user";
+        userChip.className = "topbar-user";
+        authBox.insertBefore(userChip, pill);
+      }
+      userChip.textContent = `${session.user.username} · ${session.user.role}`;
+      userChip.title = `Signed in as ${session.user.username} (${session.user.role})`;
+      if (!signOutBtn) {
+        signOutBtn = document.createElement("button");
+        signOutBtn.id = "topbar-signout";
+        signOutBtn.className = "topbar-signout";
+        signOutBtn.textContent = "Sign out";
+        signOutBtn.addEventListener("click", () => {
+          void logout();
+        });
+        authBox.insertBefore(signOutBtn, pill);
+      }
+    } else {
+      if (userChip) {
+        authBox.removeChild(userChip);
+        userChip = null;
+      }
+      if (signOutBtn) {
+        authBox.removeChild(signOutBtn);
+        signOutBtn = null;
+      }
+      // Re-show the paste-field only if the mode allows it
+      // (mode-aware visibility is applied separately below).
+    }
+  }
+
+  function applyModeVisibility(): void {
+    const info = getCachedAuthInfoFromAttribute();
+    const hidesDevField =
+      info?.mode === "local" || info?.mode === "oidc" || info?.mode === "hybrid";
+    if (hidesDevField && !getSession()) {
+      // Login overlay is up — don't bother showing the
+      // paste-field; the overlay covers the whole viewport
+      // anyway.
+      input.style.display = "none";
+    } else if (!hidesDevField) {
+      input.style.display = "";
+    }
+  }
+
   onAuthStatusChange((s) => {
     pill.classList.remove("token-pill-ok", "token-pill-bad", "token-pill-unknown");
-    const cls = s === "ok" ? "token-pill-ok" : s === "unauthorized" ? "token-pill-bad" : "token-pill-unknown";
+    const cls =
+      s === "ok"
+        ? "token-pill-ok"
+        : s === "unauthorized"
+          ? "token-pill-bad"
+          : "token-pill-unknown";
     pill.classList.add(cls);
     pill.title = `Auth: ${s}`;
   });
+
+  onSessionChange(() => {
+    renderSessionWidget();
+    applyModeVisibility();
+  });
+
+  onAuthInfoChange((info) => {
+    if (info) {
+      authBox.dataset["mode"] = info.mode;
+    } else {
+      delete authBox.dataset["mode"];
+    }
+    applyModeVisibility();
+  });
+
+  renderSessionWidget();
+  applyModeVisibility();
+}
+
+/// Tiny read-through of the topbar's `data-mode` attribute,
+/// kept in sync by `mountTopbarAuth`. Used by the visibility
+/// helper above to avoid threading `info` through callbacks.
+function getCachedAuthInfoFromAttribute(): { mode: string } | null {
+  const authBox = document.getElementById("topbar-auth");
+  const mode = authBox?.dataset["mode"];
+  return mode ? { mode } : null;
 }
 
 async function pollHealth(dot: HTMLElement) {
@@ -143,15 +260,22 @@ async function pollHealth(dot: HTMLElement) {
   }
 }
 
-function main() {
+/// Mount the long-running app shell (sidebar, main pane, alert
+/// ticker, health dot). Idempotent — guarded by an internal
+/// flag so re-mounts after logout-then-login don't duplicate
+/// the alert ticker subscriptions.
+let shellMounted = false;
+function mountShell(): void {
+  if (shellMounted) return;
+  shellMounted = true;
+
   const sidebarEl = document.getElementById("sidebar") as HTMLElement;
   const mainEl = document.getElementById("main") as HTMLElement;
   const appEl = document.getElementById("app") as HTMLElement;
   const dot = document.getElementById("health-dot") as HTMLElement;
 
+  appEl.style.display = "";
   buildSidebar(sidebarEl);
-  mountTokenField();
-
   window.addEventListener("hashchange", () =>
     activate(readTab(), mainEl, sidebarEl, appEl),
   );
@@ -162,4 +286,67 @@ function main() {
   setInterval(() => void pollHealth(dot), 10_000);
 }
 
-main();
+/// Hide / show the shell DOM. We don't unmount on logout —
+/// just hide the app grid so the login overlay covers the
+/// viewport on its own.
+function setShellVisible(visible: boolean): void {
+  const appEl = document.getElementById("app");
+  if (appEl) appEl.style.display = visible ? "" : "none";
+}
+
+async function main() {
+  mountTopbarAuth();
+
+  // Probe the engine to learn which login surface to render.
+  // On network failure we fall back to "show the shell" — that
+  // keeps the dev_token paste-field reachable so the operator
+  // can recover even with the auth endpoint temporarily
+  // unreachable.
+  const info = await loadAuthInfo();
+  const mode = info?.mode ?? "dev_token";
+  const needsSessionLogin = mode === "local" || mode === "hybrid";
+
+  if (needsSessionLogin && !hasUsableSession()) {
+    // No session yet — render the overlay first; mount the
+    // shell only after the user completes login.
+    setShellVisible(false);
+    showLoginOverlay(() => {
+      hideLoginOverlay();
+      setShellVisible(true);
+      mountShell();
+    });
+  } else if (needsSessionLogin && getSession()?.user.force_password_reset) {
+    // Have a session but flagged for forced reset (e.g. the
+    // tab was reloaded right after admin reset-password).
+    // Modal-only until they resolve it.
+    setShellVisible(false);
+    mountForcePasswordResetModal(getSession()!, () => {
+      setShellVisible(true);
+      mountShell();
+    });
+  } else {
+    // dev_token / none / already-logged-in: straight to the
+    // shell.
+    mountShell();
+  }
+
+  // Watch for logout while the shell is up — drop back into
+  // the overlay loop. Watch for session re-acquisition (e.g.
+  // someone hand-edits localStorage) — mount the shell.
+  onSessionChange((session) => {
+    if (!needsSessionLogin) return;
+    if (!session) {
+      setShellVisible(false);
+      showLoginOverlay(() => {
+        hideLoginOverlay();
+        setShellVisible(true);
+        mountShell();
+      });
+    } else if (!shellMounted && !session.user.force_password_reset) {
+      setShellVisible(true);
+      mountShell();
+    }
+  });
+}
+
+void main();
