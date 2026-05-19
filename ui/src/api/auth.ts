@@ -87,12 +87,14 @@ export const auth = {
       headers: { Authorization: `Bearer ${accessToken}` },
     }),
 
-  /// 200 with a fresh (access, refresh) pair on success. Clears
-  /// `users.force_password_reset` server-side. The caller MUST
-  /// replace its stored session with the response — every prior
-  /// refresh token for this user is revoked atomically.
+  /// 204 No Content on success. Clears
+  /// `users.force_password_reset` server-side and rotates the
+  /// refresh-token chain (every prior refresh token for this
+  /// user is revoked atomically). The existing access token
+  /// remains valid until its TTL expires; subsequent refreshes
+  /// will fail and bump the user back to login.
   changePassword: (req: ChangePasswordRequest, accessToken: string) =>
-    rawRequest<TokenResponse>("/v1/auth/change-password", {
+    rawRequest<void>("/v1/auth/change-password", {
       method: "POST",
       body: JSON.stringify(req),
       headers: { Authorization: `Bearer ${accessToken}` },

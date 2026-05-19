@@ -23,8 +23,8 @@
 import { auth as authApi } from "../api/auth.js";
 import {
   type Session,
+  getSession,
   logout,
-  sessionFromTokenResponse,
   setSession,
 } from "../lib/auth.js";
 
@@ -157,8 +157,26 @@ export function mountForcePasswordResetModal(
         { old_password: oldPassword, new_password: newPassword },
         session.access_token,
       )
-      .then((tok) => {
-        setSession(sessionFromTokenResponse(tok));
+      .then(() => {
+        // Engine returns 204 No Content on success — there is
+        // no fresh TokenResponse to consume. The existing
+        // access_token remains valid until its TTL expires.
+        // The refresh-token chain is rotated server-side, so
+        // the next refresh attempt will fail; the user will be
+        // bumped back to login at that point (acceptable —
+        // password just changed).
+        //
+        // What we MUST do here is clear `force_password_reset`
+        // on the locally-cached session so `main.ts` lets the
+        // shell mount instead of re-opening this modal on the
+        // next render tick.
+        const current = getSession();
+        if (current != null) {
+          setSession({
+            ...current,
+            user: { ...current.user, force_password_reset: false },
+          });
+        }
         host.style.display = "none";
         onComplete();
       })
