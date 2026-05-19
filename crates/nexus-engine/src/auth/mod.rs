@@ -13,11 +13,12 @@
 //!   off the request, decodes the JWT, and asserts a minimum
 //!   role. Bridges the legacy `AdminClaims` shape during the
 //!   deprecation window (Phase 2 Step 2.5).
+//! * [`bootstrap`] — first-boot admin provisioning. Runs once
+//!   when `auth.mode` allows local users AND the `users` table
+//!   is empty (Phase 2 Step 2.6).
 //!
 //! Future siblings (planned in [`docs/M6_IDENTITY.md`](../../../docs/M6_IDENTITY.md)):
 //!
-//! * `bootstrap` — one-shot CLI / first-run seed for the
-//!   initial admin user (Phase 2 Step 2.6).
 //! * `login` — axum handler that consumes the above primitives
 //!   and issues the session cookie (Phase 2 Step 2.7).
 //!
@@ -39,3 +40,5 @@ pub mod lockout;
 pub mod sessions;
 #[allow(dead_code)]
 pub mod require_role;
+#[allow(dead_code)]
+pub mod bootstrap;

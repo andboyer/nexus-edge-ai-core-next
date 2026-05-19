@@ -266,6 +266,22 @@ impl Store {
         Ok(row.map(|r| (r.get::<i64, _>(0), r.get::<String, _>(1))))
     }
 
+    /// Total rows in the `users` table, INCLUDING soft-deleted
+    /// tombstones and disabled accounts. Used exclusively by the
+    /// first-boot bootstrap (`nexus-engine::auth::bootstrap`) to
+    /// answer "have we ever provisioned a user?" — once any row
+    /// exists we never auto-create another. Counting tombstones
+    /// is deliberate: if the only admin was soft-deleted, a
+    /// silent re-bootstrap would print a fresh password to logs
+    /// and grant access to anyone reading them. Operator must
+    /// recover via the CLI instead.
+    pub async fn count_users(&self) -> Result<i64, StoreError> {
+        let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(row.0)
+    }
+
     /// Active admins = role = 'admin' AND not soft-deleted AND
     /// not disabled. Used by last-admin protection on every
     /// downgrade path.
