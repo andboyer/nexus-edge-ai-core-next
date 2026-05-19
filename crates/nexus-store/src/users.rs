@@ -170,10 +170,7 @@ impl Store {
     /// NOCASE index). Returns `None` for both
     /// "no such user" and "soft-deleted user" — the login
     /// handler treats them identically to avoid enumeration.
-    pub async fn get_user_by_username(
-        &self,
-        username: &str,
-    ) -> Result<Option<User>, StoreError> {
+    pub async fn get_user_by_username(&self, username: &str) -> Result<Option<User>, StoreError> {
         let row = sqlx::query(USER_SELECT_PREFIX_SQL)
             .bind(username)
             .fetch_optional(&self.pool)
@@ -221,10 +218,7 @@ impl Store {
 
     /// /admin/users listing. Pass `include_deleted = true` to
     /// surface tombstones; default UI hides them.
-    pub async fn list_users(
-        &self,
-        include_deleted: bool,
-    ) -> Result<Vec<User>, StoreError> {
+    pub async fn list_users(&self, include_deleted: bool) -> Result<Vec<User>, StoreError> {
         let sql = if include_deleted {
             "SELECT id, username, password_hash, oidc_subject, role,
                     force_password_reset, disabled,
@@ -300,11 +294,7 @@ impl Store {
     /// Atomically: read current row, apply last-admin check (if
     /// downgrading from admin), then `UPDATE`. Returns `NotFound`
     /// if the user does not exist or is already soft-deleted.
-    pub async fn update_user_role(
-        &self,
-        id: UserId,
-        new_role: Role,
-    ) -> Result<(), UsersError> {
+    pub async fn update_user_role(&self, id: UserId, new_role: Role) -> Result<(), UsersError> {
         let mut tx = self
             .pool
             .begin()
@@ -335,11 +325,7 @@ impl Store {
 
     /// Disable / re-enable a user. Disabling an admin trips
     /// last-admin protection. Re-enabling never does.
-    pub async fn set_user_disabled(
-        &self,
-        id: UserId,
-        disabled: bool,
-    ) -> Result<(), UsersError> {
+    pub async fn set_user_disabled(&self, id: UserId, disabled: bool) -> Result<(), UsersError> {
         let mut tx = self
             .pool
             .begin()
@@ -522,11 +508,7 @@ impl Store {
             return Err(UsersError::LastAdmin);
         }
         let now = Utc::now();
-        let renamed = format!(
-            "{}:deleted-{}",
-            id,
-            now.format("%Y%m%dT%H%M%S%.3fZ")
-        );
+        let renamed = format!("{}:deleted-{}", id, now.format("%Y%m%dT%H%M%S%.3fZ"));
         sqlx::query(
             "UPDATE users
                 SET username = ?,
@@ -553,8 +535,7 @@ impl Store {
 // Internal helpers.
 // ---------------------------------------------------------------------------
 
-const USER_SELECT_PREFIX_SQL: &str =
-    "SELECT id, username, password_hash, oidc_subject, role,
+const USER_SELECT_PREFIX_SQL: &str = "SELECT id, username, password_hash, oidc_subject, role,
             force_password_reset, disabled,
             failed_login_count, locked_until,
             last_login_at, last_failed_login_at,
@@ -568,9 +549,7 @@ const USER_SELECT_PREFIX_SQL: &str =
 /// `BEGIN DEFERRED` (which on write upgrades to RESERVED). For
 /// SQLite + a single-process engine this is sufficient — no
 /// other writer can sneak between the COUNT and the UPDATE.
-async fn active_admins_in_tx(
-    tx: &mut Transaction<'_, Sqlite>,
-) -> Result<i64, UsersError> {
+async fn active_admins_in_tx(tx: &mut Transaction<'_, Sqlite>) -> Result<i64, UsersError> {
     let row: (i64,) = sqlx::query_as(
         "SELECT COUNT(*) FROM users
          WHERE role = 'admin' AND deleted_at IS NULL AND disabled = 0",

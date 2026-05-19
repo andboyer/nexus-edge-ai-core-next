@@ -145,6 +145,12 @@ pub struct ApiState {
     /// (so the UI doesn't appear to forget a freshly-added sink
     /// just because no alerts have fired yet).
     pub sink_registry: Arc<nexus_sinks::SinkRegistry>,
+    /// M6 Phase 2 Step 2.7 — failed-login lockout policy.
+    /// Snapshot of `runtime.auth.lockout` at engine boot;
+    /// consumed by `auth::login::post_login` via the
+    /// `LoginState::from_ref` bridge. Cheap to clone — three
+    /// u32 fields.
+    pub lockout: nexus_config::LockoutConfig,
 }
 
 pub fn router(state: ApiState) -> Router {
@@ -280,6 +286,26 @@ pub fn router(state: ApiState) -> Router {
         // browser here; authentication is via the unguessable
         // `state` token from the matching `start` request).
         .route("/v1/admin/oauth/{provider}/callback", get(oauth_callback))
+        // M6 Phase 2 Step 2.7 — auth endpoints. Live OUTSIDE
+        // the admin gate (anyone can attempt to log in; the
+        // change-password handler checks the bearer itself via
+        // the `SessionContext` extractor).
+        .route(
+            "/v1/auth/login",
+            axum::routing::post(crate::auth::login::post_login),
+        )
+        .route(
+            "/v1/auth/refresh",
+            axum::routing::post(crate::auth::login::post_refresh),
+        )
+        .route(
+            "/v1/auth/logout",
+            axum::routing::post(crate::auth::login::post_logout),
+        )
+        .route(
+            "/v1/auth/change-password",
+            axum::routing::post(crate::auth::login::post_change_password),
+        )
         // Admin writes (gated) merged in last so they share state.
         .merge(admin);
 
@@ -4157,6 +4183,11 @@ mod tests {
             // delivery-policy tests below populate it when they
             // exercise the sinks-health endpoint.
             sink_registry: Arc::new(nexus_sinks::SinkRegistry::new()),
+            // M6 — default LockoutConfig is fine for every test
+            // here; tests that exercise the lockout boundary
+            // override via a per-test mutation of `state` before
+            // building the app.
+            lockout: nexus_config::LockoutConfig::default(),
         };
         let app = super::router(state);
         (app, store, dir)

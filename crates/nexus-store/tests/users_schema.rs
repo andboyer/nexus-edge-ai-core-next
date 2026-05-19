@@ -275,13 +275,12 @@ async fn soft_delete_user_renames_username_and_frees_slot() {
     store.soft_delete_user(alice).await.unwrap();
 
     // The deleted row is still present under a renamed handle.
-    let raw: (String, Option<String>) = sqlx::query_as(
-        "SELECT username, deleted_at FROM users WHERE id = ?",
-    )
-    .bind(alice)
-    .fetch_one(store.pool())
-    .await
-    .unwrap();
+    let raw: (String, Option<String>) =
+        sqlx::query_as("SELECT username, deleted_at FROM users WHERE id = ?")
+            .bind(alice)
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
     assert!(
         raw.0.starts_with(&format!("{alice}:deleted-")),
         "username renamed to {} (expected '{alice}:deleted-...')",
@@ -303,7 +302,10 @@ async fn soft_delete_user_renames_username_and_frees_slot() {
 
     // Soft-deleted user is NOT findable by original username.
     let by_username = store.get_user_by_username("alice").await.unwrap().unwrap();
-    assert_eq!(by_username.id, new_alice, "lookup hits the new user, not the tombstone");
+    assert_eq!(
+        by_username.id, new_alice,
+        "lookup hits the new user, not the tombstone"
+    );
 }
 
 #[tokio::test]

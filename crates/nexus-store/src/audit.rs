@@ -233,10 +233,7 @@ impl Store {
         tx: &mut Transaction<'_, Sqlite>,
         entry: &NewAuditEntry<'_>,
     ) -> Result<i64, StoreError> {
-        let actor_kind = entry
-            .actor_kind
-            .unwrap_or(AuditActorKind::System)
-            .as_str();
+        let actor_kind = entry.actor_kind.unwrap_or(AuditActorKind::System).as_str();
         let outcome = entry.outcome.as_str();
         // Use sqlx::query_scalar so we get back the generated
         // rowid in one round-trip.
@@ -381,10 +378,7 @@ impl Store {
     /// older than `cutoff`. Returns the affected-row count so the
     /// retention sweeper can log it. Used by the daily sweeper
     /// hook (`runtime.audit.retention_days`).
-    pub async fn delete_audit_older_than(
-        &self,
-        cutoff: DateTime<Utc>,
-    ) -> Result<u64, StoreError> {
+    pub async fn delete_audit_older_than(&self, cutoff: DateTime<Utc>) -> Result<u64, StoreError> {
         let res = sqlx::query("DELETE FROM audit_log WHERE created_at < ?")
             .bind(cutoff.to_rfc3339())
             .execute(&self.pool)
@@ -398,8 +392,8 @@ fn decode_audit_row(row: sqlx::sqlite::SqliteRow) -> Result<AuditEntry, StoreErr
     let outcome_str: String = row.try_get("outcome")?;
     let created_at_str: String = row.try_get("created_at")?;
 
-    let actor_kind = AuditActorKind::try_from(actor_kind_str.as_str())
-        .map_err(StoreError::Decode)?;
+    let actor_kind =
+        AuditActorKind::try_from(actor_kind_str.as_str()).map_err(StoreError::Decode)?;
     let outcome = AuditOutcome::try_from(outcome_str.as_str()).map_err(StoreError::Decode)?;
     let created_at = parse_sqlite_ts(&created_at_str)?;
 

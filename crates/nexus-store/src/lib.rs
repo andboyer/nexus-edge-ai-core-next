@@ -8,20 +8,20 @@
 
 #![forbid(unsafe_code)]
 
+pub mod audit;
 pub mod motion;
 pub mod outbox;
-pub mod audit;
-pub mod users;
 pub mod sessions;
+pub mod users;
+pub use audit::{AuditActorKind, AuditEntry, AuditFilter, AuditOutcome, NewAuditEntry};
 pub use motion::{
     ClipClose, ClipColdMark, ClipId, ClipRow, ColdReplicaRow, ColdReplicaStats, DeleteBackendError,
     MotionEventId, MotionEventKind, MotionEventRow, MotionHistogramBucket, NewClip, NewMotionEvent,
     PerCameraClipStats, StorageBackendRow,
 };
 pub use outbox::{OutboxRow, OutboxSinkCounts, OutboxStatus, SuppressionReason};
-pub use audit::{AuditActorKind, AuditEntry, AuditFilter, AuditOutcome, NewAuditEntry};
-pub use users::{NewUser, User, UserId, UsersError};
 pub use sessions::{NewRefreshToken, RefreshToken, RefreshTokenId, SessionsError};
+pub use users::{NewUser, User, UserId, UsersError};
 
 use std::sync::Arc;
 

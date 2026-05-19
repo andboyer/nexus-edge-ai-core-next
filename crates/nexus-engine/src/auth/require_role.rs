@@ -136,17 +136,24 @@ impl SessionContext {
 /// signatures when you want the role check at compile-time-ish
 /// instead of inside the handler body. The inner [`SessionContext`]
 /// is still available via `.0` for audit-log writes.
+//
+// dead_code: these three role-newtypes are consumed by the
+// admin user-CRUD handlers landing in Step 2.8 (`GET/POST/PUT
+// /admin/users`, etc.). Drop these allows the moment 2.8 lands.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct AdminContext(pub SessionContext);
 
 /// Like [`AdminContext`] but for `Role::Operator`. Admin tokens
 /// also satisfy (admin > operator).
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct OperatorContext(pub SessionContext);
 
 /// Like [`AdminContext`] but for `Role::Viewer` — i.e. any
 /// authenticated caller. Used by read-only routes that should
 /// still 401 anonymous traffic.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct ViewerContext(pub SessionContext);
 
@@ -455,9 +462,8 @@ mod tests {
     fn wrong_signature_rejected_as_invalid() {
         let now = Utc::now();
         // Sign with one secret, verify with another.
-        let token =
-            issue_access_token(1, Role::Admin, b"other-secret", now, Duration::minutes(15))
-                .unwrap();
+        let token = issue_access_token(1, Role::Admin, b"other-secret", now, Duration::minutes(15))
+            .unwrap();
         let err = authorise(&auth_with_secret(), Some(&token)).unwrap_err();
         assert!(matches!(err, SessionRejection::Invalid), "{err:?}");
     }

@@ -60,7 +60,12 @@ pub(crate) async fn post_inject_event(
     // Snapshot the live registry → string-ids in the format the
     // store expects. Matches the production fire path in the rule
     // engine, which also resolves sinks from this same registry.
-    let sink_ids: Vec<String> = s.sink_registry.ids().iter().map(|id| id.to_string()).collect();
+    let sink_ids: Vec<String> = s
+        .sink_registry
+        .ids()
+        .iter()
+        .map(|id| id.to_string())
+        .collect();
     let sink_refs: Vec<&str> = sink_ids.iter().map(String::as_str).collect();
     let n = sink_refs.len();
 

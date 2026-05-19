@@ -127,11 +127,7 @@ pub fn evaluate(now: DateTime<Utc>, user: &User) -> LockState {
 /// in 15 min" rolling window rather than an absolute "5 fails
 /// total ever". Without the reset, four fails six months ago
 /// would tip into a lockout after a single typo today.
-pub fn evaluate_failure(
-    now: DateTime<Utc>,
-    user: &User,
-    cfg: &LockoutConfig,
-) -> FailureOutcome {
+pub fn evaluate_failure(now: DateTime<Utc>, user: &User, cfg: &LockoutConfig) -> FailureOutcome {
     let window = Duration::seconds(cfg.window_secs as i64);
     let window_open = user
         .last_failed_login_at
@@ -204,20 +200,29 @@ mod tests {
 
     #[test]
     fn evaluate_returns_unlocked_when_locked_until_is_none() {
-        assert_eq!(evaluate(now(), &user_with(0, None, None)), LockState::Unlocked);
+        assert_eq!(
+            evaluate(now(), &user_with(0, None, None)),
+            LockState::Unlocked
+        );
     }
 
     #[test]
     fn evaluate_returns_unlocked_when_locked_until_is_in_the_past() {
         let past = now() - Duration::seconds(1);
-        assert_eq!(evaluate(now(), &user_with(5, None, Some(past))), LockState::Unlocked);
+        assert_eq!(
+            evaluate(now(), &user_with(5, None, Some(past))),
+            LockState::Unlocked
+        );
     }
 
     #[test]
     fn evaluate_returns_unlocked_when_locked_until_equals_now() {
         // Boundary: `>` not `>=`. Equality means just-expired.
         let t = now();
-        assert_eq!(evaluate(t, &user_with(5, None, Some(t))), LockState::Unlocked);
+        assert_eq!(
+            evaluate(t, &user_with(5, None, Some(t))),
+            LockState::Unlocked
+        );
     }
 
     #[test]

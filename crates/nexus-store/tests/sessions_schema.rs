@@ -60,12 +60,11 @@ async fn make_user(store: &Store, username: &str, role: Role) -> i64 {
 #[tokio::test]
 async fn refresh_tokens_migration_registers() {
     let (store, _tmp) = fresh_store().await;
-    let row: (String,) = sqlx::query_as(
-        "SELECT id FROM schema_migrations WHERE id = '0011_auth_refresh_tokens'",
-    )
-    .fetch_one(store.pool())
-    .await
-    .expect("migration registered");
+    let row: (String,) =
+        sqlx::query_as("SELECT id FROM schema_migrations WHERE id = '0011_auth_refresh_tokens'")
+            .fetch_one(store.pool())
+            .await
+            .expect("migration registered");
     assert_eq!(row.0, "0011_auth_refresh_tokens");
 }
 
@@ -106,10 +105,7 @@ async fn insert_refresh_token_round_trips_by_id_and_hash() {
         .expect("found by hash");
     assert_eq!(by_hash.id, inserted.id);
 
-    let missing = store
-        .get_refresh_token_by_hash("nope")
-        .await
-        .unwrap();
+    let missing = store.get_refresh_token_by_hash("nope").await.unwrap();
     assert!(missing.is_none());
 }
 
@@ -167,10 +163,7 @@ async fn mark_rotated_flips_rotated_at_and_makes_not_live() {
         .unwrap();
 
     let now = Utc::now();
-    store
-        .mark_refresh_token_rotated(row.id, now)
-        .await
-        .unwrap();
+    store.mark_refresh_token_rotated(row.id, now).await.unwrap();
 
     let reloaded = store
         .get_refresh_token_by_hash("h1")
@@ -332,10 +325,7 @@ async fn list_active_returns_only_live_head_rows() {
         })
         .await
         .unwrap();
-    store
-        .revoke_refresh_token(b0.id, Utc::now())
-        .await
-        .unwrap();
+    store.revoke_refresh_token(b0.id, Utc::now()).await.unwrap();
 
     // Chain C: expired → 0 rows.
     let _c0 = store
@@ -394,10 +384,7 @@ async fn delete_expired_purges_only_terminated_rows() {
         })
         .await
         .unwrap();
-    store
-        .mark_refresh_token_rotated(r1.id, past)
-        .await
-        .unwrap();
+    store.mark_refresh_token_rotated(r1.id, past).await.unwrap();
 
     // Expired + revoked → DELETE.
     let r2 = store
@@ -456,17 +443,11 @@ async fn delete_expired_purges_only_terminated_rows() {
     assert_eq!(n, 2, "only r1 + r2");
 
     for hash in ["r3", "r4"] {
-        let row = store
-            .get_refresh_token_by_hash(hash)
-            .await
-            .unwrap();
+        let row = store.get_refresh_token_by_hash(hash).await.unwrap();
         assert!(row.is_some(), "{hash} should be kept");
     }
     for hash in ["r1", "r2"] {
-        let row = store
-            .get_refresh_token_by_hash(hash)
-            .await
-            .unwrap();
+        let row = store.get_refresh_token_by_hash(hash).await.unwrap();
         assert!(row.is_none(), "{hash} should be deleted");
     }
 }
@@ -496,9 +477,6 @@ async fn cascade_delete_when_user_dropped() {
         .await
         .unwrap();
 
-    let row = store
-        .get_refresh_token_by_hash("casc")
-        .await
-        .unwrap();
+    let row = store.get_refresh_token_by_hash("casc").await.unwrap();
     assert!(row.is_none(), "ON DELETE CASCADE dropped the refresh row");
 }

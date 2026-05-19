@@ -316,9 +316,7 @@ fn is_unique_violation(db: &dyn sqlx::error::DatabaseError) -> bool {
         .unwrap_or(false)
 }
 
-fn decode_refresh_token_row(
-    row: sqlx::sqlite::SqliteRow,
-) -> Result<RefreshToken, StoreError> {
+fn decode_refresh_token_row(row: sqlx::sqlite::SqliteRow) -> Result<RefreshToken, StoreError> {
     Ok(RefreshToken {
         id: row.try_get("id")?,
         token_hash: row.try_get("token_hash")?,

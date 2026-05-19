@@ -190,6 +190,39 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
         store.seed_from_config_if_empty(&cfg).await?;
     }
 
+    // M6 Phase 2 Step 2.7 — first-boot admin bootstrap. Runs
+    // exactly once across the lifetime of the database file;
+    // subsequent boots see `SkippedAlreadyBootstrapped` and
+    // emit no log line. Mode-gated: only fires for `Local` and
+    // `Hybrid`. When it does fire, the one-time password is
+    // surfaced via a single `warn!` line — operators MUST grab
+    // it from the journal and rotate via `/change-password` on
+    // first login. The plaintext is dropped from the engine's
+    // memory immediately after this match.
+    match auth::bootstrap::bootstrap_if_needed(&store, cfg.auth.mode).await {
+        Ok(auth::bootstrap::BootstrapOutcome::AdminCreated {
+            user_id,
+            username,
+            one_time_password,
+        }) => {
+            tracing::warn!(
+                user_id,
+                username = %username,
+                one_time_password = %one_time_password,
+                "FIRST-BOOT ADMIN PROVISIONED — log in once, change password, then redact this log line",
+            );
+        }
+        Ok(auth::bootstrap::BootstrapOutcome::SkippedAlreadyBootstrapped) => {
+            tracing::debug!("bootstrap skipped: users table already populated");
+        }
+        Ok(auth::bootstrap::BootstrapOutcome::SkippedModeDisallowsLocal) => {
+            tracing::debug!(mode = ?cfg.auth.mode, "bootstrap skipped: mode does not allow local users");
+        }
+        Err(e) => {
+            return Err(anyhow::anyhow!("first-boot admin bootstrap failed: {e}"));
+        }
+    }
+
     let rules = store.list_rules().await?;
     let evaluator = Arc::new(RuleEvaluator::new(&cfg.rules, &rules)?);
     info!(
@@ -539,6 +572,12 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
         // eviction sweep spawned below drops stale sessions on a
         // 60 s tick.
         discovery_sessions: discovery::DiscoverySessions::new(),
+        // M6 Phase 2 Step 2.7 — snapshot the lockout policy at
+        // boot so `auth::login::post_login` doesn't have to
+        // re-read it on every request. Hot-reload of the policy
+        // requires an engine restart for now (acceptable — these
+        // knobs change once a quarter at most).
+        lockout: cfg.runtime.auth.lockout.clone(),
     };
 
     // M-Admin Phase 1B — start the registry eviction sweep. Holds

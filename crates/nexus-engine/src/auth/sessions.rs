@@ -31,8 +31,8 @@
 //! SameSite=Lax`) live with the login handler in `api.rs`
 //! (Step 2.7) — they're transport, not session model.
 
-use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine as _;
 use chrono::{DateTime, Duration, Utc};
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use nexus_store::UserId;
@@ -131,6 +131,14 @@ pub fn issue_access_token(
 /// `now` so the test suite can simulate "5 minutes from now"
 /// without touching the system clock. jsonwebtoken's built-in
 /// `Validation` would otherwise insist on wall-clock comparison.
+//
+// dead_code: production handlers all decode via
+// `require_role::SessionContext`, which has its own decoder
+// (it accepts the legacy admin-token shape too). This
+// stand-alone verifier is kept because it round-trips the
+// new-shape JWT against the same code path the issuer uses —
+// invaluable for the `sessions::tests::*` symmetry tests.
+#[allow(dead_code)]
 pub fn verify_access_token(
     token: &str,
     secret: &[u8],
@@ -142,8 +150,7 @@ pub fn verify_access_token(
     // `now`. Signature + algorithm validation still run.
     validation.validate_exp = false;
     validation.required_spec_claims.clear();
-    let claims = jsonwebtoken::decode::<AccessClaims>(token, &key, &validation)?
-        .claims;
+    let claims = jsonwebtoken::decode::<AccessClaims>(token, &key, &validation)?.claims;
     if claims.exp <= now.timestamp() {
         return Err(SessionError::Jwt(
             jsonwebtoken::errors::ErrorKind::ExpiredSignature.into(),
@@ -243,8 +250,7 @@ mod tests {
     #[test]
     fn access_jwt_round_trips_claims() {
         let token =
-            issue_access_token(42, Role::Operator, secret(), now(), Duration::minutes(15))
-                .unwrap();
+            issue_access_token(42, Role::Operator, secret(), now(), Duration::minutes(15)).unwrap();
         let claims = verify_access_token(&token, secret(), now()).unwrap();
         assert_eq!(claims.sub, "42");
         assert_eq!(claims.role, Role::Operator);
@@ -258,8 +264,7 @@ mod tests {
     #[test]
     fn access_jwt_rejected_when_signed_with_wrong_secret() {
         let token =
-            issue_access_token(42, Role::Operator, secret(), now(), Duration::minutes(15))
-                .unwrap();
+            issue_access_token(42, Role::Operator, secret(), now(), Duration::minutes(15)).unwrap();
         let err = verify_access_token(&token, b"other-secret", now()).unwrap_err();
         // Should be a JWT decode error, not Rng or anything else.
         assert!(matches!(err, SessionError::Jwt(_)), "{err:?}");
@@ -268,17 +273,13 @@ mod tests {
     #[test]
     fn access_jwt_rejected_when_expired() {
         let token =
-            issue_access_token(42, Role::Operator, secret(), now(), Duration::minutes(15))
-                .unwrap();
+            issue_access_token(42, Role::Operator, secret(), now(), Duration::minutes(15)).unwrap();
         let future = now() + Duration::hours(1);
         let err = verify_access_token(&token, secret(), future).unwrap_err();
         match err {
             SessionError::Jwt(e) => {
                 assert!(
-                    matches!(
-                        e.kind(),
-                        jsonwebtoken::errors::ErrorKind::ExpiredSignature
-                    ),
+                    matches!(e.kind(), jsonwebtoken::errors::ErrorKind::ExpiredSignature),
                     "{e:?}"
                 );
             }
@@ -290,8 +291,7 @@ mod tests {
     fn access_jwt_at_exact_exp_is_rejected() {
         // Boundary: `<=`, so `now == exp` is expired.
         let token =
-            issue_access_token(42, Role::Operator, secret(), now(), Duration::seconds(1))
-                .unwrap();
+            issue_access_token(42, Role::Operator, secret(), now(), Duration::seconds(1)).unwrap();
         let at_exp = now() + Duration::seconds(1);
         assert!(verify_access_token(&token, secret(), at_exp).is_err());
     }
@@ -301,10 +301,8 @@ mod tests {
         // Defence-in-depth: two issues at the "same" time still
         // produce distinct jtis because UUIDv7 has a per-call
         // randomness tail.
-        let a = issue_access_token(1, Role::Viewer, secret(), now(), Duration::minutes(1))
-            .unwrap();
-        let b = issue_access_token(1, Role::Viewer, secret(), now(), Duration::minutes(1))
-            .unwrap();
+        let a = issue_access_token(1, Role::Viewer, secret(), now(), Duration::minutes(1)).unwrap();
+        let b = issue_access_token(1, Role::Viewer, secret(), now(), Duration::minutes(1)).unwrap();
         let ca = verify_access_token(&a, secret(), now()).unwrap();
         let cb = verify_access_token(&b, secret(), now()).unwrap();
         assert_ne!(ca.jti, cb.jti);
@@ -342,8 +340,7 @@ mod tests {
         // login handler depends on Role::serialize for the
         // claim, and the verify path depends on the inverse.
         let token =
-            issue_access_token(7, Role::Admin, secret(), now(), Duration::minutes(15))
-                .unwrap();
+            issue_access_token(7, Role::Admin, secret(), now(), Duration::minutes(15)).unwrap();
         let claims = verify_access_token(&token, secret(), now()).unwrap();
         let json = serde_json::to_value(&claims).unwrap();
         assert_eq!(json["role"], "admin");
@@ -398,10 +395,7 @@ mod tests {
     fn refresh_secret_debug_redacts_inner_value() {
         let s = RefreshSecret::from_str_unchecked("hunter2");
         let dbg = format!("{s:?}");
-        assert!(
-            !dbg.contains("hunter2"),
-            "Debug must redact, got {dbg:?}"
-        );
+        assert!(!dbg.contains("hunter2"), "Debug must redact, got {dbg:?}");
         assert!(dbg.contains("redacted"));
     }
 }

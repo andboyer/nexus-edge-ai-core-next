@@ -24,9 +24,7 @@ use std::path::PathBuf;
 
 use chrono::{Duration, Utc};
 use nexus_config::StoreConfig;
-use nexus_store::{
-    AuditActorKind, AuditFilter, AuditOutcome, NewAuditEntry, Store,
-};
+use nexus_store::{AuditActorKind, AuditFilter, AuditOutcome, NewAuditEntry, Store};
 use tempfile::TempDir;
 
 async fn fresh_store() -> (Store, TempDir) {
@@ -172,7 +170,10 @@ async fn per_resource_listing_is_newest_first_and_respects_limit() {
         .await
         .unwrap();
 
-    let rows = store.list_audit_for_resource("camera", "11", 3).await.unwrap();
+    let rows = store
+        .list_audit_for_resource("camera", "11", 3)
+        .await
+        .unwrap();
     assert_eq!(rows.len(), 3, "limit honoured");
     // Latest-inserted row is the v=4 row (last loop iteration).
     assert_eq!(rows[0].after_json.as_deref(), Some(r#"{"v":4}"#));
@@ -189,12 +190,42 @@ async fn list_audit_filtered_combines_actor_action_resource_outcome() {
     let (store, _tmp) = fresh_store().await;
     // Build a small population that we'll slice by every filter.
     let cases = [
-        ("alice", "camera.update", "camera", "1", AuditOutcome::Success),
-        ("alice", "camera.delete", "camera", "1", AuditOutcome::Failure),
-        ("alice", "camera.update", "camera", "2", AuditOutcome::Success),
+        (
+            "alice",
+            "camera.update",
+            "camera",
+            "1",
+            AuditOutcome::Success,
+        ),
+        (
+            "alice",
+            "camera.delete",
+            "camera",
+            "1",
+            AuditOutcome::Failure,
+        ),
+        (
+            "alice",
+            "camera.update",
+            "camera",
+            "2",
+            AuditOutcome::Success,
+        ),
         ("bob", "camera.update", "camera", "1", AuditOutcome::Denied),
-        ("bob", "login.success", "session", "x", AuditOutcome::Success),
-        ("bob", "login.failure", "session", "x", AuditOutcome::Failure),
+        (
+            "bob",
+            "login.success",
+            "session",
+            "x",
+            AuditOutcome::Success,
+        ),
+        (
+            "bob",
+            "login.failure",
+            "session",
+            "x",
+            AuditOutcome::Failure,
+        ),
     ];
     for (actor, action, rk, rid, outcome) in cases {
         store

@@ -184,7 +184,11 @@ mod tests {
         // bump weakens these, this test fires so we can pin
         // explicit params instead of trusting Default.
         let p = Params::default();
-        assert_eq!(p.m_cost(), 19_456, "m_cost (KiB) drifted from OWASP-2024 baseline");
+        assert_eq!(
+            p.m_cost(),
+            19_456,
+            "m_cost (KiB) drifted from OWASP-2024 baseline"
+        );
         assert_eq!(p.t_cost(), 2, "t_cost drifted from OWASP-2024 baseline");
         assert_eq!(p.p_cost(), 1, "p_cost drifted from OWASP-2024 baseline");
 
@@ -194,7 +198,10 @@ mod tests {
         // through the PHC string to confirm the prefix.
         let a = Argon2::default();
         let salt = SaltString::generate(&mut OsRng);
-        let phc = a.hash_password(b"long-enough-password", &salt).unwrap().to_string();
+        let phc = a
+            .hash_password(b"long-enough-password", &salt)
+            .unwrap()
+            .to_string();
         assert!(phc.starts_with("$argon2id$v=19$"), "PHC prefix = {phc}");
         // And the `Algorithm` enum's `Argon2id` is the default
         // we rely on, not Argon2i/Argon2d.
@@ -208,7 +215,10 @@ mod tests {
         let phc = hash_password(plain).expect("hash ok");
         assert!(phc.starts_with("$argon2id$"));
         assert!(verify_password(plain, &phc), "round-trip verify");
-        assert!(!verify_password("wrong-horse-battery-staple", &phc), "wrong password fails");
+        assert!(
+            !verify_password("wrong-horse-battery-staple", &phc),
+            "wrong password fails"
+        );
     }
 
     #[test]
@@ -238,9 +248,15 @@ mod tests {
 
     #[test]
     fn policy_rejects_short_passwords() {
-        assert_eq!(check_password_policy("short").unwrap_err(), PasswordPolicyError::TooShort);
+        assert_eq!(
+            check_password_policy("short").unwrap_err(),
+            PasswordPolicyError::TooShort
+        );
         // 11 chars — just under the limit.
-        assert_eq!(check_password_policy("eleven-char").unwrap_err(), PasswordPolicyError::TooShort);
+        assert_eq!(
+            check_password_policy("eleven-char").unwrap_err(),
+            PasswordPolicyError::TooShort
+        );
         // Exactly 12 — passes (assuming not in denylist).
         check_password_policy("zaphod-trout").expect("12 chars ok");
     }
@@ -249,7 +265,10 @@ mod tests {
     fn policy_counts_unicode_scalars_not_bytes() {
         // "über-secret" is 11 chars but >11 bytes (UTF-8). We
         // count chars, so it correctly rejects.
-        assert_eq!(check_password_policy("über-secret").unwrap_err(), PasswordPolicyError::TooShort);
+        assert_eq!(
+            check_password_policy("über-secret").unwrap_err(),
+            PasswordPolicyError::TooShort
+        );
         // "über-secretz" is 12 chars → ok.
         check_password_policy("über-secretz").expect("12 unicode chars ok");
     }
@@ -290,7 +309,11 @@ mod tests {
         // and the worst-of-the-worst made it through the
         // include_str! → HashSet path.
         let set = common_password_set();
-        assert!(set.len() > 100, "denylist surprisingly small: {}", set.len());
+        assert!(
+            set.len() > 100,
+            "denylist surprisingly small: {}",
+            set.len()
+        );
         for canonical in ["password1234", "qwertyuiop12", "letmein12345"] {
             assert!(set.contains(canonical), "denylist missing {canonical}");
         }

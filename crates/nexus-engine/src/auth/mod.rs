@@ -1,7 +1,7 @@
 //! M6 — local user authentication primitives.
 //!
-//! Pure, self-contained sub-modules consumed by the eventual
-//! `auth::login` / `auth::require_role` handlers:
+//! Pure, self-contained sub-modules consumed by the
+//! `auth::login` handler set:
 //!
 //! * [`passwords`] — argon2id hashing + password policy
 //!   (Phase 2 Step 2.2).
@@ -16,29 +16,23 @@
 //! * [`bootstrap`] — first-boot admin provisioning. Runs once
 //!   when `auth.mode` allows local users AND the `users` table
 //!   is empty (Phase 2 Step 2.6).
+//! * [`login`] — the four HTTP handlers (`/login`, `/refresh`,
+//!   `/logout`, `/change-password`) that compose every other
+//!   primitive in this module (Phase 2 Step 2.7).
 //!
 //! Future siblings (planned in [`docs/M6_IDENTITY.md`](../../../docs/M6_IDENTITY.md)):
 //!
-//! * `login` — axum handler that consumes the above primitives
-//!   and issues the session cookie (Phase 2 Step 2.7).
+//! * `users_admin` — `GET/POST/PUT/DELETE /api/v1/admin/users`
+//!   + the unlock + reset-password actions (Phase 2 Step 2.8).
+//! * `oidc` — Phase 3.
 //!
 //! Keeping each concern as a tiny leaf module under `auth/`
-//! lets the login handler in `api.rs` compose them without
-//! pulling in a god-module.
+//! lets the login handler set compose them without pulling in
+//! a god-module.
 
-// Until the login handler in `api.rs` (Phase 2 Step 2.7) and
-// the admin user-CRUD handlers (Step 2.8) consume these
-// functions, every public item below is unreferenced in the
-// engine binary. Tests inside each module exercise the API end
-// to end; we just need to silence dead_code until the wiring
-// catches up. Drop these allows the moment 2.7 lands.
-#[allow(dead_code)]
-pub mod passwords;
-#[allow(dead_code)]
-pub mod lockout;
-#[allow(dead_code)]
-pub mod sessions;
-#[allow(dead_code)]
-pub mod require_role;
-#[allow(dead_code)]
 pub mod bootstrap;
+pub mod lockout;
+pub mod login;
+pub mod passwords;
+pub mod require_role;
+pub mod sessions;
