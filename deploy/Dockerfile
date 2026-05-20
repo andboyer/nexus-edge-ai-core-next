@@ -32,13 +32,29 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Pin ORT version. M0 ships without ORT linkage; M1 enables `--features ep-cpu`
-# in the cargo build line below. ORT shared libs are downloaded into /opt and
-# discovered at runtime via load-dynamic + LD_LIBRARY_PATH.
+# Pin ORT version. The runtime image ships ORT shared libs (load-dynamic
+# at runtime via LD_LIBRARY_PATH).
 #
 # Must track the `ort` crate's ABI requirement — `ort 2.0.0-rc.10` calls
 # GetVersionString() at session creation and panics if it's not in the 1.22.x
 # line. Bump this in lock-step with the workspace `ort` dependency.
+#
+# Two-step layering:
+#   1. Download Microsoft's official onnxruntime-linux-x64-${ORT_VERSION}.tgz
+#      (CPU-only, but ships headers + a clean libonnxruntime.so) so the Rust
+#      build can link.
+#   2. AFTER the Rust build, overlay the *same-version* libs from the
+#      onnxruntime-openvino PyPI wheel — that wheel bundles a
+#      libonnxruntime.so.${ORT_VERSION} compiled with the OpenVINO EP +
+#      libonnxruntime_providers_openvino.so + the full OpenVINO runtime
+#      (libopenvino*.so + intel CPU/GPU/NPU plugins + TBB). Drop them into
+#      /opt/onnxruntime/lib/ where the existing ORT load-dynamic path
+#      already looks for them.
+#
+# Net effect: stage 2's cargo link uses the small CPU tarball; stage 3 ends
+# up with the fat OpenVINO-enabled libs at exactly the same SONAME — so
+# `ort::Session::run` finds the OpenVINO provider when ep_priority asks
+# for it, and silently falls back to CPU when it doesn't.
 ARG ORT_VERSION=1.22.0
 RUN curl -fsSL https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-linux-x64-${ORT_VERSION}.tgz \
     | tar -xz -C /opt && mv /opt/onnxruntime-linux-x64-${ORT_VERSION} /opt/onnxruntime
@@ -84,6 +100,42 @@ COPY crates crates
 RUN cargo build --release -p nexus-engine --features "${FEATURES}" --bin nexus-engine \
     && cargo build --release -p nexus-probe --bin nexus-probe
 
+# ----------------------- stage 2b: OpenVINO overlay ----------------
+# Extract the matching-ABI OpenVINO-enabled runtime libs from the
+# `onnxruntime-openvino` PyPI wheel. The wheel ships
+# libonnxruntime.so.${ORT_VERSION} compiled with the OpenVINO EP plus
+# libonnxruntime_providers_openvino.so + the full OpenVINO runtime
+# (libopenvino*.so, intel CPU/GPU/NPU plugins, TBB) — all self-contained
+# in `onnxruntime/capi/`. No apt repo, no Intel SDK install.
+#
+# We *replace* /opt/onnxruntime/lib's libonnxruntime.so* with the wheel's
+# fatter copy and *add* the OpenVINO provider + plugin .so files. The
+# Microsoft tarball's headers under /opt/onnxruntime/include/ are kept
+# untouched — they already match the 1.22 ABI.
+#
+# The wheel's libonnxruntime.so.${ORT_VERSION} is the versioned soname
+# only; the ort crate dlopens "libonnxruntime.so" (unversioned), so we
+# add the symlink explicitly.
+FROM rust-build AS ort-openvino
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3 python3-pip \
+    && pip3 install --break-system-packages --no-cache-dir \
+        --target=/tmp/ovwheel "onnxruntime-openvino==${ORT_VERSION}" \
+    && rm -rf /var/lib/apt/lists/*
+RUN set -eux; \
+    SRC=/tmp/ovwheel/onnxruntime/capi; \
+    DST=/opt/onnxruntime/lib; \
+    ls -la "$SRC" | head -40; \
+    # Overlay every shared lib (preserves symlinks).
+    cp -aP "$SRC"/*.so* "$DST"/; \
+    # Ensure the unversioned soname exists for ort's load-dynamic dlopen.
+    if [ ! -e "$DST/libonnxruntime.so" ]; then \
+        ln -s "libonnxruntime.so.${ORT_VERSION}" "$DST/libonnxruntime.so"; \
+    fi; \
+    echo "--- /opt/onnxruntime/lib after OpenVINO overlay ---"; \
+    ls -la "$DST" | head -60; \
+    rm -rf /tmp/ovwheel
+
 # ----------------------- stage 3: runtime --------------------------
 FROM debian:bookworm-slim AS runtime
 ENV DEBIAN_FRONTEND=noninteractive
@@ -93,11 +145,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
     gstreamer1.0-libav gstreamer1.0-tools \
     libssl3 \
+    # OpenVINO iGPU needs an OpenCL ICD loader to talk to the
+    # Intel compute-runtime kernel driver (`i915` / `xe`) via
+    # /dev/dri/renderD12x. The Intel userspace itself is bundled
+    # by the onnxruntime-openvino wheel (libopenvino_intel_gpu_plugin.so);
+    # only the OpenCL dispatcher is system-side.
+    ocl-icd-libopencl1 \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --uid 1000 --create-home --shell /usr/sbin/nologin nexus
 
-# ORT shared lib for load-dynamic (no-op until M1 enables ORT features).
-COPY --from=rust-build /opt/onnxruntime /opt/onnxruntime
+# ORT shared libs (load-dynamic). The OpenVINO-enabled libonnxruntime.so
+# + provider + OpenVINO runtime libs come from the ort-openvino stage,
+# which layered them on top of the Microsoft tarball checked out by
+# stage 2 (rust-build).
+COPY --from=ort-openvino /opt/onnxruntime /opt/onnxruntime
 ENV LD_LIBRARY_PATH=/opt/onnxruntime/lib:${LD_LIBRARY_PATH}
 
 # Engine + probe binaries.

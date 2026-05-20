@@ -224,8 +224,23 @@ impl ThreadIsolatedBackend {
         rx: channel::Receiver<WorkerCmd>,
         restart_backoff: Duration,
     ) {
-        let rt = match tokio::runtime::Builder::new_current_thread()
+        // Must be a multi-thread runtime: the `Detector::detect` impls
+        // for YOLO / YOLO-World / YOLOE all call
+        // `tokio::task::block_in_place(...)` to drive the synchronous
+        // `ort::Session::run` while holding the session mutex.
+        // `block_in_place` panics on `new_current_thread` runtimes
+        // ("can call blocking only when running on the multi-threaded
+        // runtime") — that exact panic shipped in v0.1.1 → v0.1.4 and
+        // killed every detector worker on the first real frame.
+        //
+        // `worker_threads(1)` keeps the resource footprint identical
+        // to the original `current_thread` design (one tokio worker
+        // per detector slot); the only thing it adds is the blocking-
+        // pool wiring that `block_in_place` requires.
+        let rt = match tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
             .enable_all()
+            .thread_name(format!("nexus-detect-{slot}-rt"))
             .build()
         {
             Ok(rt) => rt,
@@ -643,3 +658,80 @@ impl Drop for WorkerProcessBackend {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use chrono::Utc;
+    use nexus_types::{Frame, PixelFormat};
+    use std::sync::Arc;
+
+    /// Probe detector that mirrors what every real YOLO* detector does:
+    /// call `tokio::task::block_in_place(...)` inside `detect`. With the
+    /// pre-v0.1.5 `Builder::new_current_thread()` worker runtime this
+    /// would panic with:
+    ///   "can call blocking only when running on the multi-threaded runtime"
+    /// the first time a frame reached the detector — which is exactly the
+    /// crash loop that took down the v0.1.1..v0.1.4 Docker images.
+    struct BlockInPlaceProbe;
+
+    #[async_trait]
+    impl Detector for BlockInPlaceProbe {
+        async fn detect(
+            &self,
+            _f: &Frame,
+            _p: &[String],
+        ) -> Result<Vec<Detection>, InferenceError> {
+            tokio::task::block_in_place(|| Ok(vec![]))
+        }
+
+        fn name(&self) -> &'static str {
+            "block_in_place_probe"
+        }
+    }
+
+    fn tiny_frame() -> Frame {
+        Frame {
+            camera_id: 0,
+            frame_id: 0,
+            captured_at: Utc::now(),
+            width: 2,
+            height: 2,
+            format: PixelFormat::Rgb24,
+            data: Arc::new(vec![0u8; 2 * 2 * 3]),
+            trace_id: "regression-block-in-place".into(),
+        }
+    }
+
+    /// Regression: detector workers must support `tokio::task::block_in_place`
+    /// in their `Detector::detect` impl. The fix swapped the worker's
+    /// `Builder::new_current_thread()` runtime for
+    /// `new_multi_thread().worker_threads(1)`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn thread_isolated_worker_supports_block_in_place() {
+        let cfg = InferenceConfig::default();
+        let detector: Arc<dyn Detector> = Arc::new(BlockInPlaceProbe);
+        let backend = ThreadIsolatedBackend::start(0, detector, &cfg)
+            .expect("worker spawn");
+
+        // Wait briefly for the worker to swap into Ready.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while backend.state() != BackendState::Ready
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(backend.state(), BackendState::Ready);
+
+        let frame = tiny_frame();
+        let res = backend.detect(&frame, &[]).await;
+        assert!(res.is_ok(), "detect returned {res:?}");
+        assert!(res.unwrap().is_empty());
+    }
+}
+
