@@ -39,9 +39,17 @@ services:
       - /dev/dri:/dev/dri
       # NPU 4 — opt in only after §5.3 is confirmed green on the host.
       # - /dev/accel/accel0:/dev/accel/accel0
+    # Numeric host GIDs for /dev/dri (and /dev/accel) access. Docker
+    # resolves group_add names against the CONTAINER's /etc/group
+    # (which has no render or video group baked in), so we pass
+    # numeric GIDs from the host instead. Defaults match Debian 12 /
+    # Ubuntu 22.04+ stock GIDs; override per-box via `.env` if
+    # `getent group render` differs:
+    #   echo NEXUS_RENDER_GID=$(getent group render | cut -d: -f3) >> /opt/nexus/deploy/.env
+    #   echo NEXUS_VIDEO_GID=$(getent group video  | cut -d: -f3) >> /opt/nexus/deploy/.env
     group_add:
-      - "video"
-      - "render"
+      - "${NEXUS_VIDEO_GID:-44}"
+      - "${NEXUS_RENDER_GID:-993}"
     volumes:
       # Bind-mount the host state dir (uid 1000 / gid 1000, set in
       # INSTALL.md §4.3) over the named volume from the base compose.

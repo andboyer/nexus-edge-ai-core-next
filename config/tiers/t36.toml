@@ -5,6 +5,14 @@
 worker_threads = 12
 blocking_threads = 12
 
+[auth]
+# Auto-provisions a 32-byte URL-safe token at
+# `/var/lib/nexus/state/dev-token` (mode 0600) on first boot and
+# prints it once at WARN. Clients send `Authorization: Bearer <token>`.
+# Required because `api_bind` below is non-loopback — the engine
+# refuses to run with `mode = "none"` on a LAN-reachable bind.
+mode = "dev_token"
+
 [server]
 api_bind = "0.0.0.0:8089"
 ui_root = "/usr/share/nexus/ui"

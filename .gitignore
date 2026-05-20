@@ -16,7 +16,12 @@ Thumbs.db
 /build
 /dist
 /data
-/models
+# models/ contents are large binaries staged out-of-band (CI bake or
+# operator scp); track the directory itself via models/.gitkeep so
+# from-source `docker build` doesn't fail on a missing path, but
+# never commit the .onnx / manifest files.
+/models/*
+!/models/.gitkeep
 *.db
 *.db-journal
 *.db-wal

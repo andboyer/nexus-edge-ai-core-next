@@ -112,10 +112,16 @@ COPY --from=ui-build /work/ui/dist /usr/share/nexus/ui
 # nexus.toml and bind-mounting `/var/lib/nexus/models/` over the read-only
 # image dir. Path mirrors `/usr/share/nexus/ui/` so neither is shadowed
 # by the `/var/lib/nexus` state bind from the per-tier overlays.
+#
+# `models/` is gitignored — release builds and CI bake the files in by
+# placing them in the build context before `docker build`. From-source
+# operator builds either (a) scp / generate the pack into models/ per
+# §6.4 before building, or (b) build with an empty models/ (just the
+# tracked .gitkeep) and bind-mount /var/lib/nexus/models at runtime.
+# `COPY models/ /usr/share/nexus/models/` copies whatever's there —
+# empty is fine, the engine then expects the runtime bind-mount.
 RUN mkdir -p /usr/share/nexus/models
-COPY models/yolo26n_dynamic.onnx     /usr/share/nexus/models/yolo26n_dynamic.onnx
-COPY models/yolo_world_v2_s.onnx     /usr/share/nexus/models/yolo_world_v2_s.onnx
-COPY models/models-manifest.json     /usr/share/nexus/models/models-manifest.json
+COPY models/ /usr/share/nexus/models/
 
 # Default config + state dirs.
 RUN mkdir -p /etc/nexus /var/lib/nexus && chown -R nexus:nexus /var/lib/nexus

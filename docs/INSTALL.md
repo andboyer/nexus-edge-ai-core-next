@@ -359,12 +359,49 @@ continue at §6 (or §7 for T36-S).
 
 ### 5.1 T10 / T24 — Intel UHD / Iris Xe iGPU
 
+> **Use the Intel graphics OEM repo, not the Ubuntu archive, AND pin
+> it at priority 1001.** Ubuntu 24.04 ships
+> `intel-media-va-driver-non-free 24.1.0` (early-2024 vintage), which
+> silently fails to init against the HWE kernel (≥ 6.11). Symptom:
+> `vainfo` prints `iHD_drv_video.so init failed` with no further
+> detail even though `dmesg` shows i915 bound, GuC authenticated, and
+> `/dev/dri/renderD128` present. The Intel repo ships 25.x, which
+> tracks the current i915 uAPI — but its iHD deb's libva dependency
+> is loose (`>= 2.20`), so without the apt pin you end up with
+> repo-iHD-25.x against archive-libva-2.20 and get the second-order
+> failure `has no function __vaDriverInit_1_0` (iHD-25.x only exports
+> `__vaDriverInit_1_22`).
+
 ```bash
+# Add Intel graphics OEM repo (same source as §5.2 / §5.3).
+sudo apt install -y gpg-agent wget
+wget -qO- https://repositories.intel.com/gpu/intel-graphics.key \
+  | sudo gpg --yes --dearmor --output /usr/share/keyrings/intel-graphics.gpg
+echo "deb [arch=amd64 signed-by=/usr/share/keyrings/intel-graphics.gpg] \
+https://repositories.intel.com/gpu/ubuntu noble unified" \
+  | sudo tee /etc/apt/sources.list.d/intel-gpu-noble.list
+
+# Pin the Intel repo at priority 1001 so its libva, iHD, and compute
+# runtime win over the Ubuntu archive even when already installed.
+# Without this, apt silently keeps archive-libva and you get an ABI
+# mismatch against repo-iHD. Scope the pin tightly to Intel-shipped
+# packages — a bare `Package: *` also captures libdrm/libgl/etc and
+# blocks later steps (e.g. gstreamer in §5.5 pulling a newer libdrm)
+# with `Packages were downgraded` errors.
+sudo tee /etc/apt/preferences.d/intel-graphics > /dev/null << 'EOF'
+Package: libva* intel-* libigdgmm* libmfx* libvpl* level-zero* libze*
+Pin: origin repositories.intel.com
+Pin-Priority: 1001
+EOF
+sudo apt update
+
 sudo apt install -y \
+    libva2 libva-drm2 libva-x11-2 libva-wayland2 \
     intel-opencl-icd \
     intel-media-va-driver-non-free \
-    libmfx1 \
+    libmfx-gen1.2 \
     vainfo \
+    clinfo \
     intel-gpu-tools
 sudo usermod -aG render,video nexus
 sudo usermod -aG render,video nexus-admin
@@ -375,17 +412,46 @@ sudo reboot
 **Verify:**
 
 ```bash
-vainfo | head -20
-# Expect VAProfileH264Main / VAProfileH264High lines pointing at
-# "Intel iHD driver".
+# Use the DRM backend explicitly — on Ubuntu Server (no X) the
+# default X11 backend prints "can't connect to X server!" and
+# then misleadingly reports "iHD init failed".
+vainfo --display drm --device /dev/dri/renderD128 | head -25
+# Expect THREE things, in order:
+#   1. libva info: VA-API version 1.22.0    ← proves the pin worked;
+#      if it still reads 1.20.0 the libva packages came from the
+#      Ubuntu archive — re-check /etc/apt/preferences.d/intel-graphics
+#      and rerun `sudo apt install --reinstall libva2 libva-drm2`.
+#   2. Driver version: Intel iHD driver ... - 25.x.x
+#   3. VAProfileH264Main / VAProfileH264High / VAProfileHEVCMain /
+#      VAProfileAV1Profile0 lines.
 clinfo | grep -i 'platform name'
 # Expect: "Intel(R) OpenCL Graphics" (or similar).
 ls -l /dev/dri/render*
 # Expect: crw-rw---- 1 root render ...
 ```
 
-If `vainfo` complains about permissions, you skipped the
-`usermod` step or didn't log out / in.
+If `vainfo` exits with `Permission denied` opening `/dev/dri/renderD128`,
+the user running it isn't in the `render` group. Either run the verify
+commands as the `nexus` service user (`sudo -u nexus vainfo --display drm
+--device /dev/dri/renderD128`) or add your own login to the group with
+`sudo usermod -aG render,video $USER` and log out / in.
+
+If `vainfo` prints `has no function __vaDriverInit_1_0`, the pin
+didn't apply and you have repo-iHD vs archive-libva. Confirm with
+`apt policy libva2` — the install candidate should be from
+`repositories.intel.com`. Force-fix:
+`sudo apt install --reinstall -y libva2 libva-drm2 libva-x11-2 libva-wayland2`.
+
+If `vainfo` still prints `iHD_drv_video.so init failed` after the repo
+install, confirm in this order: (a) `lspci -nnk | grep -A3 -i vga` shows
+`Kernel driver in use: i915`; (b) `dmesg | grep -iE 'guc|huc'` shows
+`GuC firmware ... version` and `HuC: authenticated`; (c) `dpkg -l
+intel-media-va-driver-non-free` shows a 25.x version. If (a) or (b) is
+missing the iGPU isn't actually coming up — check the Beelink BIOS for
+`Primary Display = IGFX` and `iGPU Multi-Monitor = Enabled` so i915
+binds even when running headless. The `i965_drv_video.so` failure
+beneath the iHD one is expected and harmless — `i965` only covers Gen8
+and older; iHD is the right driver for Alder Lake-N.
 
 ### 5.2 T36 — Intel Arc A380 dGPU
 
@@ -398,16 +464,28 @@ wget -qO- https://repositories.intel.com/gpu/intel-graphics.key \
 echo "deb [arch=amd64 signed-by=/usr/share/keyrings/intel-graphics.gpg] \
 https://repositories.intel.com/gpu/ubuntu noble unified" \
   | sudo tee /etc/apt/sources.list.d/intel-gpu-noble.list
+
+# Pin the Intel repo at priority 1001 so libva/iHD/compute-runtime
+# all come from it. Without this you get repo-iHD-25.x against
+# archive-libva-2.20 — vainfo fails with `__vaDriverInit_1_0` missing.
+# Pin is scoped to Intel-shipped packages only (see §5.1 comment).
+sudo tee /etc/apt/preferences.d/intel-graphics > /dev/null << 'EOF'
+Package: libva* intel-* libigdgmm* libmfx* libvpl* level-zero* libze*
+Pin: origin repositories.intel.com
+Pin-Priority: 1001
+EOF
 sudo apt update
 
 # Install the Arc compute + media stack.
 sudo apt install -y \
+    libva2 libva-drm2 libva-x11-2 libva-wayland2 \
     intel-opencl-icd \
     intel-level-zero-gpu \
     level-zero \
     intel-media-va-driver-non-free \
     libmfx-gen1.2 \
     vainfo \
+    clinfo \
     intel-gpu-tools
 
 sudo usermod -aG render,video nexus
@@ -418,6 +496,10 @@ sudo reboot
 **Verify:**
 
 ```bash
+vainfo --display drm --device /dev/dri/renderD128 | head -25
+# Expect: "libva info: VA-API version 1.22.0" AND "Driver version:
+# Intel iHD driver ... - 25.x.x" AND the full VAProfileH264* /
+# VAProfileHEVC* / VAProfileAV1Profile0 list.
 clinfo | grep -A2 'Platform Name'
 # Expect "Intel(R) OpenCL Graphics" with the Arc A380 listed under
 # Devices.
@@ -445,8 +527,17 @@ wget -qO- https://repositories.intel.com/gpu/intel-graphics.key \
 echo "deb [arch=amd64 signed-by=/usr/share/keyrings/intel-graphics.gpg] \
 https://repositories.intel.com/gpu/ubuntu noble unified" \
   | sudo tee /etc/apt/sources.list.d/intel-gpu-noble.list
+
+# Pin the Intel repo at priority 1001 — see §5.1 for why.
+sudo tee /etc/apt/preferences.d/intel-graphics > /dev/null << 'EOF'
+Package: libva* intel-* libigdgmm* libmfx* libvpl* level-zero* libze*
+Pin: origin repositories.intel.com
+Pin-Priority: 1001
+EOF
 sudo apt update
+
 sudo apt install -y \
+    libva2 libva-drm2 libva-x11-2 libva-wayland2 \
     intel-opencl-icd \
     intel-level-zero-gpu \
     level-zero \
@@ -625,19 +716,79 @@ sudo apt install -y \
     docker-ce docker-ce-cli containerd.io \
     docker-buildx-plugin docker-compose-plugin
 
+# Add BOTH the service user (so the engine container can be managed
+# by systemd-run / future automation) AND your interactive login
+# user (so you can run `docker compose pull` / `up` directly during
+# install). Replace $USER with your actual login name if you ran
+# this block under sudo from a different account.
 sudo usermod -aG docker nexus-admin
-# Log out / in for group membership.
+sudo usermod -aG docker "$USER"
+
+# Activate the new group in THIS shell without logging out. Without
+# this, `docker compose pull` in §6.7 fails with
+# "permission denied while trying to connect to the docker API at
+# unix:///var/run/docker.sock" \u2014 the group membership only loads
+# at next login otherwise.
+newgrp docker << 'EOF'
 docker --version
 docker compose version
+docker info > /dev/null && echo "docker OK"
+EOF
 ```
 
 ### 6.2 Clone the repo
+
+> The repo is private, so HTTPS prompts for credentials and **GitHub
+> no longer accepts passwords here** (you'll see `Invalid username
+> or token. Password authentication is not supported for Git
+> operations.`). Pick one of the two auth methods below before you
+> run `git clone`. SSH-key is the only option that survives reboots
+> for unattended OTA pulls, so prefer it on edge boxes.
+
+**Option A — SSH deploy key (recommended for edge boxes):**
+
+```bash
+# Generate a key dedicated to this box (no passphrase so OTA pulls
+# don't block waiting for unlock).
+sudo -u nexus-admin ssh-keygen -t ed25519 -N "" \
+    -C "nexus-edge-$(hostname)" \
+    -f /home/nexus-admin/.ssh/id_ed25519_nexus
+sudo -u nexus-admin cat /home/nexus-admin/.ssh/id_ed25519_nexus.pub
+```
+
+Copy the printed public key, then in the GitHub repo UI go to
+**Settings → Deploy keys → Add deploy key**, paste it, check
+**Allow write access** only if this box will push (it shouldn't —
+leave it off). Then clone via SSH:
+
+```bash
+sudo -u nexus-admin tee -a /home/nexus-admin/.ssh/config > /dev/null << 'EOF'
+Host github.com
+  IdentityFile ~/.ssh/id_ed25519_nexus
+  IdentitiesOnly yes
+EOF
+
+sudo mkdir -p /opt/nexus
+sudo chown nexus-admin:nexus-admin /opt/nexus
+cd /opt/nexus
+sudo -u nexus-admin git clone \
+    git@github.com:andboyer/nexus-edge-ai-core-next.git .
+```
+
+**Option B — Personal Access Token (interactive, one-off installs):**
+
+Generate a fine-grained PAT at <https://github.com/settings/tokens?type=beta>
+with **Repository access → Only select repositories →
+`andboyer/nexus-edge-ai-core-next`** and **Repository permissions →
+Contents: Read-only**. Then:
 
 ```bash
 sudo mkdir -p /opt/nexus
 sudo chown nexus-admin:nexus-admin /opt/nexus
 cd /opt/nexus
 git clone https://github.com/andboyer/nexus-edge-ai-core-next.git .
+# Username: andboyer (your GitHub login)
+# Password: <paste the PAT, NOT your account password>
 ```
 
 ### 6.3 Pick the tier config
@@ -662,21 +813,26 @@ sudo install -o nexus -g nexus -m 0644 \
 > to pin a version-controlled config and audit changes. See
 > [`docs/ROADMAP.md` → M-Install Checkpoint 1](ROADMAP.md#checkpoint-1--dogfooding-kit-now-2-days).
 
-### 6.4 Stage the models (optional — custom packs only)
+### 6.4 Stage the models
 
-> **Skip this section by default.** The published Docker image ships
-> with the default model pack baked in at `/usr/share/nexus/models/`
-> (yolo26n_dynamic.onnx + yolo_world_v2_s.onnx + models-manifest.json,
-> ~58 MB total). All five tier configs in `config/tiers/` already point
-> `[inference.model].pack_path` there, so a fresh `docker compose up`
-> works without any host-side model staging.
-
-Follow the steps below **only if** you've regenerated the models
-locally per [Appendix A](#12-appendix-a--reproducible-model-generation),
-fine-tuned them, or are running a custom pack.
+> **When you need this section:**
+>
+> - **Pulling GHCR (§6.7 Option A):** skip — the published image bakes
+>   the default pack (~58 MB) into `/usr/share/nexus/models/` and all
+>   five tier configs already point `pack_path` there.
+> - **Building from source (§6.7 Option B):** required, because
+>   `models/` is gitignored — your fresh clone has an empty `models/`
+>   directory (just a `.gitkeep`). Either (a) scp / generate the pack
+>   into `/opt/nexus/models/` BEFORE running `docker compose build`
+>   and the build will bake them into the image, OR (b) stage them at
+>   `/var/lib/nexus/models/` and let the container bind-mount them at
+>   runtime (steps below). Path (b) is preferred for fleet operators
+>   because the same image works across boxes with different packs.
+> - **Custom / fine-tuned pack on any install:** required.
 
 ```bash
-# Stage your custom pack on the host:
+# Stage the pack on the host where the per-tier overlay's
+# /var/lib/nexus bind mount will surface it inside the container.
 sudo mkdir -p /var/lib/nexus/models
 sudo install -o nexus -g nexus -m 0644 \
     /path/to/yolo26n_dynamic.onnx \
@@ -699,6 +855,16 @@ sudo sed -i \
     's#/usr/share/nexus/models#/var/lib/nexus/models#g' \
     /etc/nexus/nexus.toml
 ```
+
+> **Quick path from a dev machine that already has the pack:**
+>
+> ```bash
+> # From the machine that ran `tools/models/gen_*.py`:
+> ssh nexus 'sudo mkdir -p /var/lib/nexus/models && sudo chown -R nexus:nexus /var/lib/nexus/models'
+> scp models/{yolo26n_dynamic.onnx,yolo_world_v2_s.onnx,models-manifest.json} \
+>     nexus:/tmp/models-pack/
+> ssh nexus 'sudo install -o nexus -g nexus -m 0644 /tmp/models-pack/* /var/lib/nexus/models/'
+> ```
 
 ### 6.5 Where state lives
 
@@ -745,6 +911,30 @@ ls -l docker-compose.override.yml                                # confirm symli
 > `/opt/nexus` brings in upstream overlay tweaks automatically.
 > Copying freezes the override at install-time and means you'll
 > drift behind future bug-fixes.
+
+**Then check the `render` / `video` group GIDs match the overlay's
+defaults.** The overlays use numeric host GIDs (44 / 993) for
+`/dev/dri` access because the container image has no `render` or
+`video` group baked in. Verify on your box:
+
+```bash
+getent group render && getent group video
+# Default expected: render:x:993:...  video:x:44:...
+```
+
+If either GID differs, drop an override into a `.env` file next to
+the compose files (Compose auto-loads it):
+
+```bash
+sudo tee /opt/nexus/deploy/.env >/dev/null <<EOF
+NEXUS_RENDER_GID=$(getent group render | cut -d: -f3)
+NEXUS_VIDEO_GID=$(getent group video  | cut -d: -f3)
+EOF
+```
+
+Without this, `docker compose up` fails with
+`Unable to find group render: no matching entries in group file`
+(if the host's GIDs differ from the 44/993 defaults).
 
 #### 6.6.legacy — Hand-written override (T36, T64, or custom)
 
@@ -797,24 +987,108 @@ services:
       - NEXUS_TIER=t64
 ```
 
-### 6.7 Pull + start
+### 6.7 Pull (or build) + start
 
-> **Pre-flight:** the published image is on GHCR at
-> `ghcr.io/andboyer/nexus-engine:latest` (pushed by
-> [.github/workflows/release.yml](../.github/workflows/release.yml)
-> on every `v*` tag). For a public package no login is needed; for a
-> private package, one-time `docker login ghcr.io -u andboyer` with a
-> read-scoped PAT.
+> The GHCR image `ghcr.io/andboyer/nexus-engine` is **private** and
+> linked to this private repo. Tagged releases (`v*`) are published
+> by [.github/workflows/release.yml](../.github/workflows/release.yml)
+> with `:vX.Y.Z`, `:<sha>`, and `:latest` tags. **Pulling a release
+> is the recommended path** — the image already includes the default
+> model pack at `/usr/share/nexus/models/`, so §6.4 is skip-by-default
+> and the engine starts in ~5 sec instead of a 15–25 min build.
 >
-> Pin to a specific `vX.Y.Z` in production by editing the `image:`
-> line of your overlay — `:latest` is fine for the dogfooding fleet
-> but means a tagged release rolls forward on the next `pull`.
+> Build from source only if you need a commit between releases,
+> are iterating on engine code, or want a custom feature set.
+
+**Option A — Pull a published tag from GHCR (recommended):**
+
+You need a GitHub Personal Access Token with `read:packages` scope to
+pull. The token is created **once per edge box** and stored in Docker's
+credential file under the user that runs `docker compose`.
+
+1.  **Create the token in the GitHub UI:**
+
+    > **Use a classic token.** Fine-grained PATs only expose the
+    > `Packages` permission for **organization-owned** packages.
+    > `andboyer/nexus-engine` is a user-owned package, so the
+    > Packages permission **will not appear** in the fine-grained
+    > token creation screen — pulls always 401 with such a token.
+    > Open issue tracking this:
+    > <https://github.com/orgs/community/discussions/24636>.
+    > Switch to a classic token; if/when we move the package under
+    > an org, fine-grained will become viable.
+
+    Open <https://github.com/settings/tokens/new> ("Generate new
+    token (classic)").
+
+    - **Note:** `nexus-edge-<hostname>` (e.g. `nexus-edge-t10-01`)
+    - **Expiration:** 1 year (rotate during scheduled maintenance),
+      or "No expiration" if you'd rather rotate manually.
+    - **Scopes:**
+      - `read:packages` — **required**, lets `docker pull` fetch
+        the image.
+      - `repo` — optional, only if you also want this same token to
+        `git pull` the private source for §6.8 updates.
+
+    Click *Generate token* and copy it — it's shown **once**.
+
+2.  **Log Docker in to GHCR on the edge box** (as the user that runs
+    compose — `andboyer`, not root, because compose reads
+    `~/.docker/config.json` of the calling user and forwards the
+    credential to the daemon):
+
+    ```bash
+    # Paste the PAT when prompted — token IS the password.
+    docker login ghcr.io -u andboyer
+    # Or non-interactively:
+    echo "<PAT>" | docker login ghcr.io -u andboyer --password-stdin
+    # Stored at ~/.docker/config.json (mode 0600). Persists across
+    # reboots until the PAT expires.
+    ```
+
+3.  **Pull + start:**
+
+    ```bash
+    cd /opt/nexus/deploy
+    docker compose pull            # fetches ghcr.io/andboyer/nexus-engine:latest
+    docker compose up -d
+    docker compose logs -f         # Ctrl-C to detach
+    ```
+
+Pin to a specific `vX.Y.Z` in production by editing the `image:` line
+of your tier overlay — `:latest` is fine for the dogfooding fleet but
+auto-rolls forward on the next `pull`.
+
+> **Troubleshooting `docker compose pull` → `denied`:**
+>
+> | Symptom in error | Cause | Fix |
+> |---|---|---|
+> | `denied: denied` with no auth attempt | not logged in | rerun `docker login ghcr.io -u andboyer` |
+> | `denied: permission_denied: read_package` | PAT missing `read:packages` scope, OR you generated a fine-grained PAT (won't work for user-owned packages — see step 1 above) | regenerate as a **classic** token with `read:packages` |
+> | `denied` after a recent PAT rotation | old creds cached | `docker logout ghcr.io` then `docker login` again |
+> | `manifest unknown` for a `vX.Y.Z` tag | release workflow hasn't published that tag yet | check `gh run list --workflow=release.yml` on the publisher; or use `:latest` |
+> | `denied` only as `root` / under `sudo` | login was under your user; root has its own `/root/.docker/config.json` | run compose without sudo (your user is in the `docker` group from §6.1), OR `sudo docker login ghcr.io -u andboyer` to give root its own creds |
+>
+> If you're not sure whether you're authenticated, run:
+> `docker pull ghcr.io/andboyer/nexus-engine:latest` — a clean pull
+> proves the credential is good independently of compose.
+
+**Option B — Build from source (for non-tagged commits / local dev):**
+
+> **Pre-flight:** complete [§6.4](#64-stage-the-models) first.
+> `models/` is gitignored, so your clone has an empty models directory
+> and the resulting image will contain no model files. You can still
+> `docker compose build` successfully (the Dockerfile copies whatever
+> is in `models/`, empty included), but the engine will fail at
+> startup with `failed to open model file ... yolo26n_dynamic.onnx`.
+> §6.4's bind-mount path (`/var/lib/nexus/models`) is the recommended
+> workflow.
 
 ```bash
 cd /opt/nexus/deploy
-docker compose pull         # grab the all-EPs image from GHCR
-docker compose up -d        # start the engine
-docker compose logs -f      # Ctrl-C to detach; engine keeps running
+docker compose build engine    # first build ~15-25 min on T10/T24
+docker compose up -d           # start the engine
+docker compose logs -f         # Ctrl-C to detach; engine keeps running
 ```
 
 First-boot tasks the engine performs automatically:
@@ -836,14 +1110,27 @@ Then jump to §8 to add cameras.
 ### 6.8 Updating to a new release
 
 The release workflow publishes a new immutable `vX.Y.Z` plus a
-rolling `:latest` on every git tag. Updating each box is two
-commands:
+rolling `:latest` on every git tag. Choose the path that matches
+how you installed in §6.7:
+
+**If you pull from GHCR (§6.7 Option A — recommended):**
 
 ```bash
 cd /opt/nexus
 git pull --ff-only          # picks up overlay tweaks + new tier configs
 cd deploy
 docker compose pull         # pulls the new GHCR image
+docker compose up -d        # restart-in-place with the new image
+docker image prune -f       # reclaim disk
+```
+
+**If you built from source (§6.7 Option B):**
+
+```bash
+cd /opt/nexus
+git pull --ff-only          # picks up overlay tweaks + new tier configs
+cd deploy
+docker compose build engine # rebuild against the new tree (cached)
 docker compose up -d        # restart-in-place with the new image
 docker image prune -f       # reclaim disk
 ```
@@ -1557,8 +1844,22 @@ sudo mkswap /swapfile && sudo swapon /swapfile
 echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
 
 # ---- §5.1 Intel iGPU drivers (T24) -------------------------------
-sudo apt install -y intel-opencl-icd intel-media-va-driver-non-free \
-    libmfx1 vainfo intel-gpu-tools
+sudo apt install -y gpg-agent wget
+wget -qO- https://repositories.intel.com/gpu/intel-graphics.key \
+  | sudo gpg --yes --dearmor --output /usr/share/keyrings/intel-graphics.gpg
+echo "deb [arch=amd64 signed-by=/usr/share/keyrings/intel-graphics.gpg] \
+https://repositories.intel.com/gpu/ubuntu noble unified" \
+  | sudo tee /etc/apt/sources.list.d/intel-gpu-noble.list
+sudo tee /etc/apt/preferences.d/intel-graphics > /dev/null << 'EOF'
+Package: libva* intel-* libigdgmm* libmfx* libvpl* level-zero* libze*
+Pin: origin repositories.intel.com
+Pin-Priority: 1001
+EOF
+sudo apt update
+sudo apt install -y \
+    libva2 libva-drm2 libva-x11-2 libva-wayland2 \
+    intel-opencl-icd intel-media-va-driver-non-free \
+    libmfx-gen1.2 vainfo clinfo intel-gpu-tools
 sudo usermod -aG render,video nexus
 sudo usermod -aG render,video $USER
 sudo reboot
@@ -1580,8 +1881,11 @@ sudo usermod -aG docker $USER
 exec sudo -u $USER bash -i        # re-login for docker group
 
 # ---- §6.2 Clone + tier config + override -------------------------
+# Repo is private — uses an SSH deploy key per §6.2 Option A.
+# Generate the key + add it as a deploy key in the GitHub UI BEFORE
+# running this block. PAT route (Option B) works too if you have one.
 sudo mkdir -p /opt/nexus && sudo chown $USER:$USER /opt/nexus
-git clone https://github.com/andboyer/nexus-edge-ai-core-next.git /opt/nexus
+git clone git@github.com:andboyer/nexus-edge-ai-core-next.git /opt/nexus
 sudo install -o nexus -g nexus -m 0600 \
     /opt/nexus/config/tiers/t24.toml /etc/nexus/nexus.toml
 cat <<'EOF' | sudo tee /opt/nexus/deploy/docker-compose.override.yml
