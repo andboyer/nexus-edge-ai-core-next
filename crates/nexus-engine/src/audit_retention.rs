@@ -28,8 +28,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
-use nexus_store::Store;
 use nexus_store::audit::{AuditActorKind, AuditOutcome, NewAuditEntry};
+use nexus_store::Store;
 use tokio::time::interval;
 use tracing::{debug, info, warn};
 
@@ -153,11 +153,7 @@ mod tests {
         (store, dir)
     }
 
-    async fn insert_audit_row_at(
-        store: &Arc<Store>,
-        action: &str,
-        offset_days: i64,
-    ) -> i64 {
+    async fn insert_audit_row_at(store: &Arc<Store>, action: &str, offset_days: i64) -> i64 {
         let mut tx = store.pool().begin().await.expect("begin");
         let ts = Utc::now() - ChDuration::days(offset_days);
         let row: (i64,) = sqlx::query_as(
