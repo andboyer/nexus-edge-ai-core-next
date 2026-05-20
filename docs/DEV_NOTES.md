@@ -38,8 +38,8 @@ future automated agents who need to skip the same potholes we already hit.
 
   Burning a CI cycle for any of these is wasted iteration.
 
-- ORT brew formula 1.25.x works at runtime against the `ort = "=2.0.0-rc.10"`
-  crate via `load-dynamic`, even though CI pins 1.20.0 in the system-libs
+- ORT brew formula ≥ 1.22.x works at runtime against the `ort = "=2.0.0-rc.10"`
+  crate via `load-dynamic`, matching the 1.22.0 pin in the system-libs
   job. Set `ORT_DYLIB_PATH=/opt/homebrew/lib/libonnxruntime.dylib`.
 
 ## Cargo / Rust

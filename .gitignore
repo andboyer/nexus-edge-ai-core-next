@@ -27,6 +27,11 @@ Thumbs.db
 *.db-wal
 *.db-shm
 
+# Per-box overrides for docker compose (host GIDs, secrets, etc).
+# Compose auto-loads deploy/.env on `up`; never commit it.
+deploy/.env
+deploy/.env.local
+
 # UI
 node_modules
 ui/dist

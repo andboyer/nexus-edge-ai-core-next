@@ -1212,13 +1212,17 @@ sudo apt install -y \
 
 Add the runtime decode plugin from §5.5 if you skipped it.
 
-### 7.4 Install ONNX Runtime 1.20.0
+### 7.4 Install ONNX Runtime 1.22.0
 
-Pinned to 1.20.0 to match the Dockerfile + CI. The engine loads it
-at runtime via `load-dynamic`.
+Pinned to 1.22.0 to match the Dockerfile + CI. The engine loads it
+at runtime via `load-dynamic`. The `ort 2.0.0-rc.10` crate calls
+`GetVersionString()` at session creation and panics with exit code 134
+(`ort … is not compatible with the ONNX Runtime binary found at …`)
+if the version isn't in the 1.22.x line — bump in lock-step with the
+workspace `ort` dependency in `Cargo.toml`.
 
 ```bash
-ORT_VER=1.20.0
+ORT_VER=1.22.0
 curl -fsSL "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VER}/onnxruntime-linux-x64-${ORT_VER}.tgz" \
   | sudo tar -xz -C /opt
 sudo mv "/opt/onnxruntime-linux-x64-${ORT_VER}" /opt/onnxruntime

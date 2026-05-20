@@ -35,7 +35,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Pin ORT version. M0 ships without ORT linkage; M1 enables `--features ep-cpu`
 # in the cargo build line below. ORT shared libs are downloaded into /opt and
 # discovered at runtime via load-dynamic + LD_LIBRARY_PATH.
-ARG ORT_VERSION=1.20.0
+#
+# Must track the `ort` crate's ABI requirement — `ort 2.0.0-rc.10` calls
+# GetVersionString() at session creation and panics if it's not in the 1.22.x
+# line. Bump this in lock-step with the workspace `ort` dependency.
+ARG ORT_VERSION=1.22.0
 RUN curl -fsSL https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-linux-x64-${ORT_VERSION}.tgz \
     | tar -xz -C /opt && mv /opt/onnxruntime-linux-x64-${ORT_VERSION} /opt/onnxruntime
 
