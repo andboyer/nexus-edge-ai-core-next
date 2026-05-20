@@ -22,9 +22,12 @@
 //!    no-allocations-on-the-happy-path policy enforcement:
 //!    minimum length (12, the OWASP-2024 recommendation), and
 //!    a curated common-password denylist embedded at compile
-//!    time (`common_passwords.txt`, ~300 entries). The policy
-//!    is intentionally minimal — no character-class theatre,
-//!    no max length — matching modern NIST SP 800-63B guidance.
+//!    time (`common_passwords.txt`, ~1260 entries: the full
+//!    SecLists xato-net top-1000 plus hand-curated 12+ char
+//!    variants like `password1234` that are reachable past the
+//!    length check). The policy is intentionally minimal — no
+//!    character-class theatre, no max length — matching modern
+//!    NIST SP 800-63B guidance.
 //!
 //! ## Why argon2id's defaults
 //!
@@ -307,15 +310,30 @@ mod tests {
     fn denylist_loads_some_canonical_entries() {
         // Sanity-check that the embedded file actually parsed
         // and the worst-of-the-worst made it through the
-        // include_str! → HashSet path.
+        // include_str! → HashSet path. After the SecLists
+        // top-1000 expansion the set is ~1260 entries; the
+        // lower bound here is deliberately loose so that a
+        // future prune (e.g. removing entries < MIN_PASSWORD_LEN
+        // once we decide they have no audit value) won't trip
+        // the test, but any catastrophic load failure still does.
         let set = common_password_set();
         assert!(
-            set.len() > 100,
+            set.len() > 1000,
             "denylist surprisingly small: {}",
             set.len()
         );
         for canonical in ["password1234", "qwertyuiop12", "letmein12345"] {
             assert!(set.contains(canonical), "denylist missing {canonical}");
+        }
+        // Spot-check that the SecLists top-1000 block landed.
+        // These are short (< MIN_PASSWORD_LEN) and therefore
+        // unreachable by real signups, but their presence
+        // proves the embedded file includes the full corpus.
+        for seclists in ["123456", "qwerty", "iloveyou", "monkey"] {
+            assert!(
+                set.contains(seclists),
+                "SecLists top-1000 entry missing: {seclists}"
+            );
         }
     }
 }
