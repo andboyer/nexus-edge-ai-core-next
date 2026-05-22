@@ -1,0 +1,84 @@
+# Nexus Edge AI engine — bare-metal systemd unit.
+#
+# Source of truth checked into the repo at deploy/systemd/nexus-engine.service.
+# Shipped as part of the release tarball at etc-templates/systemd/nexus-engine.service
+# (M-Install Checkpoint 3a.2) and installed by scripts/install.sh to
+# /etc/systemd/system/nexus-engine.service on the host.
+#
+# Layout assumptions (see scripts/install.sh):
+#   /opt/nexus/releases/vX.Y.Z/                — extracted tarball, immutable
+#   /opt/nexus/current   -> releases/vX.Y.Z    — atomic-swap symlink (rollback = flip)
+#   /etc/nexus/nexus.toml                      — operator-editable config (survives upgrades)
+#   /var/lib/nexus/                            — runtime state (db, clips, models override)
+#
+# Upgrade = install.sh extracts new release, flips `current`, runs
+#           `systemctl restart nexus-engine`. Rollback = flip the symlink
+#           back and restart. The unit file itself never has to change.
+
+[Unit]
+Description=Nexus Edge AI engine
+Documentation=https://github.com/andboyer/nexus-edge-ai-core-next/blob/main/docs/INSTALL.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nexus
+Group=nexus
+WorkingDirectory=/var/lib/nexus
+
+# ORT shared libs ship inside the release at lib/onnxruntime/. The ort
+# crate dlopens libonnxruntime.so (unversioned soname); LD_LIBRARY_PATH
+# is required so the OpenVINO provider + intel CPU/GPU/NPU plugins +
+# TBB libs that sit alongside it also resolve.
+Environment=ORT_DYLIB_PATH=/opt/nexus/current/lib/onnxruntime/libonnxruntime.so
+Environment=LD_LIBRARY_PATH=/opt/nexus/current/lib/onnxruntime
+Environment=RUST_LOG=info,nexus=info
+
+# T64 (CUDA + TensorRT) operators uncomment the CUDA path. The installed
+# binary is built with --features ep-cuda,ep-tensorrt — the EP is only
+# activated when ep_priority in nexus.toml asks for it AND libcuda is
+# loadable, so leaving this commented on non-T64 boxes is harmless.
+# Environment=LD_LIBRARY_PATH=/opt/nexus/current/lib/onnxruntime:/usr/local/cuda/lib64
+
+ExecStart=/opt/nexus/current/bin/nexus-engine --config /etc/nexus/nexus.toml
+
+# Graceful drain (M-OTA Step 1, planned). Engine traps SIGTERM,
+# EOSes every open mp4mux so clips finish writing instead of stranding
+# at a header-only 864-byte stub on restart. Until the handler ships,
+# systemd's default 90s still lets the engine exit cleanly on a
+# clip-idle camera; recording cameras may lose the in-flight clip.
+TimeoutStopSec=30s
+KillSignal=SIGTERM
+
+Restart=on-failure
+RestartSec=5s
+LimitNOFILE=65535
+
+# Allow the `nexus` user (non-root) to bind the UI alias on :80.
+# api_bind defaults to :8089 and does not need this; ui_bind = "0.0.0.0:80"
+# (default in every tier config since v0.1.9) does.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+# Hardening — keep the engine boxed in.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/nexus /tmp
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+DevicePolicy=closed
+
+# Allow accelerator devices per tier. No-op when the device doesn't
+# exist on this host; leave them all in so the unit is portable.
+DeviceAllow=/dev/dri rw
+DeviceAllow=/dev/accel/accel0 rw
+DeviceAllow=/dev/nvidia0 rw
+DeviceAllow=/dev/nvidiactl rw
+DeviceAllow=/dev/nvidia-uvm rw
+
+[Install]
+WantedBy=multi-user.target
