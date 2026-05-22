@@ -43,7 +43,11 @@ export function TimelinePage() {
     staleTime: 30_000,
   });
 
-  const cameras = camerasQuery.data ?? [];
+  // Depend on the query's `.data` directly (stable reference between
+  // refetches) rather than the `cameras` fallback (which would create a
+  // new `[]` every render and trip react-hooks/exhaustive-deps).
+  const cameraList = camerasQuery.data;
+  const cameras = cameraList ?? [];
 
   const [selectedCameraId, setSelectedCameraId] = useState<string | null>(
     null,
@@ -51,10 +55,10 @@ export function TimelinePage() {
 
   // Default to first camera once the list arrives.
   useEffect(() => {
-    if (selectedCameraId === null && cameras.length > 0) {
-      setSelectedCameraId(String(cameras[0]!.id));
+    if (selectedCameraId === null && cameraList && cameraList.length > 0) {
+      setSelectedCameraId(String(cameraList[0]!.id));
     }
-  }, [cameras, selectedCameraId]);
+  }, [cameraList, selectedCameraId]);
 
   const [rangeIdx, setRangeIdx] = useState(2); // last 24h default
   const range = RANGE_OPTIONS[rangeIdx]!;

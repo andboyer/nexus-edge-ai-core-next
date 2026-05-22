@@ -192,10 +192,10 @@ export interface VisualPromptSummary {
   [k: string]: unknown;
 }
 
-export interface VisualPrompt extends VisualPromptSummary {
-  // Engine returns more fields (image_path, dims, etc.) — extra props
-  // allowed via index signature.
-}
+// Engine returns more fields (image_path, dims, etc.) on the detail view
+// vs the summary, but they all flow through the `[k: string]: unknown`
+// index signature on VisualPromptSummary. A bare type alias is enough.
+export type VisualPrompt = VisualPromptSummary;
 
 export interface CameraVisualPromptAttachment {
   visual_prompt_id: string;

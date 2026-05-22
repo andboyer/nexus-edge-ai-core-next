@@ -18,7 +18,6 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import type { FullConfig } from "@playwright/test";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = join(HERE, "..", "..");
@@ -41,7 +40,11 @@ async function pickFreePort(): Promise<number> {
   });
 }
 
-export default async function globalSetup(_config: FullConfig) {
+// Playwright passes its FullConfig but we don't consume it (port/log paths
+// are driven by env vars + SIDECAR). Declared without args to satisfy
+// @typescript-eslint/no-unused-vars; Playwright's globalSetup signature
+// permits a zero-arg function.
+export default async function globalSetup() {
   if (process.env.E2E_SKIP_ENGINE === "1") {
     writeFileSync(
       SIDECAR,

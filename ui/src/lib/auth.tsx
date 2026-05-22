@@ -106,16 +106,23 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
 }
 
+// The hooks below are co-located with <AuthProvider> intentionally so
+// the Context type doesn't have to be re-exported and re-imported.
+// react-refresh wants component-only exports for full HMR; these hooks
+// are stable enough that a manual page reload on auth changes is fine.
+// eslint-disable-next-line react-refresh/only-export-components
 export function useAuth() {
   const ctx = useContext(Ctx);
   if (!ctx) throw new Error("useAuth() must be used inside <AuthProvider>");
   return ctx;
 }
 
+// eslint-disable-next-line react-refresh/only-export-components
 export function useSession() {
   return useAuth().session;
 }
 
+// eslint-disable-next-line react-refresh/only-export-components
 export function useIsAdmin() {
   const s = useSession();
   return s?.user.role === "admin";

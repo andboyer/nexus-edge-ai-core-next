@@ -80,7 +80,6 @@ export function useSSE<T = unknown>(opts: UseSseOptions<T>): UseSseResult<T> {
           });
         } catch (err) {
           // Single bad payload shouldn't tear down the stream.
-          // eslint-disable-next-line no-console
           console.warn("[sse] parse error", err);
         }
       };

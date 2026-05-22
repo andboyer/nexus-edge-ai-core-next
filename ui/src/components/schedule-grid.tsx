@@ -18,12 +18,18 @@ import { Label } from "@/components/ui/label";
 const DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 const HOURS = Array.from({ length: 24 }, (_, h) => h);
 
+// Helper functions are intentionally co-located with the component for
+// tight coupling (grid shape is owned by ScheduleGrid). Re-exporting
+// breaks `react-refresh/only-export-components` HMR support but the
+// page-level Fast Refresh boundary on consumers absorbs it.
+// eslint-disable-next-line react-refresh/only-export-components
 export function makeEmptyGrid(initial: boolean = true): boolean[][] {
   return Array.from({ length: 7 }, () =>
     Array.from({ length: 48 }, () => initial),
   );
 }
 
+// eslint-disable-next-line react-refresh/only-export-components
 export function cloneGrid(g: boolean[][]): boolean[][] {
   return g.map((row) => row.slice());
 }

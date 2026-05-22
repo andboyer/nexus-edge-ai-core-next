@@ -50,4 +50,7 @@ export const Button = forwardRef<HTMLButtonElement, ButtonProps>(
 );
 Button.displayName = "Button";
 
+// shadcn/ui convention: ship the cva variants alongside the component
+// so callers can compose className.
+// eslint-disable-next-line react-refresh/only-export-components
 export { buttonVariants };

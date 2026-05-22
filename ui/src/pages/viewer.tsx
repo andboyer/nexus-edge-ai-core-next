@@ -58,10 +58,14 @@ export function ViewerPage() {
 
   const [expandedId, setExpandedId] = useState<string | null>(null);
 
-  const cameras = camerasQuery.data ?? [];
+  // Depend on the query's `.data` directly (stable reference between
+  // refetches) rather than the `cameras` fallback (a new `[]` every
+  // render would trip react-hooks/exhaustive-deps and break memoization).
+  const cameraList = camerasQuery.data;
+  const cameras = cameraList ?? [];
   const expanded = useMemo(
-    () => cameras.find((c) => String(c.id) === expandedId) ?? null,
-    [cameras, expandedId],
+    () => cameraList?.find((c) => String(c.id) === expandedId) ?? null,
+    [cameraList, expandedId],
   );
 
   return (

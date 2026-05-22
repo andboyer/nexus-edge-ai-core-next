@@ -29,4 +29,8 @@ export function Badge({ className, variant, ...props }: BadgeProps) {
   return <div className={cn(badgeVariants({ variant }), className)} {...props} />;
 }
 
+// shadcn/ui convention: ship the cva variants alongside the component
+// so callers can compose className. `cva()` returns a function so the
+// react-refresh `allowConstantExport` heuristic can't recognise it.
+// eslint-disable-next-line react-refresh/only-export-components
 export { badgeVariants };
