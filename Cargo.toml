@@ -15,6 +15,8 @@ members = [
     "crates/nexus-pipeline",
     "crates/nexus-engine",
     "crates/nexus-probe",
+    "crates/nexus-cloud-protocol",
+    "crates/nexus-cloud-client",
 ]
 
 [workspace.package]
@@ -208,6 +210,17 @@ nexus-inference = { path = "crates/nexus-inference" }
 nexus-storage = { path = "crates/nexus-storage" }
 nexus-storage-cloud = { path = "crates/nexus-storage-cloud" }
 nexus-sinks = { path = "crates/nexus-sinks" }
+nexus-cloud-protocol = { path = "crates/nexus-cloud-protocol" }
+nexus-cloud-client = { path = "crates/nexus-cloud-client" }
+
+# Phase 1.7 — Ed25519 actor_token verifier. RustCrypto-aligned with the
+# existing aes-gcm / hkdf / sha2 family. `pkcs8` feature lets the engine
+# load the bundled entitlement public key from the enrollment artifact
+# PEM, and `rand_core` is needed by the unit tests that mint test keys.
+ed25519-dalek = { version = "2", features = ["pkcs8", "rand_core"] }
+# Cryptographic RNG for ed25519-dalek test key generation. Workspace
+# dep so test crates that mint Ed25519 keys can share the version pin.
+rand_core = { version = "0.6", features = ["getrandom"] }
 nexus-pipeline = { path = "crates/nexus-pipeline" }
 nexus-probe = { path = "crates/nexus-probe" }
 

@@ -1,0 +1,35 @@
+[package]
+name = "nexus-cloud-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Edge-side client for the cloud-console: tunnel, RPC dispatcher with actor_token verification, entitlement cache, and alert sink."
+
+[lib]
+name = "nexus_cloud_client"
+path = "src/lib.rs"
+
+[dependencies]
+nexus-cloud-protocol = { workspace = true }
+nexus-types = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+base64 = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+parking_lot = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+
+ed25519-dalek = { workspace = true }
+
+[dev-dependencies]
+ed25519-dalek = { workspace = true }
+rand_core = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }

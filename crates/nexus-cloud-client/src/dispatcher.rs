@@ -1,0 +1,205 @@
+//! RPC dispatcher — verifies `actor_token` then invokes a handler.
+//!
+//! Phase 1.7 ships the dispatcher contract; the actual engine handler
+//! wiring (cameras CRUD, OTA apply, etc.) happens in Phase 1.11 once
+//! the tunnel is connected. The dispatcher is intentionally generic
+//! over the handler type so unit tests can substitute a mock.
+
+use std::collections::HashSet;
+use std::sync::Arc;
+
+use async_trait::async_trait;
+
+use crate::actor_token::{EnvelopeContext, VerifiedActor, Verifier};
+use crate::error::{DispatchError, InvalidReason, RejectReason};
+
+/// Logical operation name extracted by the engine from
+/// `rpc_call.payload.path`. Phase 1.7 keeps the contract simple — the
+/// caller hands the dispatcher a `&str`; how it's derived from the
+/// HTTP path is the engine's concern.
+pub type MethodName<'a> = &'a str;
+
+/// Policy controlling which methods accept a `system:`-sub token.
+///
+/// The Phase 1.7 acceptance criteria enumerate one positive case
+/// (`entitlement_update` accepted) and one negative case (`create_camera`
+/// rejected). [`Self::default`] ships the minimum-viable list; the
+/// engine extends it as system services are added in later phases
+/// (e.g. `notify` for the alert pipeline, `ota_apply` for the OTA worker
+/// in Phase 7).
+#[derive(Debug, Clone)]
+pub struct SystemMethodPolicy {
+    permitted: HashSet<String>,
+}
+
+impl SystemMethodPolicy {
+    /// Build an empty policy — every `system:`-sub token is rejected.
+    #[must_use]
+    pub fn deny_all() -> Self {
+        Self {
+            permitted: HashSet::new(),
+        }
+    }
+
+    /// Build a policy that admits the named methods.
+    #[must_use]
+    pub fn permitting<I, S>(methods: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self {
+            permitted: methods.into_iter().map(Into::into).collect(),
+        }
+    }
+
+    /// Add a method to the allow-list.
+    pub fn permit(&mut self, method: impl Into<String>) {
+        self.permitted.insert(method.into());
+    }
+
+    /// Returns `true` if a `system:`-sub token may invoke `method`.
+    #[must_use]
+    pub fn allows(&self, method: &str) -> bool {
+        self.permitted.contains(method)
+    }
+}
+
+impl Default for SystemMethodPolicy {
+    /// Phase 1.7 default — admits exactly `entitlement_update`. Engine
+    /// callers MUST extend this for each subsequent system integration.
+    fn default() -> Self {
+        Self::permitting(["entitlement_update"])
+    }
+}
+
+/// Handler trait the engine implements once per logical method. The
+/// dispatcher invokes it only after the `actor_token` has been verified.
+#[async_trait]
+pub trait Handler: Send + Sync {
+    /// Apply the verified RPC. The `actor` is recorded in the engine
+    /// audit log by the dispatcher before this is called, so handlers
+    /// don't need to re-log.
+    async fn handle(
+        &self,
+        method: &str,
+        envelope: EnvelopeContext<'_>,
+        actor: &VerifiedActor,
+        body: Option<&[u8]>,
+    ) -> Result<Vec<u8>, String>;
+}
+
+/// Function adapter so simple handlers can skip implementing the trait.
+/// Reserved for tests — production code wires a `Handler` impl.
+pub struct FnHandler<F>(pub F);
+
+#[async_trait]
+impl<F, Fut> Handler for FnHandler<F>
+where
+    F: Send + Sync + Fn(String, VerifiedActor, Option<Vec<u8>>) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<u8>, String>> + Send,
+{
+    async fn handle(
+        &self,
+        method: &str,
+        _envelope: EnvelopeContext<'_>,
+        actor: &VerifiedActor,
+        body: Option<&[u8]>,
+    ) -> Result<Vec<u8>, String> {
+        (self.0)(method.to_string(), actor.clone(), body.map(Vec::from)).await
+    }
+}
+
+/// Audit hook the engine implements to write `(sub, role, jti)` plus
+/// method/path to its local audit log BEFORE the handler is invoked.
+/// Phase 1.7 leaves the storage backend to the engine — this trait is
+/// the only contract the dispatcher needs.
+pub trait AuditSink: Send + Sync {
+    /// Record one successful authorisation. The dispatcher calls this
+    /// after `verify` succeeds and BEFORE invoking the handler so a
+    /// crash mid-handler still leaves an audit trail.
+    fn record(&self, method: &str, envelope: EnvelopeContext<'_>, actor: &VerifiedActor);
+}
+
+/// No-op audit sink — useful for tests and the Phase 1.7 scaffold.
+/// Engine integrators MUST replace this with a sink that writes to
+/// the local SQLite audit table.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NullAuditSink;
+
+impl AuditSink for NullAuditSink {
+    fn record(&self, _method: &str, _envelope: EnvelopeContext<'_>, _actor: &VerifiedActor) {}
+}
+
+/// Top-level dispatcher. Holds the verifier, the system-sub policy, the
+/// audit sink, and a handler.
+pub struct RpcDispatcher<H: Handler> {
+    verifier: Verifier,
+    policy: SystemMethodPolicy,
+    audit: Arc<dyn AuditSink>,
+    handler: H,
+}
+
+impl<H: Handler> RpcDispatcher<H> {
+    /// Build a dispatcher. The handler is moved in; share via
+    /// `Arc<DispatchedHandler>` if multiple call sites need access.
+    pub fn new(verifier: Verifier, policy: SystemMethodPolicy, handler: H) -> Self {
+        Self {
+            verifier,
+            policy,
+            audit: Arc::new(NullAuditSink),
+            handler,
+        }
+    }
+
+    /// Override the audit sink (default is [`NullAuditSink`]).
+    #[must_use]
+    pub fn with_audit_sink(mut self, audit: Arc<dyn AuditSink>) -> Self {
+        self.audit = audit;
+        self
+    }
+
+    /// Reference to the configured verifier — exposed so the engine
+    /// can pass the same JTI cache to other components.
+    #[must_use]
+    pub const fn verifier(&self) -> &Verifier {
+        &self.verifier
+    }
+
+    /// Top-level entry point. The engine calls this for every inbound
+    /// state-mutating `rpc_call`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DispatchError::Reject`] if the token is missing or
+    /// invalid (the wire response will carry `actor_token_missing` /
+    /// `actor_token_invalid` accordingly), or [`DispatchError::Handler`]
+    /// if the handler itself errored after a successful verification.
+    pub async fn dispatch(
+        &self,
+        method: &str,
+        envelope: EnvelopeContext<'_>,
+        token: Option<&str>,
+        body: Option<&[u8]>,
+    ) -> Result<Vec<u8>, DispatchError> {
+        let token = token.ok_or(DispatchError::Reject(RejectReason::Missing))?;
+        let actor = self.verifier.verify(token, envelope)?;
+
+        // System-sub gate. We check AFTER signature verification so the
+        // policy decision is bound to a cryptographically authenticated
+        // `sub` — never to an attacker-supplied claim.
+        if actor.sub.starts_with("system:") && !self.policy.allows(method) {
+            return Err(DispatchError::Reject(RejectReason::Invalid(
+                InvalidReason::SystemSubNotPermittedForMethod,
+            )));
+        }
+
+        // Audit BEFORE dispatch — Phase 1.7 acceptance bullet.
+        self.audit.record(method, envelope, &actor);
+
+        self.handler
+            .handle(method, envelope, &actor, body)
+            .await
+            .map_err(DispatchError::Handler)
+    }
+}
