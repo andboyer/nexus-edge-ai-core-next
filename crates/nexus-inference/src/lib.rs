@@ -45,6 +45,8 @@ pub use detectors::{
     label_matches_any_prompt, ClassifierEnsembleDetector, Detector, InferenceError, MockDetector,
     OpenVocabDetector,
 };
+#[cfg(feature = "ort")]
+pub use encoder::ImageEncoder;
 pub use pool::{BackendStatus, DetectorPool};
 pub use router::InferenceRouter;
 pub use visual_prompts::{InMemoryVisualPromptStore, VisualPromptBinding, VisualPromptStore};
