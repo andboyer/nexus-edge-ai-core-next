@@ -1052,23 +1052,31 @@ fn build_gst_recorder(
 ) -> Result<Arc<dyn nexus_pipeline::ClipRecorder>> {
     // Build one always-on PreRollIngester per enabled camera. The
     // ingester holds the only RTSP connection for that camera; the
-    // recorder consumes from its broadcast channel + ring snapshot.
+    // recorder consumes from its broadcast channel + ring snapshot,
+    // and the detector consumes decoded RGB frames from the same
+    // ingester via the shared frame source (see
+    // `crates/nexus-pipeline/src/source.rs::SharedRtspSource`).
+    // Collapsing to one session per camera is REQUIRED for cameras
+    // whose firmware caps concurrent RTSP sessions at 1 per stream
+    // path (e.g. InSight 192.168.1.66).
     let mut ingesters: std::collections::HashMap<i64, Arc<nexus_pipeline::PreRollIngester>> =
         std::collections::HashMap::new();
     for cam in cameras {
         if !cam.ingest.enabled {
             continue;
         }
-        match nexus_pipeline::PreRollIngester::new(
+        match nexus_pipeline::PreRollIngester::new_with_rgb(
             cam.id,
             cam.ingest.url.to_string(),
             pre_roll_secs,
+            cam.ingest.max_fps,
         ) {
             Ok(ing) => {
                 tracing::info!(
                     camera_id = cam.id,
                     pre_roll_secs,
-                    "pre-roll ingester started"
+                    max_fps = cam.ingest.max_fps,
+                    "pre-roll ingester started (with shared rgb tap)"
                 );
                 ingesters.insert(cam.id, ing);
             }

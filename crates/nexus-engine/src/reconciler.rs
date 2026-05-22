@@ -216,9 +216,9 @@ fn start_camera(args: &ReconcilerArgs, cam: CameraConfig, url: &str) {
     // the supervisor opens its first motion clip. Failure is logged
     // but non-fatal: detection still runs; clip opens for this
     // camera return Refused until the next reconcile pass.
-    if let Err(e) = args
-        .recorder
-        .add_camera_ingester(cam_id, url, args.pre_roll_secs)
+    if let Err(e) =
+        args.recorder
+            .add_camera_ingester(cam_id, url, args.pre_roll_secs, cam.ingest.max_fps)
     {
         error!(
             camera_id = cam_id,

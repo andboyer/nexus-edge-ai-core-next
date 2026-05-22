@@ -40,8 +40,13 @@ backend = "pool"
 workers = 2
 restart_backoff_ms = 2000
 fail_soft = true
-# NPU first when present; iGPU is the always-available fallback. CPU last.
-ep_priority = ["openvino", "npu", "cpu"]
+# NPU via the OpenVINO EP, CPU as the always-available fallback.
+# Do NOT list "openvino" and "npu" both: the OpenVINO EP library
+# can only be registered once per session and a duplicate entry trips
+# ORT's "Provider OpenVINOExecutionProvider has already been registered"
+# guard, which fails the detector load and silently falls back to mock.
+# The single "npu" entry dispatches through OpenVINO with device_type=NPU.
+ep_priority = ["npu", "cpu"]
 
 [inference.model]
 kind = "yolo"

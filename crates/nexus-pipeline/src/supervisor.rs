@@ -115,7 +115,7 @@ async fn run_camera(
             .await;
 
         let (tx, mut rx) = mpsc::channel::<Frame>(8);
-        let source = build_source(&cfg);
+        let source = build_source(&cfg, &recorder);
         let cam_id = cfg.id;
         let source_task = tokio::spawn(async move {
             if let Err(e) = source.run(tx).await {
@@ -550,7 +550,22 @@ async fn run_camera(
     .await
 }
 
-fn build_source(cfg: &CameraConfig) -> Box<dyn FrameSource + Send> {
+fn build_source(
+    cfg: &CameraConfig,
+    recorder: &Arc<dyn ClipRecorder>,
+) -> Box<dyn FrameSource + Send> {
+    // Prefer a frame source shared with the recorder's pre-roll
+    // ingester whenever the recorder offers one. This collapses
+    // what used to be two RTSP sessions per camera (one for the
+    // detector's RGB feed, one for the recorder's H.264 tap) into
+    // one — REQUIRED for cameras whose firmware caps concurrent
+    // sessions at 1 per stream path (e.g. InSight 192.168.1.66).
+    // The stub recorder (and any future non-pre-roll backend)
+    // returns None here and we fall through to building a fresh
+    // RtspSource as before.
+    if let Some(shared) = recorder.shared_frame_source(cfg.id) {
+        return shared;
+    }
     match cfg.ingest.url.scheme() {
         #[cfg(feature = "gstreamer")]
         "rtsp" | "rtsps" => Box::new(crate::source::RtspSource {

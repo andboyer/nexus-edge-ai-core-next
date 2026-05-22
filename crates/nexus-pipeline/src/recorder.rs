@@ -143,6 +143,12 @@ pub trait ClipRecorder: Send + Sync {
     /// ingest URL changes, so the GStreamer recorder can start a
     /// fresh always-on `PreRollIngester` without a process restart.
     ///
+    /// `max_fps` is the camera's configured detector framerate. The
+    /// GStreamer recorder uses it to size the shared RGB tap's
+    /// `videorate` cap so the detector sees frames at the same
+    /// rate the old standalone `RtspSource` would have produced;
+    /// other recorders ignore it.
+    ///
     /// Default impl is a no-op so the stub recorder (and any future
     /// non-pre-roll backend) doesn't have to opt in. The GStreamer
     /// recorder overrides it; failure to build the ingester is
@@ -154,6 +160,7 @@ pub trait ClipRecorder: Send + Sync {
         camera_id: CameraId,
         url: &str,
         pre_roll_secs: u32,
+        max_fps: u32,
     ) -> Result<(), RecorderError> {
         Ok(())
     }
@@ -163,6 +170,27 @@ pub trait ClipRecorder: Send + Sync {
     /// deleted or disabled. Default impl is a no-op.
     #[allow(unused_variables)]
     fn remove_camera_ingester(&self, camera_id: CameraId) {}
+
+    /// Return a [`crate::source::FrameSource`] that consumes
+    /// decoded RGB frames from this recorder's per-camera ingester
+    /// (sharing the one RTSP session). Default returns `None`; the
+    /// GStreamer recorder overrides to return a
+    /// [`crate::source::SharedRtspSource`] iff it has an ingester
+    /// for `camera_id` and the ingester was built with the RGB tap.
+    ///
+    /// The supervisor's `build_source` calls this BEFORE falling
+    /// back to a freshly-built `RtspSource`. When `Some`, the
+    /// detector + recorder share one connection — required for
+    /// single-session camera firmwares (InSight 192.168.1.66 et
+    /// al). When `None`, the supervisor opens its own RTSP
+    /// session.
+    #[allow(unused_variables)]
+    fn shared_frame_source(
+        &self,
+        camera_id: CameraId,
+    ) -> Option<Box<dyn crate::source::FrameSource + Send>> {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------

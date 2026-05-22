@@ -66,16 +66,22 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use chrono::Utc;
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app::{AppSink, AppSinkCallbacks};
-use nexus_types::CameraId;
+use gstreamer_video::prelude::*;
+use gstreamer_video::{VideoFormat, VideoFrameRef, VideoInfo};
+use nexus_types::{CameraId, Frame, PixelFormat};
 use parking_lot::Mutex;
 use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
+use uuid::Uuid;
 
 use crate::preroll::{NalRingBuffer, NalSample};
-use crate::source::gst_init;
+use crate::source::{
+    gst_init, RTSP_SOURCE_FRAME_HEIGHT, RTSP_SOURCE_FRAME_WIDTH,
+};
 
 /// How many in-flight live samples the broadcast channel buffers
 /// per subscriber. Tokio's broadcast drops the OLDEST sample when
@@ -86,6 +92,18 @@ use crate::source::gst_init;
 /// 720p is ~10–50 KB, so worst-case ~25 MB per camera. Cheaper than
 /// losing frames in the recording.
 const BROADCAST_CAPACITY: usize = 512;
+
+/// How many in-flight RGB frames the per-camera frame broadcast
+/// holds per subscriber. The supervisor downstream of the
+/// broadcast::Receiver has its own mpsc::Sender(8) and a motion
+/// gate that drops the bulk of frames, so this only has to absorb
+/// jitter on the tokio task wakeup — not the entire detector
+/// backlog. 16 buffers ≈ 1s at 15fps. Smaller is better: each RGB
+/// frame at 960×540 is 1.5 MB, so 16 ≈ 24 MB peak per camera. A
+/// slow detector sees `RecvError::Lagged(n)` and the shared source
+/// emits a one-line warn but continues — the gate/pool drop policy
+/// is upstream of us so missed frames are routine.
+const FRAME_BROADCAST_CAPACITY: usize = 16;
 
 /// Max backoff between reconnect attempts.
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
@@ -100,6 +118,24 @@ pub enum IngesterError {
     AppSink(String),
 }
 
+/// Optional shared RGB frame tap. When `Some`, the ingester's
+/// GStreamer pipeline grows a `tee` after the H.264 parser plus a
+/// second branch that decodes to RGB at the camera's `max_fps` and
+/// publishes every decoded frame on a tokio broadcast channel. The
+/// supervisor's [`crate::source::SharedRtspSource`] subscribes to
+/// this channel and forwards into the per-camera frame mpsc —
+/// collapsing the two RTSP sessions (one for the detector RGB feed,
+/// one for the recorder NAL feed) that the old `RtspSource` +
+/// `PreRollIngester` pair would otherwise open. The collapse is
+/// REQUIRED for cameras whose firmware caps concurrent RTSP
+/// sessions at one per stream path (confirmed on the InSight
+/// 192.168.1.66 fixture); on cameras that tolerate two sessions it
+/// just halves the upstream bandwidth + per-camera CPU.
+struct FrameTap {
+    tx: broadcast::Sender<Frame>,
+    max_fps: u32,
+}
+
 pub struct PreRollIngester {
     camera_id: CameraId,
     url: String,
@@ -108,6 +144,9 @@ pub struct PreRollIngester {
     /// for recording) but the ring buffer never accumulates.
     ring: Arc<Mutex<NalRingBuffer>>,
     live_tx: broadcast::Sender<NalSample>,
+    /// Set iff the pipeline was built with the RGB tap. See
+    /// [`FrameTap`] for the why.
+    frame_tap: Option<FrameTap>,
     /// Active GStreamer pipeline, populated by the supervisor each
     /// time it (re)builds a session. Drop sets it to NULL
     /// synchronously so the GObject ref cycle teardown doesn't
@@ -128,10 +167,47 @@ impl PreRollIngester {
     /// that need to know "is the camera actually online?" should
     /// read [`PreRollIngester::is_buffering`] after a brief grace
     /// period.
+    ///
+    /// Builds the H.264-NAL-only pipeline (no RGB tap). The
+    /// detector must still open its own `RtspSource` against the
+    /// same URL — fine on cameras that allow multiple concurrent
+    /// RTSP sessions per path, broken on single-session cameras
+    /// (see [`Self::new_with_rgb`] for the collapse).
     pub fn new(
         camera_id: CameraId,
         url: impl Into<String>,
         pre_roll_secs: u32,
+    ) -> Result<Arc<Self>, IngesterError> {
+        Self::build(camera_id, url, pre_roll_secs, None)
+    }
+
+    /// Variant of [`Self::new`] that also exposes a decoded RGB
+    /// frame stream off the same RTSP session, sized to the
+    /// engine's standard detector resolution
+    /// (`RTSP_SOURCE_FRAME_WIDTH × RTSP_SOURCE_FRAME_HEIGHT`) at
+    /// `max_fps` (0 ⇒ 15). Pipeline grows a `tee` after `h264parse`
+    /// plus a second branch
+    /// `queue → avdec_h264 → videoconvert → videoscale → videorate
+    /// → appsink RGB`; the detector consumes frames via
+    /// [`Self::subscribe_frames`] without opening a second
+    /// connection to the camera. Use this constructor whenever the
+    /// recorder is `gstreamer` so single-session cameras (e.g.
+    /// InSight firmware caps at 1 session per stream path) work
+    /// end-to-end.
+    pub fn new_with_rgb(
+        camera_id: CameraId,
+        url: impl Into<String>,
+        pre_roll_secs: u32,
+        max_fps: u32,
+    ) -> Result<Arc<Self>, IngesterError> {
+        Self::build(camera_id, url, pre_roll_secs, Some(max_fps))
+    }
+
+    fn build(
+        camera_id: CameraId,
+        url: impl Into<String>,
+        pre_roll_secs: u32,
+        rgb_max_fps: Option<u32>,
     ) -> Result<Arc<Self>, IngesterError> {
         gst_init::ensure().map_err(|e| IngesterError::GstInit(e.to_string()))?;
         let url = url.into();
@@ -139,12 +215,20 @@ impl PreRollIngester {
             pre_roll_secs as u64,
         ))));
         let (live_tx, _rx) = broadcast::channel(BROADCAST_CAPACITY);
+        let frame_tap = rgb_max_fps.map(|fps| {
+            let (tx, _rx) = broadcast::channel(FRAME_BROADCAST_CAPACITY);
+            FrameTap {
+                tx,
+                max_fps: if fps == 0 { 15 } else { fps },
+            }
+        });
         let active_pipeline = Arc::new(Mutex::new(None));
         let shutdown = Arc::new(AtomicBool::new(false));
 
         let task_url = url.clone();
         let task_ring = ring.clone();
         let task_tx = live_tx.clone();
+        let task_frame_tap = frame_tap.as_ref().map(|t| (t.tx.clone(), t.max_fps));
         let task_pipeline = active_pipeline.clone();
         let task_shutdown = shutdown.clone();
         let task = tokio::spawn(async move {
@@ -153,6 +237,7 @@ impl PreRollIngester {
                 task_url,
                 task_ring,
                 task_tx,
+                task_frame_tap,
                 task_pipeline,
                 task_shutdown,
             )
@@ -164,6 +249,7 @@ impl PreRollIngester {
             url,
             ring,
             live_tx,
+            frame_tap,
             active_pipeline,
             shutdown,
             task: Mutex::new(Some(task)),
@@ -188,6 +274,28 @@ impl PreRollIngester {
         self.live_tx.subscribe()
     }
 
+    /// Subscribe to the decoded RGB frame stream off this
+    /// ingester's RTSP session. Returns `None` if the ingester was
+    /// built via [`Self::new`] (no RGB tap). Returns `Some` if
+    /// built via [`Self::new_with_rgb`]. The first frame a fresh
+    /// subscriber sees is the next one decoded — no replay of past
+    /// frames. Drop the receiver to detach; the GStreamer pipeline
+    /// keeps decoding regardless (the cost is paid even with zero
+    /// subscribers, but every realistic deployment has exactly one:
+    /// the per-camera supervisor task).
+    pub fn subscribe_frames(&self) -> Option<broadcast::Receiver<Frame>> {
+        self.frame_tap.as_ref().map(|t| t.tx.subscribe())
+    }
+
+    /// True iff this ingester was built with the shared RGB tap
+    /// enabled. Used by the recorder's `shared_frame_source` to
+    /// decide whether to hand the supervisor a
+    /// [`crate::source::SharedRtspSource`] or have it open its own
+    /// `RtspSource`.
+    pub fn has_rgb_tap(&self) -> bool {
+        self.frame_tap.is_some()
+    }
+
     /// Take a copy of every NAL currently in the pre-roll ring
     /// buffer. Returned vec starts on a keyframe (or is empty if
     /// no keyframe has arrived yet). The buffer continues filling
@@ -210,12 +318,15 @@ async fn run_supervisor(
     url: String,
     ring: Arc<Mutex<NalRingBuffer>>,
     live_tx: broadcast::Sender<NalSample>,
+    frame_tap: Option<(broadcast::Sender<Frame>, u32)>,
     active_pipeline: Arc<Mutex<Option<gst::Pipeline>>>,
     shutdown: Arc<AtomicBool>,
 ) {
     info!(
         camera_id,
-        url, "preroll ingester supervisor starting (always-on)"
+        url,
+        rgb_tap = frame_tap.is_some(),
+        "preroll ingester supervisor starting (always-on)"
     );
     let mut backoff = Duration::from_millis(500);
     loop {
@@ -227,6 +338,7 @@ async fn run_supervisor(
             &url,
             ring.clone(),
             live_tx.clone(),
+            frame_tap.clone(),
             active_pipeline.clone(),
             shutdown.clone(),
         )
@@ -258,6 +370,7 @@ async fn run_session(
     url: &str,
     ring: Arc<Mutex<NalRingBuffer>>,
     live_tx: broadcast::Sender<NalSample>,
+    frame_tap: Option<(broadcast::Sender<Frame>, u32)>,
     active_pipeline: Arc<Mutex<Option<gst::Pipeline>>>,
     shutdown: Arc<AtomicBool>,
 ) -> Result<(), IngesterError> {
@@ -273,14 +386,53 @@ async fn run_session(
     // docstring for the multi-paragraph explanation of why -1
     // catastrophically breaks recording on cameras that already
     // include SPS/PPS in every keyframe access unit.
-    let desc = format!(
-        "rtspsrc location=\"{url_safe}\" latency=500 protocols=tcp \
-         ! rtph264depay \
-         ! h264parse config-interval=0 \
-         ! video/x-h264,stream-format=byte-stream,alignment=au \
-         ! appsink name=tap emit-signals=true sync=false \
-             max-buffers=200 drop=false"
-    );
+    //
+    // When `frame_tap` is `Some`, the pipeline grows a `tee` after
+    // the h264parse caps filter, with two queued branches:
+    //   * `tap`  — the existing byte-stream H.264 appsink that
+    //              feeds the ring buffer + recorder broadcast.
+    //   * `rgb`  — `avdec_h264 → videoconvert → videoscale →
+    //              videorate → appsink RGB` at the engine's
+    //              standard 960×540 detector resolution. The
+    //              detector subscribes via
+    //              [`PreRollIngester::subscribe_frames`] and never
+    //              opens its own RTSP connection. Queues sit at
+    //              both branch heads (mandatory for `tee` — without
+    //              them the upstream pad serialises both downstream
+    //              sinks on one thread and the slower one wedges
+    //              the faster one). `tap` queue is lossless (we
+    //              must record every NAL); `rgb` queue is
+    //              `leaky=downstream` so a slow detector drops the
+    //              oldest decoded frame instead of stalling the
+    //              shared upstream parser.
+    let desc = match &frame_tap {
+        None => format!(
+            "rtspsrc location=\"{url_safe}\" latency=500 protocols=tcp \
+             ! rtph264depay \
+             ! h264parse config-interval=0 \
+             ! video/x-h264,stream-format=byte-stream,alignment=au \
+             ! appsink name=tap emit-signals=true sync=false \
+                 max-buffers=200 drop=false"
+        ),
+        Some((_, max_fps)) => format!(
+            "rtspsrc location=\"{url_safe}\" latency=500 protocols=tcp \
+             ! rtph264depay \
+             ! h264parse config-interval=0 \
+             ! video/x-h264,stream-format=byte-stream,alignment=au \
+             ! tee name=t \
+             t. ! queue max-size-buffers=200 max-size-bytes=0 max-size-time=0 \
+                ! appsink name=tap emit-signals=true sync=false \
+                    max-buffers=200 drop=false \
+             t. ! queue leaky=downstream max-size-buffers=8 max-size-bytes=0 max-size-time=0 \
+                ! avdec_h264 \
+                ! videoconvert ! videoscale ! videorate \
+                ! video/x-raw,format=RGB,width={w},height={h},framerate={fr}/1 \
+                ! appsink name=rgb emit-signals=true sync=false drop=true max-buffers=4",
+            w = RTSP_SOURCE_FRAME_WIDTH,
+            h = RTSP_SOURCE_FRAME_HEIGHT,
+            fr = max_fps,
+        ),
+    };
     let pipeline = gst::parse::launch(&desc)
         .map_err(|e| IngesterError::Pipeline(format!("parse::launch: {e}")))?
         .downcast::<gst::Pipeline>()
@@ -343,6 +495,116 @@ async fn run_session(
             })
             .build(),
     );
+
+    // RGB tap (shared with the detector) — only wired when
+    // [`PreRollIngester::new_with_rgb`] was used. Reads decoded
+    // RGB samples off the second `tee` branch and publishes them
+    // on the per-camera `Frame` broadcast. Code mirrors the
+    // RtspSource appsink callback: VideoFrameRef for stride-safe
+    // reads, hard error on non-RGB caps, row-by-row tight pack
+    // because every downstream consumer (image::JpegEncoder,
+    // ndarray) wants width*height*3 with no padding.
+    if let Some((frame_tx, _max_fps)) = &frame_tap {
+        let rgb_sink = pipeline
+            .by_name("rgb")
+            .ok_or_else(|| IngesterError::AppSink("appsink 'rgb' not found".into()))?
+            .downcast::<AppSink>()
+            .map_err(|_| IngesterError::AppSink("downcast rgb AppSink".into()))?;
+        let frame_tx_cb = frame_tx.clone();
+        let counter = Arc::new(parking_lot::Mutex::new(0u64));
+        let counter_cb = counter.clone();
+        let logged_first = Arc::new(AtomicBool::new(false));
+        let logged_first_cb = logged_first.clone();
+        rgb_sink.set_callbacks(
+            AppSinkCallbacks::builder()
+                .new_sample(move |sink| {
+                    let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
+                    let buffer = sample.buffer().ok_or(gst::FlowError::Error)?;
+                    let caps = sample.caps().ok_or(gst::FlowError::Error)?;
+                    let info = VideoInfo::from_caps(caps).map_err(|_| gst::FlowError::Error)?;
+                    let frame_ref = VideoFrameRef::from_buffer_ref_readable(buffer, &info)
+                        .map_err(|_| gst::FlowError::Error)?;
+
+                    if !logged_first_cb.swap(true, Ordering::Relaxed) {
+                        info!(
+                            camera_id,
+                            caps = %caps,
+                            format = ?info.format(),
+                            width = info.width(),
+                            height = info.height(),
+                            stride0 = frame_ref.plane_stride().first().copied().unwrap_or(0),
+                            buffer_size = buffer.size(),
+                            "preroll ingester rgb tap: first sample"
+                        );
+                    }
+
+                    if info.format() != VideoFormat::Rgb {
+                        error!(
+                            camera_id,
+                            format = ?info.format(),
+                            "rgb appsink received non-RGB sample; \
+                             check capsfilter and videoconvert in the pipeline"
+                        );
+                        return Err(gst::FlowError::NotNegotiated);
+                    }
+
+                    let plane = frame_ref.plane_data(0).map_err(|_| gst::FlowError::Error)?;
+                    let stride =
+                        frame_ref.plane_stride().first().copied().unwrap_or(0) as usize;
+                    let width = info.width() as usize;
+                    let height = info.height() as usize;
+                    let row_bytes = width * 3;
+
+                    if stride < row_bytes || plane.len() < stride * height {
+                        error!(
+                            camera_id,
+                            stride,
+                            row_bytes,
+                            plane_len = plane.len(),
+                            height,
+                            "rgb appsink buffer geometry inconsistent with caps"
+                        );
+                        return Err(gst::FlowError::Error);
+                    }
+
+                    let mut data = Vec::with_capacity(row_bytes * height);
+                    if stride == row_bytes {
+                        data.extend_from_slice(&plane[..row_bytes * height]);
+                    } else {
+                        for y in 0..height {
+                            let start = y * stride;
+                            data.extend_from_slice(&plane[start..start + row_bytes]);
+                        }
+                    }
+
+                    let frame_id = {
+                        let mut g = counter_cb.lock();
+                        *g = g.saturating_add(1);
+                        *g
+                    };
+                    let frame = Frame {
+                        camera_id,
+                        frame_id,
+                        captured_at: Utc::now(),
+                        width: info.width(),
+                        height: info.height(),
+                        format: PixelFormat::Rgb24,
+                        data: Arc::new(data),
+                        trace_id: Uuid::now_v7().to_string(),
+                    };
+                    // `broadcast::send` returns Err iff no
+                    // subscribers — fine, we're a shared bus and
+                    // the supervisor may not have called
+                    // `subscribe_frames` yet at very first session
+                    // start. Slow subscribers see `Lagged(n)` on
+                    // their next recv (handled in
+                    // `SharedRtspSource`), NOT a send error here.
+                    let _ = frame_tx_cb.send(frame);
+                    Ok(gst::FlowSuccess::Ok)
+                })
+                .build(),
+        );
+    }
 
     pipeline
         .set_state(gst::State::Playing)

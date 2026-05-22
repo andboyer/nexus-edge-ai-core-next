@@ -785,6 +785,7 @@ impl ClipRecorder for GstClipRecorder {
         camera_id: CameraId,
         url: &str,
         pre_roll_secs: u32,
+        max_fps: u32,
     ) -> Result<(), RecorderError> {
         // Idempotent + URL-aware: if we already have an ingester for
         // this camera with the same URL, do nothing. If the URL
@@ -804,8 +805,13 @@ impl ClipRecorder for GstClipRecorder {
                 }
             }
         }
-        let new_ing = PreRollIngester::new(camera_id, url.to_string(), pre_roll_secs)
-            .map_err(|e| RecorderError::Io(std::io::Error::other(format!("ingester: {e}"))))?;
+        // Build with the shared RGB tap so the supervisor's
+        // SharedRtspSource can consume detector frames off the same
+        // RTSP session — required for cameras whose firmware caps
+        // concurrent sessions at 1 per stream path (InSight et al).
+        let new_ing =
+            PreRollIngester::new_with_rgb(camera_id, url.to_string(), pre_roll_secs, max_fps)
+                .map_err(|e| RecorderError::Io(std::io::Error::other(format!("ingester: {e}"))))?;
         // Insert under the exclusive lock; dropping the previous
         // `Arc<PreRollIngester>` here triggers its supervisor
         // shutdown via Drop, which cleans up the GStreamer pipeline
@@ -814,7 +820,7 @@ impl ClipRecorder for GstClipRecorder {
         if prev.is_some() {
             info!(camera_id, %url, "pre-roll ingester replaced (URL changed)");
         } else {
-            info!(camera_id, %url, pre_roll_secs, "pre-roll ingester started (hot-add)");
+            info!(camera_id, %url, pre_roll_secs, max_fps, "pre-roll ingester started (hot-add)");
         }
         Ok(())
     }
@@ -823,6 +829,26 @@ impl ClipRecorder for GstClipRecorder {
         if self.ingesters.write().remove(&camera_id).is_some() {
             info!(camera_id, "pre-roll ingester removed (hot-remove)");
         }
+    }
+
+    fn shared_frame_source(
+        &self,
+        camera_id: CameraId,
+    ) -> Option<Box<dyn crate::source::FrameSource + Send>> {
+        let read = self.ingesters.read();
+        let ing = read.get(&camera_id)?;
+        if !ing.has_rgb_tap() {
+            // Ingester built without RGB tap (legacy path / test
+            // construction). Returning None has the supervisor
+            // open its own RtspSource — fine on cameras that allow
+            // multiple sessions, but the whole point of this trait
+            // method is to AVOID that on single-session firmwares.
+            return None;
+        }
+        Some(Box::new(crate::source::SharedRtspSource {
+            camera_id,
+            ingester: ing.clone(),
+        }))
     }
 }
 

@@ -49,7 +49,8 @@
 11. [Troubleshooting](#11-troubleshooting)
 12. [Appendix A — Reproducible model generation](#12-appendix-a--reproducible-model-generation)
 13. [Appendix B — End-to-end T24 transcript](#13-appendix-b--end-to-end-t24-transcript)
-14. [Appendix C — Where to file bugs](#14-appendix-c--where-to-file-bugs)
+14. [Appendix C — End-to-end T36-S transcript](#14-appendix-c--end-to-end-t36-s-transcript)
+15. [Appendix D — Where to file bugs](#15-appendix-d--where-to-file-bugs)
 
 ---
 
@@ -382,50 +383,46 @@ continue at §6 (or §7 for T36-S).
 
 ### 5.1 T10 / T24 — Intel UHD / Iris Xe iGPU
 
-> **Use the Intel graphics OEM repo, not the Ubuntu archive, AND pin
-> it at priority 1001.** Ubuntu 24.04 ships
+> **Use the Intel-graphics PPA (`ppa:kobuk-team/intel-graphics`), not
+> the Ubuntu archive and not the old `repositories.intel.com/gpu`
+> data-center repo.** Ubuntu 24.04 ships
 > `intel-media-va-driver-non-free 24.1.0` (early-2024 vintage), which
 > silently fails to init against the HWE kernel (≥ 6.11). Symptom:
 > `vainfo` prints `iHD_drv_video.so init failed` with no further
 > detail even though `dmesg` shows i915 bound, GuC authenticated, and
-> `/dev/dri/renderD128` present. The Intel repo ships 25.x, which
-> tracks the current i915 uAPI — but its iHD deb's libva dependency
-> is loose (`>= 2.20`), so without the apt pin you end up with
-> repo-iHD-25.x against archive-libva-2.20 and get the second-order
-> failure `has no function __vaDriverInit_1_0` (iHD-25.x only exports
-> `__vaDriverInit_1_22`).
+> `/dev/dri/renderD128` present. The PPA ships 25.x, which tracks
+> the current i915 uAPI, plus a matched libva 1.22.x.
+>
+> **Why the PPA, not `repositories.intel.com/gpu`?** As of late 2025
+> Intel split their package channels: client GPUs (UHD / Iris Xe /
+> Arc / Lunar Lake / Battlemage / Panther Lake) live in the
+> `kobuk-team` PPA, and `repositories.intel.com/gpu` is now
+> data-center-only (Flex / Max). The PPA also renamed packages —
+> `intel-level-zero-gpu` → `libze-intel-gpu1`, `level-zero` →
+> `libze1` — so old install recipes fail with
+> `intel-level-zero-gpu : Depends: libigc1 ... but it is not
+> installable`.
 
 ```bash
-# Add Intel graphics OEM repo (same source as §5.2 / §5.3).
-sudo apt install -y gpg-agent wget
-wget -qO- https://repositories.intel.com/gpu/intel-graphics.key \
-  | sudo gpg --yes --dearmor --output /usr/share/keyrings/intel-graphics.gpg
-echo "deb [arch=amd64 signed-by=/usr/share/keyrings/intel-graphics.gpg] \
-https://repositories.intel.com/gpu/ubuntu noble unified" \
-  | sudo tee /etc/apt/sources.list.d/intel-gpu-noble.list
-
-# Pin the Intel repo at priority 1001 so its libva, iHD, and compute
-# runtime win over the Ubuntu archive even when already installed.
-# Without this, apt silently keeps archive-libva and you get an ABI
-# mismatch against repo-iHD. Scope the pin tightly to Intel-shipped
-# packages — a bare `Package: *` also captures libdrm/libgl/etc and
-# blocks later steps (e.g. gstreamer in §5.5 pulling a newer libdrm)
-# with `Packages were downgraded` errors.
-sudo tee /etc/apt/preferences.d/intel-graphics > /dev/null << 'EOF'
-Package: libva* intel-* libigdgmm* libmfx* libvpl* level-zero* libze*
-Pin: origin repositories.intel.com
-Pin-Priority: 1001
-EOF
+# Add the Intel-graphics PPA (client GPUs).
+sudo apt install -y software-properties-common
+sudo add-apt-repository -y ppa:kobuk-team/intel-graphics
 sudo apt update
 
+# Compute stack. (intel-gsc = GPU firmware update tool, useful on
+# T10 N100 boxes whose shipping firmware lags behind kernel.)
 sudo apt install -y \
-    libva2 libva-drm2 libva-x11-2 libva-wayland2 \
-    intel-opencl-icd \
+    libze-intel-gpu1 libze1 \
+    intel-metrics-discovery intel-opencl-icd intel-gsc \
+    clinfo
+
+# Media stack.
+sudo apt install -y \
     intel-media-va-driver-non-free \
-    libmfx-gen1.2 \
-    vainfo \
-    clinfo \
+    libmfx-gen1 libvpl2 libvpl-tools \
+    libva-glx2 va-driver-all vainfo \
     intel-gpu-tools
+
 sudo usermod -aG render,video nexus
 sudo usermod -aG render,video nexus-admin
 # Log out / in (or reboot) for group membership to take effect.
@@ -440,9 +437,10 @@ sudo reboot
 # then misleadingly reports "iHD init failed".
 vainfo --display drm --device /dev/dri/renderD128 | head -25
 # Expect THREE things, in order:
-#   1. libva info: VA-API version 1.22.0    ← proves the pin worked;
-#      if it still reads 1.20.0 the libva packages came from the
-#      Ubuntu archive — re-check /etc/apt/preferences.d/intel-graphics
+#   1. libva info: VA-API version 1.22.x    ← proves you got the PPA
+#      build; if it still reads 1.20.0 the libva packages came from
+#      the Ubuntu archive — re-check that `apt policy libva2` shows
+#      the candidate origin as `LP-PPA-kobuk-team-intel-graphics`,
 #      and rerun `sudo apt install --reinstall libva2 libva-drm2`.
 #   2. Driver version: Intel iHD driver ... - 25.x.x
 #   3. VAProfileH264Main / VAProfileH264High / VAProfileHEVCMain /
@@ -459,56 +457,55 @@ commands as the `nexus` service user (`sudo -u nexus vainfo --display drm
 --device /dev/dri/renderD128`) or add your own login to the group with
 `sudo usermod -aG render,video $USER` and log out / in.
 
-If `vainfo` prints `has no function __vaDriverInit_1_0`, the pin
-didn't apply and you have repo-iHD vs archive-libva. Confirm with
-`apt policy libva2` — the install candidate should be from
-`repositories.intel.com`. Force-fix:
+If `vainfo` prints `has no function __vaDriverInit_1_0`, libva is
+from the Ubuntu archive (2.20.x) while iHD is the PPA build (needs
+1.22.x). Confirm with `apt policy libva2` — the install candidate
+should be from `LP-PPA-kobuk-team-intel-graphics`. Force-fix:
 `sudo apt install --reinstall -y libva2 libva-drm2 libva-x11-2 libva-wayland2`.
 
-If `vainfo` still prints `iHD_drv_video.so init failed` after the repo
-install, confirm in this order: (a) `lspci -nnk | grep -A3 -i vga` shows
-`Kernel driver in use: i915`; (b) `dmesg | grep -iE 'guc|huc'` shows
-`GuC firmware ... version` and `HuC: authenticated`; (c) `dpkg -l
-intel-media-va-driver-non-free` shows a 25.x version. If (a) or (b) is
-missing the iGPU isn't actually coming up — check the Beelink BIOS for
-`Primary Display = IGFX` and `iGPU Multi-Monitor = Enabled` so i915
-binds even when running headless. The `i965_drv_video.so` failure
-beneath the iHD one is expected and harmless — `i965` only covers Gen8
-and older; iHD is the right driver for Alder Lake-N.
+If `apt install` fails with `intel-level-zero-gpu : Depends: libigc1
+(>= ...) but it is not installable`, you're following an older recipe
+that referenced the now-deprecated `repositories.intel.com/gpu/ubuntu
+noble unified` data-center channel. Tear it down with `sudo rm -f
+/etc/apt/sources.list.d/intel-gpu-noble.list
+/etc/apt/preferences.d/intel-graphics && sudo apt update`, then
+follow the PPA recipe above. The package names also changed:
+`intel-level-zero-gpu` → `libze-intel-gpu1`, `level-zero` → `libze1`.
+
+If `vainfo` still prints `iHD_drv_video.so init failed` after the
+install, confirm in this order: (a) `lspci -nnk | grep -A3 -i vga`
+shows `Kernel driver in use: i915`; (b) `dmesg | grep -iE 'guc|huc'`
+shows `GuC firmware ... version` and `HuC: authenticated`; (c) `dpkg
+-l intel-media-va-driver-non-free` shows a 25.x version. If (a) or
+(b) is missing the iGPU isn't actually coming up — check the Beelink
+BIOS for `Primary Display = IGFX` and `iGPU Multi-Monitor = Enabled`
+so i915 binds even when running headless. The `i965_drv_video.so`
+failure beneath the iHD one is expected and harmless — `i965` only
+covers Gen8 and older; iHD is the right driver for Alder Lake-N.
 
 ### 5.2 T36 — Intel Arc A380 dGPU
 
-```bash
-# Add Intel graphics OEM repo.
-. /etc/os-release
-sudo apt install -y gpg-agent wget
-wget -qO- https://repositories.intel.com/gpu/intel-graphics.key \
-  | sudo gpg --yes --dearmor --output /usr/share/keyrings/intel-graphics.gpg
-echo "deb [arch=amd64 signed-by=/usr/share/keyrings/intel-graphics.gpg] \
-https://repositories.intel.com/gpu/ubuntu noble unified" \
-  | sudo tee /etc/apt/sources.list.d/intel-gpu-noble.list
+> Same PPA as §5.1 — see that section for the background on why the
+> old `repositories.intel.com/gpu` recipe no longer works.
 
-# Pin the Intel repo at priority 1001 so libva/iHD/compute-runtime
-# all come from it. Without this you get repo-iHD-25.x against
-# archive-libva-2.20 — vainfo fails with `__vaDriverInit_1_0` missing.
-# Pin is scoped to Intel-shipped packages only (see §5.1 comment).
-sudo tee /etc/apt/preferences.d/intel-graphics > /dev/null << 'EOF'
-Package: libva* intel-* libigdgmm* libmfx* libvpl* level-zero* libze*
-Pin: origin repositories.intel.com
-Pin-Priority: 1001
-EOF
+```bash
+# Add the Intel-graphics PPA (client GPUs, includes Arc dGPUs).
+sudo apt install -y software-properties-common
+sudo add-apt-repository -y ppa:kobuk-team/intel-graphics
 sudo apt update
 
-# Install the Arc compute + media stack.
+# Compute stack (the libze* pair is the new name for the old
+# intel-level-zero-gpu + level-zero packages).
 sudo apt install -y \
-    libva2 libva-drm2 libva-x11-2 libva-wayland2 \
-    intel-opencl-icd \
-    intel-level-zero-gpu \
-    level-zero \
+    libze-intel-gpu1 libze1 \
+    intel-metrics-discovery intel-opencl-icd intel-gsc \
+    clinfo
+
+# Media stack.
+sudo apt install -y \
     intel-media-va-driver-non-free \
-    libmfx-gen1.2 \
-    vainfo \
-    clinfo \
+    libmfx-gen1 libvpl2 libvpl-tools \
+    libva-glx2 va-driver-all vainfo \
     intel-gpu-tools
 
 sudo usermod -aG render,video nexus
@@ -520,13 +517,12 @@ sudo reboot
 
 ```bash
 vainfo --display drm --device /dev/dri/renderD128 | head -25
-# Expect: "libva info: VA-API version 1.22.0" AND "Driver version:
+# Expect: "libva info: VA-API version 1.22.x" AND "Driver version:
 # Intel iHD driver ... - 25.x.x" AND the full VAProfileH264* /
 # VAProfileHEVC* / VAProfileAV1Profile0 list.
 clinfo | grep -A2 'Platform Name'
 # Expect "Intel(R) OpenCL Graphics" with the Arc A380 listed under
 # Devices.
-sudo apt install -y intel-gpu-tools
 sudo intel_gpu_top -L          # lists the engines on the card
 ```
 
@@ -543,46 +539,43 @@ uname -r        # expect 6.10.x or later
 ```
 
 ```bash
-# Step 2 — iGPU stack, identical to T36.
-. /etc/os-release
-wget -qO- https://repositories.intel.com/gpu/intel-graphics.key \
-  | sudo gpg --yes --dearmor --output /usr/share/keyrings/intel-graphics.gpg
-echo "deb [arch=amd64 signed-by=/usr/share/keyrings/intel-graphics.gpg] \
-https://repositories.intel.com/gpu/ubuntu noble unified" \
-  | sudo tee /etc/apt/sources.list.d/intel-gpu-noble.list
-
-# Pin the Intel repo at priority 1001 — see §5.1 for why.
-sudo tee /etc/apt/preferences.d/intel-graphics > /dev/null << 'EOF'
-Package: libva* intel-* libigdgmm* libmfx* libvpl* level-zero* libze*
-Pin: origin repositories.intel.com
-Pin-Priority: 1001
-EOF
+# Step 2 — iGPU stack, same PPA recipe as §5.1 / §5.2.
+sudo apt install -y software-properties-common
+sudo add-apt-repository -y ppa:kobuk-team/intel-graphics
 sudo apt update
 
 sudo apt install -y \
-    libva2 libva-drm2 libva-x11-2 libva-wayland2 \
-    intel-opencl-icd \
-    intel-level-zero-gpu \
-    level-zero \
+    libze-intel-gpu1 libze1 \
+    intel-metrics-discovery intel-opencl-icd intel-gsc \
+    clinfo \
     intel-media-va-driver-non-free \
-    vainfo
+    libmfx-gen1 libvpl2 libvpl-tools \
+    libva-glx2 va-driver-all vainfo
 ```
 
 ```bash
 # Step 3 — NPU driver trio. We install from the upstream
 # intel/linux-npu-driver release (Ubuntu has no apt package yet).
-NPU_VER=1.10.0
+#
+# Pin to a known-good tagged release rather than "latest" so a
+# silently-broken upstream build can't take a fleet down. v1.32.1
+# is verified for Lunar Lake on Ubuntu 24.04 / kernel >= 6.10.
+#
+# Since v1.32.x the release ships ONE tarball containing all three
+# .debs (intel-fw-npu, intel-driver-compiler-npu,
+# intel-level-zero-npu) instead of three separate downloads, and
+# the install step is `apt install ./intel-*.deb` instead of dpkg
+# so libtbb12 + libze1 deps resolve automatically. The libze1
+# package comes from the kobuk-team PPA you added in Step 2.
+NPU_VER=1.32.1
+NPU_TARBALL=linux-npu-driver-v${NPU_VER}.20260422-24767473183-ubuntu2404.tar.gz
 mkdir -p /tmp/npu && cd /tmp/npu
-for pkg in \
-    intel-driver-compiler-npu_${NPU_VER}.20240916-10885588273_ubuntu24.04_amd64.deb \
-    intel-fw-npu_${NPU_VER}.20240916-10885588273_ubuntu24.04_amd64.deb \
-    intel-level-zero-npu_${NPU_VER}.20240916-10885588273_ubuntu24.04_amd64.deb ; do
-    wget -q "https://github.com/intel/linux-npu-driver/releases/download/v${NPU_VER}/${pkg}"
-done
-# Order matters: firmware first, then compiler, then level-zero.
-sudo dpkg -i intel-fw-npu_*.deb
-sudo dpkg -i intel-driver-compiler-npu_*.deb
-sudo dpkg -i intel-level-zero-npu_*.deb
+wget "https://github.com/intel/linux-npu-driver/releases/download/v${NPU_VER}/${NPU_TARBALL}"
+tar -xf "${NPU_TARBALL}"
+ls -1 *.deb     # expect 3 packages: intel-driver-compiler-npu,
+                # intel-fw-npu, intel-level-zero-npu
+sudo apt update
+sudo apt install -y ./intel-*.deb
 ```
 
 ```bash
@@ -599,8 +592,13 @@ ls -l /dev/accel/accel0
 # Expect: crw-rw---- 1 root render ... /dev/accel/accel0
 # If accel0 is missing, kernel < 6.10 OR NPU disabled in BIOS (§2).
 
-dmesg | grep -i 'intel_vpu\|intel_vpu0'
+sudo dmesg | grep -i 'intel_vpu\|intel_vpu0'
 # Expect lines like "intel_vpu 0000:00:0b.0: Firmware: ..."
+# Note: Ubuntu 24.04 sets `kernel.dmesg_restrict=1` by default, so a
+# bare `dmesg` as a non-root user returns "read kernel buffer failed:
+# Operation not permitted". Use `sudo dmesg` (or add yourself to the
+# `adm` group). The `/dev/accel/accel0` check above is the
+# authoritative "driver is up" signal — the engine only needs that.
 
 # Optional: install OpenVINO benchmark_app for end-to-end smoke.
 # (See nexus-edge-deploy/scripts/openvino_smoke.sh if available.)
@@ -1264,13 +1262,17 @@ sudo -u nexus-admin bash <<'EOF'
 cd /opt/nexus
 source $HOME/.cargo/env
 
-# Pick the cargo features for your tier. The seven proxy features on
+# Pick the cargo features for your tier. The proxy features on
 # `nexus-engine` (M-Install Checkpoint 2) forward into
 # `nexus-inference`; the ones you don't pick stay zero-cost.
-#   T10 / T24 / T36     →  ort,ep-cpu,ep-openvino
-#   T36-S               →  ort,ep-cpu,ep-openvino   # NPU dispatched via OpenVINO; no separate ep-npu feature
-#   T64 (post-beta)     →  ort,ep-cpu,ep-cuda,ep-tensorrt
-FEATURES="ort,ep-cpu,ep-openvino"   # T24 example
+# `gstreamer` is mandatory on every tier — without it the engine
+# compiles but the RTSP source is `#[cfg]`'d out, so every camera
+# fails to connect with `requires the gstreamer feature` and the
+# supervisor stops the pipeline before any frame arrives.
+#   T10 / T24 / T36     →  gstreamer,ort,ep-cpu,ep-openvino
+#   T36-S               →  gstreamer,ort,ep-cpu,ep-openvino   # NPU dispatched via OpenVINO; no separate ep-npu feature
+#   T64 (post-beta)     →  gstreamer,ort,ep-cpu,ep-cuda,ep-tensorrt
+FEATURES="gstreamer,ort,ep-cpu,ep-openvino"   # T24 example
 
 # Two cargo invocations because workspace-level `--features` requires
 # `-p` — same pattern the Dockerfile uses (deploy/Dockerfile, stage 2).
@@ -1742,8 +1744,10 @@ docker compose -f deploy/docker-compose.yml \
 cd /opt/nexus
 sudo -u nexus-admin git pull
 # Same two-step build as §7.5 (workspace-level --features needs -p).
+# `gstreamer` must be in the feature list or the rebuilt binary will
+# silently lose RTSP support and every camera will fail to connect.
 sudo -u nexus-admin bash -c '. $HOME/.cargo/env && \
-    cargo build --release -p nexus-engine --features ort,ep-cpu,ep-openvino --bin nexus-engine && \
+    cargo build --release -p nexus-engine --features gstreamer,ort,ep-cpu,ep-openvino --bin nexus-engine && \
     cargo build --release -p nexus-probe  --bin nexus-probe'
 sudo cp /usr/local/bin/nexus-engine /usr/local/bin/nexus-engine.bak
 sudo install -o root -g root -m 0755 \
@@ -1944,22 +1948,16 @@ sudo mkswap /swapfile && sudo swapon /swapfile
 echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
 
 # ---- §5.1 Intel iGPU drivers (T24) -------------------------------
-sudo apt install -y gpg-agent wget
-wget -qO- https://repositories.intel.com/gpu/intel-graphics.key \
-  | sudo gpg --yes --dearmor --output /usr/share/keyrings/intel-graphics.gpg
-echo "deb [arch=amd64 signed-by=/usr/share/keyrings/intel-graphics.gpg] \
-https://repositories.intel.com/gpu/ubuntu noble unified" \
-  | sudo tee /etc/apt/sources.list.d/intel-gpu-noble.list
-sudo tee /etc/apt/preferences.d/intel-graphics > /dev/null << 'EOF'
-Package: libva* intel-* libigdgmm* libmfx* libvpl* level-zero* libze*
-Pin: origin repositories.intel.com
-Pin-Priority: 1001
-EOF
+sudo apt install -y software-properties-common
+sudo add-apt-repository -y ppa:kobuk-team/intel-graphics
 sudo apt update
 sudo apt install -y \
-    libva2 libva-drm2 libva-x11-2 libva-wayland2 \
-    intel-opencl-icd intel-media-va-driver-non-free \
-    libmfx-gen1.2 vainfo clinfo intel-gpu-tools
+    libze-intel-gpu1 libze1 \
+    intel-metrics-discovery intel-opencl-icd intel-gsc clinfo \
+    intel-media-va-driver-non-free \
+    libmfx-gen1 libvpl2 libvpl-tools \
+    libva-glx2 va-driver-all vainfo \
+    intel-gpu-tools
 sudo usermod -aG render,video nexus
 sudo usermod -aG render,video $USER
 sudo reboot
@@ -2050,7 +2048,266 @@ sqlite3 /var/lib/nexus/nexus.db "SELECT count(*) FROM events;"
 
 ---
 
-## 14. Appendix C — Where to file bugs
+## 14. Appendix C — End-to-end T36-S transcript
+
+Copy-pasteable shell session that takes a fresh **GMKtec K13 AI**
+(or EVO-X1, Intel Core Ultra 7 256V "Lunar Lake", Arc 140V iGPU
+with NPU 4) from post-Ubuntu-install to "first alert visible in
+the UI". T36-S is **bare-metal-only** — NPU passthrough via Docker
+`--device /dev/accel/accel0` is fragile on shipping kernels, so the
+systemd path in §7 is the canonical install. Use this as the
+canonical regression test when making changes to this document.
+
+```bash
+# ---- §3.6 HWE kernel (Lunar Lake NPU needs >= 6.10) --------------
+sudo apt update && sudo apt full-upgrade -y
+sudo apt install -y linux-generic-hwe-24.04
+sudo reboot
+# (reconnect)
+uname -r                       # expect 6.10.x or newer
+
+# ---- §4 Base hygiene ---------------------------------------------
+sudo timedatectl set-timezone America/New_York
+sudo useradd --uid 1000 --create-home --shell /usr/sbin/nologin nexus
+sudo useradd --create-home --shell /bin/bash nexus-admin
+sudo usermod -aG sudo nexus-admin
+sudo mkdir -p /etc/nexus /var/lib/nexus/clips /var/lib/nexus/models
+sudo chown -R nexus:nexus /var/lib/nexus
+sudo ufw default deny incoming && sudo ufw default allow outgoing
+sudo ufw allow OpenSSH
+sudo ufw allow 80/tcp          # UI alias (skip if port 80 is taken)
+sudo ufw allow 8089/tcp        # control-plane / API
+sudo ufw --force enable
+sudo fallocate -l 8G /swapfile && sudo chmod 600 /swapfile
+sudo mkswap /swapfile && sudo swapon /swapfile
+echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+
+# ---- §5.3 Step 2 — iGPU stack (PPA, NOT repositories.intel.com) -
+sudo apt install -y software-properties-common
+sudo add-apt-repository -y ppa:kobuk-team/intel-graphics
+sudo apt update
+sudo apt install -y \
+    libze-intel-gpu1 libze1 \
+    intel-metrics-discovery intel-opencl-icd intel-gsc clinfo \
+    intel-media-va-driver-non-free \
+    libmfx-gen1 libvpl2 libvpl-tools \
+    libva-glx2 va-driver-all vainfo \
+    intel-gpu-tools
+
+# ---- §5.3 Step 3 — NPU driver trio (upstream GitHub release) -----
+# Pinned to v1.32.1 (latest verified for Lunar Lake on kernel >=6.10).
+# Single-tarball + `apt install ./intel-*.deb` lets apt resolve
+# libtbb12 and libze1 from the kobuk-team PPA added in Step 2.
+NPU_VER=1.32.1
+NPU_TARBALL=linux-npu-driver-v${NPU_VER}.20260422-24767473183-ubuntu2404.tar.gz
+mkdir -p /tmp/npu && cd /tmp/npu
+wget "https://github.com/intel/linux-npu-driver/releases/download/v${NPU_VER}/${NPU_TARBALL}"
+tar -xf "${NPU_TARBALL}"
+sudo apt update
+sudo apt install -y ./intel-*.deb
+
+sudo usermod -aG render,video nexus
+sudo usermod -aG render,video nexus-admin
+sudo reboot
+# (reconnect)
+
+# Verify both accelerators came up before continuing.
+vainfo --display drm --device /dev/dri/renderD128 | head -25
+# Expect: VA-API 1.22.x, "Intel iHD driver ... - 25.x",
+#         VAProfileH264* / VAProfileHEVC* / VAProfileAV1Profile0.
+ls -l /dev/accel/accel0
+# Expect: crw-rw---- 1 root render ... /dev/accel/accel0
+sudo dmesg | grep -i intel_vpu | head -5
+# Expect: "intel_vpu 0000:00:0b.0: Firmware: ..."
+# (Ubuntu 24.04 defaults to kernel.dmesg_restrict=1 — hence sudo.)
+
+# ---- §5.5 GStreamer runtime + dev headers (bare-metal needs both) -
+sudo apt install -y \
+    pkg-config build-essential cmake git ca-certificates curl libssl-dev \
+    libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+    gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
+    gstreamer1.0-libav gstreamer1.0-tools gstreamer1.0-vaapi
+
+# ---- §7.1 Rust toolchain (as nexus-admin) ------------------------
+sudo -u nexus-admin bash <<'EOF'
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+  | sh -s -- -y --profile minimal --default-toolchain stable
+EOF
+echo 'source $HOME/.cargo/env' \
+  | sudo tee -a /home/nexus-admin/.profile
+
+# ---- §7.2 Node 22 ------------------------------------------------
+curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
+sudo apt install -y nodejs
+node -v && npm -v
+
+# ---- §7.4 ONNX Runtime 1.22.0 ------------------------------------
+ORT_VER=1.22.0
+curl -fsSL "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VER}/onnxruntime-linux-x64-${ORT_VER}.tgz" \
+  | sudo tar -xz -C /opt
+sudo mv "/opt/onnxruntime-linux-x64-${ORT_VER}" /opt/onnxruntime
+echo '/opt/onnxruntime/lib' | sudo tee /etc/ld.so.conf.d/onnxruntime.conf
+sudo ldconfig
+ls -l /opt/onnxruntime/lib/libonnxruntime.so*
+
+# ---- §6.2 Clone (SSH deploy key per §6.2 Option A) ---------------
+sudo mkdir -p /opt/nexus && sudo chown nexus-admin:nexus-admin /opt/nexus
+sudo -u nexus-admin git clone \
+    git@github.com:andboyer/nexus-edge-ai-core-next.git /opt/nexus
+
+# ---- §7.5 Build engine + UI -------------------------------------
+# T36-S features: gstreamer + ort + ep-cpu + ep-openvino. The NPU is
+# dispatched via the OpenVINO EP (device NPU), NOT a separate ep-npu
+# feature. `gstreamer` is REQUIRED — without it the engine compiles
+# but the RTSP source is `#[cfg]`'d out and every camera fails to
+# connect with `requires the gstreamer feature`.
+sudo -u nexus-admin bash <<'EOF'
+cd /opt/nexus
+source $HOME/.cargo/env
+FEATURES="gstreamer,ort,ep-cpu,ep-openvino"
+cargo build --release -p nexus-engine --features "$FEATURES" --bin nexus-engine
+cargo build --release -p nexus-probe  --bin nexus-probe
+(cd ui && npm ci && npm run build)
+EOF
+
+sudo install -o root -g root -m 0755 \
+    /opt/nexus/target/release/nexus-engine /usr/local/bin/nexus-engine
+sudo install -o root -g root -m 0755 \
+    /opt/nexus/target/release/nexus-probe  /usr/local/bin/nexus-probe
+sudo mkdir -p /usr/share/nexus/ui
+sudo cp -r /opt/nexus/ui/dist/. /usr/share/nexus/ui/
+sudo chown -R root:root /usr/share/nexus
+
+# ---- §12 Generate models (skip if you have prebuilt) -------------
+# T36-S uses YOLOE (open-vocab successor to YOLO-World). The base
+# yolo26n model is still used for the fast-path detector.
+sudo apt install -y python3.11 python3.11-venv python3.11-dev
+sudo -u nexus-admin bash <<'EOF'
+cd /opt/nexus
+python3.11 -m venv .venv-modelgen
+source .venv-modelgen/bin/activate
+pip install -r tools/models/requirements.txt
+python tools/models/gen_yolo26n.py \
+    --output /opt/nexus/models/yolo26n_dynamic.onnx
+python tools/models/gen_yoloe.py \
+    --prompts tools/models/yoloe_default_prompts.txt \
+    --output /opt/nexus/models/yoloe26_s.onnx
+EOF
+sudo install -o nexus -g nexus -m 0644 \
+    /opt/nexus/models/yolo26n_dynamic.onnx \
+    /opt/nexus/models/yoloe26_s.onnx \
+    /var/lib/nexus/models/
+sudo install -o nexus -g nexus -m 0644 \
+    /opt/nexus/models/models-manifest.json \
+    /var/lib/nexus/models/
+
+# ---- §7.6 Stage tier config -------------------------------------
+sudo install -o nexus -g nexus -m 0600 \
+    /opt/nexus/config/tiers/t36s.toml /etc/nexus/nexus.toml
+
+# ---- §7.7 systemd unit ------------------------------------------
+sudo tee /etc/systemd/system/nexus-engine.service >/dev/null <<'EOF'
+[Unit]
+Description=Nexus Edge AI engine (T36-S, Lunar Lake)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nexus
+Group=nexus
+WorkingDirectory=/var/lib/nexus
+Environment=ORT_DYLIB_PATH=/opt/onnxruntime/lib/libonnxruntime.so
+Environment=RUST_LOG=info,nexus=debug
+ExecStart=/usr/local/bin/nexus-engine --config /etc/nexus/nexus.toml
+Restart=on-failure
+RestartSec=5s
+LimitNOFILE=65535
+
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/nexus /tmp
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+DevicePolicy=closed
+DeviceAllow=/dev/dri rw
+DeviceAllow=/dev/accel/accel0 rw   # Lunar Lake NPU
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now nexus-engine
+sudo journalctl -u nexus-engine -n 50 --no-pager
+
+# ---- §8.2 Probe — confirms iGPU + NPU + decoder are wired -------
+sudo -u nexus /usr/local/bin/nexus-probe \
+    --output /var/lib/nexus/device-manifest.json
+sudo cat /var/lib/nexus/device-manifest.json | jq '.tier, .accelerators'
+# Expect: tier == "t36s", accelerators include both Arc 140V (iGPU)
+#         and an NPU entry with provider "openvino" device "NPU".
+
+# ---- §8.1 Add a camera -------------------------------------------
+curl -fsS -X PUT -H 'Content-Type: application/json' \
+    http://localhost:8089/api/cameras/1 \
+    -d '{
+      "id": 1,
+      "name": "Front Door",
+      "url": "rtsp://demo:demo@10.0.20.11:554/Streaming/Channels/101",
+      "enabled": true,
+      "prompts": ["person", "package", "vehicle"],
+      "max_fps": 10
+    }'
+
+# ---- §9 Smoke test -----------------------------------------------
+curl -fsS http://localhost/api/health        # UI alias on port 80
+curl -fsS http://localhost:8089/api/health   # control-plane on 8089
+curl -fsS http://localhost:8089/api/cameras | jq '.[] | {id, name, state}'
+sleep 60
+curl -fsS http://localhost:8089/api/cameras/1/frames/latest -o /tmp/cam1.jpg
+file /tmp/cam1.jpg
+curl -fsS http://localhost:8089/api/backends | jq
+# Expect at least one backend with provider "openvino" and device
+# "NPU" listed before the GPU/CPU fallbacks in ep_priority.
+curl -fsS http://localhost:8089/api/v1/storage/local | jq
+echo "Walk in front of camera 1 now..."
+sleep 15
+sqlite3 /var/lib/nexus/nexus.db "SELECT count(*) FROM events;"
+```
+
+**T36-S-specific gotchas to watch for:**
+
+1. `vainfo` complains `intel-level-zero-gpu : Depends: libigc1 ...
+   but it is not installable` — you copy-pasted a pre-2025-Q3
+   recipe that referenced `repositories.intel.com/gpu`. Tear down
+   `/etc/apt/sources.list.d/intel-gpu-noble.list` and
+   `/etc/apt/preferences.d/intel-graphics`, then redo the PPA step
+   above. See §5.1 troubleshooting.
+2. `/dev/accel/accel0` missing after reboot — confirm `uname -r`
+   is ≥ 6.10 (HWE step above) **and** that the BIOS has "AI
+   Acceleration / NPU" set to ENABLED. On some K13 firmwares this
+   setting is under "Advanced > CPU Configuration" rather than the
+   top-level device list.
+3. `nexus-engine` boots but the OpenVINO NPU device isn't picked
+   up — the engine **falls through to the iGPU automatically** per
+   the EP priority list in [config/tiers/t36s.toml](../config/tiers/t36s.toml).
+   You'll still get frames + detections, just on the iGPU. Restart
+   the engine after installing the NPU stack to pick it up
+   (`sudo systemctl restart nexus-engine`).
+4. Apple-silicon-style `vtdec` worry doesn't apply here — on Linux
+   the GStreamer pipeline uses `vaapidecodebin`, not the macOS
+   VideoToolbox path.
+
+---
+
+## 15. Appendix D — Where to file bugs
 
 Open issues at
 <https://github.com/andboyer/nexus-edge-ai-core-next/issues>. Include:

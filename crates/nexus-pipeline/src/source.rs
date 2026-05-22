@@ -163,6 +163,89 @@ pub struct RtspSource {
     pub max_fps: u32,
 }
 
+// ---------------------------------------------------------------------------
+// SharedRtspSource — frame source backed by a `PreRollIngester` that owns
+// the only RTSP session for the camera. Used when the recorder is
+// `gstreamer`, so the detector and recorder share one connection
+// instead of opening two against the camera (the latter wedges on
+// firmware that caps concurrent sessions at one per stream path —
+// confirmed on the InSight 192.168.1.66 fixture).
+//
+// The ingester is built with [`PreRollIngester::new_with_rgb`], which
+// adds a `tee` after the H.264 parser plus a second branch that
+// decodes to RGB 960×540 and publishes every frame on a
+// `broadcast::Sender<Frame>`. This source just subscribes to that
+// broadcast and forwards into the supervisor's mpsc, mirroring the
+// drop policy of [`RtspSource`] (try_send; the gate/pool decide what
+// to drop, not the source).
+//
+// Reconnect is the ingester's problem — it has its own
+// supervisor + exponential backoff. From this source's perspective a
+// reconnect is just a brief gap in `recv()` and we keep looping; the
+// broadcast::Receiver survives across ingester sessions because the
+// `broadcast::Sender` lives in the ingester struct, not the pipeline.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "gstreamer")]
+pub struct SharedRtspSource {
+    pub camera_id: CameraId,
+    /// The ingester whose RGB tap we subscribe to. Held as an
+    /// `Arc` so the source can keep the ingester alive for the
+    /// lifetime of the supervisor task even if the recorder's
+    /// internal `ingesters` map drops its reference (e.g. a
+    /// reconciler tearing down the camera mid-shutdown).
+    pub ingester: std::sync::Arc<crate::preroll_ingester::PreRollIngester>,
+}
+
+#[cfg(feature = "gstreamer")]
+#[async_trait]
+impl FrameSource for SharedRtspSource {
+    async fn run(self: Box<Self>, tx: mpsc::Sender<Frame>) -> Result<(), FrameSourceError> {
+        use tokio::sync::broadcast::error::RecvError;
+        let mut rx = self.ingester.subscribe_frames().ok_or_else(|| {
+            FrameSourceError::Backend(
+                "shared rtsp source: ingester has no RGB tap (built via \
+                 PreRollIngester::new instead of new_with_rgb)"
+                    .into(),
+            )
+        })?;
+        tracing::info!(
+            camera_id = self.camera_id,
+            "shared rtsp source subscribed to ingester rgb tap"
+        );
+        loop {
+            if tx.is_closed() {
+                return Err(FrameSourceError::Closed);
+            }
+            match rx.recv().await {
+                Ok(frame) => {
+                    // Same drop policy as RtspSource: try_send so a
+                    // slow downstream gate/pool drops at the edge
+                    // instead of stalling the broadcast (which would
+                    // cause Lagged on the NEXT recv).
+                    let _ = tx.try_send(frame);
+                }
+                Err(RecvError::Lagged(n)) => {
+                    tracing::warn!(
+                        camera_id = self.camera_id,
+                        dropped = n,
+                        "shared rtsp source lagged \
+                         (downstream too slow; gate/pool should be dropping at the edge)"
+                    );
+                }
+                Err(RecvError::Closed) => {
+                    // The Sender lives in the PreRollIngester
+                    // struct. Closed means the ingester was
+                    // dropped — typically only happens during
+                    // engine shutdown. Return Closed so the
+                    // supervisor sees the source ended.
+                    return Err(FrameSourceError::Closed);
+                }
+            }
+        }
+    }
+}
+
 #[cfg(feature = "gstreamer")]
 pub(crate) mod gst_init {
     use super::FrameSourceError;

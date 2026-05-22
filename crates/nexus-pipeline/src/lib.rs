@@ -52,3 +52,6 @@ pub use preroll_ingester::PreRollIngester;
 
 #[cfg(feature = "gstreamer")]
 pub use source::RtspSource;
+
+#[cfg(feature = "gstreamer")]
+pub use source::SharedRtspSource;
