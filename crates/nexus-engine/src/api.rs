@@ -63,6 +63,17 @@ pub struct ApiState {
     /// alongside any pending override that hasn't been picked
     /// up yet because the operator hasn't restarted.
     pub current_bind: String,
+    /// What the optional second listener (`server.ui_bind` in
+    /// `nexus.toml`, override key `ui_bind` in
+    /// `engine_runtime_settings`) is currently bound to.
+    /// `None` = no second listener was started at boot, either
+    /// because TOML didn't define it or because the operator
+    /// persisted an explicit "off" via the admin surface.
+    /// Surfaced verbatim by `GET /v1/admin/server/bind` so the UI
+    /// can render "currently off / will be on after restart"
+    /// transitions without inferring state from
+    /// `engine_runtime_settings` shape.
+    pub current_ui_bind: Option<String>,
     /// Shared with every per-camera supervisor. The admin
     /// `PUT /api/rules/:id` + `DELETE /api/rules/:id` handlers
     /// call `reload()` on this after the DB write so rule edits
@@ -5365,6 +5376,7 @@ mod tests {
             store: store.clone(),
             bus,
             current_bind: "127.0.0.1:0".into(),
+            current_ui_bind: None,
             evaluator,
             cache,
             frame_stats: Arc::new(nexus_pipeline::FrameStatsRegistry::new()),

@@ -1267,6 +1267,27 @@ impl Store {
         .await?;
         Ok(())
     }
+
+    /// Drop a `engine_runtime_settings` row entirely. Semantically
+    /// distinct from [`Self::write_runtime_setting_tx`] called with
+    /// `value = None` — the latter persists SQL `NULL` (which the
+    /// caller can read back as `Some(None)` to mean "operator
+    /// explicitly cleared"); this removes the row so the caller's
+    /// `Ok(None)` arm fires and they fall back to the on-disk
+    /// `nexus.toml` default. First consumer is the `ui_bind` admin
+    /// surface in `nexus-engine::admin_runtime` whose three-state
+    /// model (`Reset` / `Clear` / `Set`) needs to distinguish the two.
+    pub async fn delete_runtime_setting_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        key: &str,
+    ) -> Result<(), StoreError> {
+        sqlx::query("DELETE FROM engine_runtime_settings WHERE key = ?")
+            .bind(key)
+            .execute(&mut **tx)
+            .await?;
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------

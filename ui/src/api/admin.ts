@@ -57,14 +57,43 @@ export function listAudit(q: ListAuditQuery = {}) {
 
 // --- Server bind (M-Admin Phase 0, restart-based) -------------------------
 
+/**
+ * Pending state for the optional UI alias listener. `null` on the
+ * parent struct means "no persisted override" (engine will use TOML
+ * at next boot). When present, `action` disambiguates "explicit off"
+ * from "explicit set" since both differ from the on-disk default.
+ */
+export type UiBindPending =
+  | { action: "set"; addr: string }
+  | { action: "clear" };
+
+/**
+ * Operator-supplied update for the UI alias listener. Omit the
+ * `ui_bind` field on the PUT entirely to leave the persisted row
+ * alone; otherwise the discriminator chooses between persisting a
+ * new addr (`set`), persisting explicit "off" (`clear`), or
+ * dropping the override row so the engine falls back to TOML
+ * (`reset`).
+ */
+export type UiBindUpdate =
+  | { action: "set"; addr: string }
+  | { action: "clear" }
+  | { action: "reset" };
+
 export interface ServerBindOut {
   current: string;
   pending: string | null;
+  /** What the engine bound the UI alias to at boot. `null` = no second listener. */
+  ui_current: string | null;
+  /** Pending change for the UI alias listener; `null` = no change queued. */
+  ui_pending: UiBindPending | null;
 }
 
 export interface PutServerBindOut {
   current: string;
   pending: string;
+  ui_current: string | null;
+  ui_pending: UiBindPending | null;
   restart_required: boolean;
 }
 
@@ -72,8 +101,12 @@ export function getServerBind() {
   return api.get<ServerBindOut>("/v1/admin/server/bind");
 }
 
-export function putServerBind(addr: string) {
-  return api.put<PutServerBindOut>("/v1/admin/server/bind", { addr });
+export function putServerBind(addr: string, ui_bind?: UiBindUpdate) {
+  // serialise as `undefined` (omitted) when the operator hasn't
+  // touched the UI bind editor — keeps the wire shape stable.
+  const body: { addr: string; ui_bind?: UiBindUpdate } = { addr };
+  if (ui_bind !== undefined) body.ui_bind = ui_bind;
+  return api.put<PutServerBindOut>("/v1/admin/server/bind", body);
 }
 
 // --- Auth config (M-Admin Phase 0, restart-based) -------------------------

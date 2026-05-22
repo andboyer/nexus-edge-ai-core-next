@@ -770,6 +770,12 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
         // so `GET /v1/admin/server/bind` can report the active
         // value without re-reading config.
         current_bind: cfg.server.api_bind.clone(),
+        // Provisional too — overwritten below alongside the
+        // primary bind after the boot-time precedence sweep for
+        // `engine_runtime_settings.ui_bind`. `None` here keeps
+        // the GET surface honest even if the second listener
+        // boot block panics before resolving the override.
+        current_ui_bind: None,
         evaluator: evaluator.clone(),
         cache: cache.clone(),
         frame_stats: frame_stats.clone(),
@@ -898,6 +904,39 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
         };
         let mut api_state = api_state;
         api_state.current_bind = bind.clone();
+        // Resolve the optional UI alias listener with three-state
+        // override semantics that diverge from `api_bind` above —
+        // `Ok(Some(None))` (row exists, value is SQL NULL) means
+        // the operator explicitly TURNED OFF the second listener
+        // and we override the TOML default to skip the bind, even
+        // if TOML defines `server.ui_bind`. `Ok(None)` (no row)
+        // means no override; fall back to TOML. `Ok(Some(Some(s)))`
+        // means use the persisted `host:port`. Same loud-non-fatal
+        // failure shape as `api_bind`: on read error fall back to
+        // TOML so a partial DB doesn't brick the listener.
+        let effective_ui_bind: Option<String> = match store.read_runtime_setting("ui_bind").await {
+            Ok(Some(Some(persisted))) => {
+                tracing::warn!(
+                    persisted = %persisted,
+                    toml = ?cfg.server.ui_bind,
+                    "applying operator-persisted server.ui_bind from engine_runtime_settings",
+                );
+                Some(persisted)
+            }
+            Ok(Some(None)) => {
+                tracing::warn!(
+                    toml = ?cfg.server.ui_bind,
+                    "operator-persisted ui_bind = OFF; second listener disabled",
+                );
+                None
+            }
+            Ok(None) => cfg.server.ui_bind.clone(),
+            Err(e) => {
+                tracing::warn!(error = %e, "could not read ui_bind from engine_runtime_settings; using nexus.toml");
+                cfg.server.ui_bind.clone()
+            }
+        };
+        api_state.current_ui_bind = effective_ui_bind.clone();
         let app = api::router(api_state);
         let listener = tokio::net::TcpListener::bind(&bind).await?;
         info!(bind = %bind, "HTTP API + UI listening");
@@ -922,10 +961,12 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
         // console at e.g. `http://<host>/` (port 80) without typing
         // the engine port. Same router, same auth, same TLS posture
         // — it is purely a second TCP bind on top of the existing
-        // app. Configured via `[server].ui_bind` in nexus.toml.
-        // Binding <1024 on the bare-metal systemd unit needs
-        // `CAP_NET_BIND_SERVICE`; Docker already has it.
-        let ui_server = if let Some(ui_bind) = cfg.server.ui_bind.clone() {
+        // app. Configured via `[server].ui_bind` in nexus.toml
+        // and overridable via the admin surface (resolved into
+        // `effective_ui_bind` above). Binding <1024 on the
+        // bare-metal systemd unit needs `CAP_NET_BIND_SERVICE`;
+        // Docker already has it.
+        let ui_server = if let Some(ui_bind) = effective_ui_bind {
             match tokio::net::TcpListener::bind(&ui_bind).await {
                 Ok(ui_listener) => {
                     info!(bind = %ui_bind, "HTTP UI alias listening");

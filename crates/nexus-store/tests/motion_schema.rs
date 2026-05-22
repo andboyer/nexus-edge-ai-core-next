@@ -642,3 +642,48 @@ async fn schema_migrations_table_records_apply_order() {
         ]
     );
 }
+
+#[tokio::test]
+async fn delete_runtime_setting_tx_removes_row_distinct_from_null_write() {
+    // The LAN-settings UI relies on the three-state distinction
+    // (no row vs. row-with-NULL vs. row-with-value) to know whether
+    // to fall back to TOML or surface an operator-persisted "off".
+    // If `delete_*` ever silently became a `write None`, the
+    // `Reset` action in `admin_runtime::put_server_bind` would
+    // mis-translate to `Clear` on the next GET, surprising operators
+    // who expected "reset to defaults".
+    let (store, _dir) = fresh_store().await;
+
+    // Step 1 — write a value, confirm Some(Some(_)).
+    store
+        .write_runtime_setting("ui_bind", Some("0.0.0.0:80"))
+        .await
+        .unwrap();
+    let after_set = store.read_runtime_setting("ui_bind").await.unwrap();
+    assert_eq!(after_set, Some(Some("0.0.0.0:80".to_string())));
+
+    // Step 2 — write None, confirm Some(None) (operator-cleared).
+    store.write_runtime_setting("ui_bind", None).await.unwrap();
+    let after_null = store.read_runtime_setting("ui_bind").await.unwrap();
+    assert_eq!(after_null, Some(None));
+
+    // Step 3 — delete, confirm None (no row, fall back to TOML).
+    let mut tx = store.begin_tx().await.unwrap();
+    store
+        .delete_runtime_setting_tx(&mut tx, "ui_bind")
+        .await
+        .unwrap();
+    Store::commit_tx(tx).await.unwrap();
+    let after_delete = store.read_runtime_setting("ui_bind").await.unwrap();
+    assert_eq!(after_delete, None);
+
+    // Step 4 — deleting an already-absent key is idempotent.
+    let mut tx = store.begin_tx().await.unwrap();
+    store
+        .delete_runtime_setting_tx(&mut tx, "ui_bind")
+        .await
+        .unwrap();
+    Store::commit_tx(tx).await.unwrap();
+    let still_absent = store.read_runtime_setting("ui_bind").await.unwrap();
+    assert_eq!(still_absent, None);
+}

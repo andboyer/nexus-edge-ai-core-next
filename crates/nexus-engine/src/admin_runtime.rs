@@ -74,36 +74,99 @@ use crate::auth::require_role::AdminContext;
 // ===========================================================
 
 const KEY_API_BIND: &str = "api_bind";
+const KEY_UI_BIND: &str = "ui_bind";
 const KEY_AUTH_CONFIG: &str = "auth_config_json";
 const KEY_LOW_WATERMARK_PCT: &str = "low_watermark_pct";
 const KEY_PANIC_WATERMARK_PCT: &str = "panic_watermark_pct";
 
 #[derive(Debug, Deserialize)]
 pub struct PutServerBindReq {
-    /// New `host:port` string. Parsed via
-    /// [`SocketAddr::from_str`] then probe-bound to make sure
-    /// the address is reachable AND the port is free, before
-    /// we persist anything.
+    /// New `host:port` string for the primary (engine) listener.
+    /// Parsed via [`SocketAddr::from_str`] then probe-bound to
+    /// make sure the address is reachable AND the port is free,
+    /// before we persist anything.
     pub addr: String,
+    /// Optional update for the second (admin/UI alias) listener.
+    /// When omitted the persisted `ui_bind` row is left alone.
+    /// When present the discriminator chooses between
+    /// `set { addr }` (probe-bind + persist a `host:port`),
+    /// `clear` (persist explicit "off" — no second listener at
+    /// next boot, even if `nexus.toml` defines one), and
+    /// `reset` (drop the persisted row entirely, fall back to
+    /// the on-disk `nexus.toml` value at next boot).
+    #[serde(default)]
+    pub ui_bind: Option<UiBindUpdate>,
+}
+
+/// Operator-supplied action for the optional UI alias listener.
+/// Serialised with an external tag so the discriminator and
+/// payload share the same JSON shape used by every other admin
+/// surface in this module.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum UiBindUpdate {
+    /// Persist a new `host:port`. Engine will bind a second
+    /// listener to it at next restart.
+    Set {
+        /// `host:port` string. Same parser + probe-bind rules as
+        /// the primary `addr`.
+        addr: String,
+    },
+    /// Persist explicit "off". Engine will NOT start a second
+    /// listener at next restart even if `nexus.toml` defines
+    /// `server.ui_bind`.
+    Clear,
+    /// Drop the persisted override row. Engine falls back to
+    /// `server.ui_bind` in `nexus.toml` at next restart.
+    Reset,
+}
+
+/// What the engine has persisted for the UI alias listener,
+/// resolved to a discriminated shape the UI can render without
+/// triple-Option introspection.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum UiBindPending {
+    /// An operator-persisted `host:port`. Engine will bind here
+    /// at next boot.
+    Set { addr: String },
+    /// Operator-persisted "off". Engine will start with no
+    /// second listener at next boot regardless of TOML.
+    Clear,
 }
 
 #[derive(Debug, Serialize)]
 pub struct ServerBindOut {
-    /// What the engine is currently listening on (boot-time
+    /// What the primary listener is currently bound to (boot-time
     /// resolved). After a PUT this stays the same until the
-    /// operator restarts; the `pending` field is what they'll
-    /// get on next boot.
+    /// operator restarts; `pending` is what they'll get next boot.
     pub current: String,
-    /// `Some` if there's a persisted override that hasn't
-    /// taken effect yet (i.e. `pending != current`). `None`
+    /// `Some` if there's a persisted primary-bind override that
+    /// hasn't taken effect yet (`pending != current`). `None`
     /// when the persisted value matches the active bind.
     pub pending: Option<String>,
+    /// What the UI alias listener is currently bound to.
+    /// `None` = no second listener started at boot (either TOML
+    /// didn't define `server.ui_bind` or the operator persisted
+    /// "off"). Reported separately from `pending` so the UI can
+    /// render "currently off / will be on" transitions cleanly.
+    pub ui_current: Option<String>,
+    /// `Some` when there's a persisted ui-bind override row.
+    /// `None` when no override exists (engine falls back to TOML).
+    /// The discriminated `UiBindPending` makes the "explicit
+    /// clear" vs "explicit set" distinction visible to the UI.
+    pub ui_pending: Option<UiBindPending>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct PutServerBindOut {
     pub current: String,
     pub pending: String,
+    /// Same shape as `ServerBindOut.ui_pending`. Echoed back so
+    /// the UI doesn't have to refetch to confirm what got
+    /// persisted.
+    pub ui_current: Option<String>,
+    pub ui_pending: Option<UiBindPending>,
     pub restart_required: bool,
 }
 
@@ -119,9 +182,21 @@ pub async fn get_server_bind(
         .flatten()
         .flatten();
     let pending = persisted.filter(|p| p != &s.current_bind);
+
+    // ui_bind has three-state storage semantics (see KEY_UI_BIND
+    // notes in [`super::main`]'s resolver block): row absent →
+    // no override, row present + NULL → operator-cleared override,
+    // row present + Some(addr) → operator-set override.
+    let ui_pending = match s.store.read_runtime_setting(KEY_UI_BIND).await {
+        Ok(Some(Some(addr))) => Some(UiBindPending::Set { addr }),
+        Ok(Some(None)) => Some(UiBindPending::Clear),
+        Ok(None) | Err(_) => None,
+    };
     Ok(Json(ServerBindOut {
         current: s.current_bind.clone(),
         pending,
+        ui_current: s.current_ui_bind.clone(),
+        ui_pending,
     }))
 }
 
@@ -167,14 +242,82 @@ pub async fn put_server_bind(
         }
     }
 
-    let before_str = serde_json::to_string(&serde_json::json!({ "addr": &s.current_bind })).ok();
-    let after_str = serde_json::to_string(&serde_json::json!({ "addr": &trimmed })).ok();
+    // Validate + normalise the optional ui_bind update BEFORE we
+    // touch the DB. We don't want to persist the primary bind and
+    // then fail on a bad ui_addr halfway through.
+    let ui_decision = match &req.ui_bind {
+        None => None,
+        Some(UiBindUpdate::Reset) => Some(UiBindDecision::Reset),
+        Some(UiBindUpdate::Clear) => Some(UiBindDecision::Clear),
+        Some(UiBindUpdate::Set { addr }) => {
+            let ui_trimmed = addr.trim().to_string();
+            if ui_trimmed.is_empty() {
+                return Err(ApiError(
+                    StatusCode::BAD_REQUEST,
+                    "ui_bind set: addr must be a non-empty host:port".into(),
+                ));
+            }
+            // Refuse the obvious foot-gun of pointing both
+            // listeners at the same address — axum would bind one
+            // and the other would fail at boot with EADDRINUSE.
+            if ui_trimmed == trimmed {
+                return Err(ApiError(
+                    StatusCode::BAD_REQUEST,
+                    "ui_bind addr must differ from primary addr".into(),
+                ));
+            }
+            let ui_parsed: SocketAddr = ui_trimmed.parse().map_err(|e| {
+                ApiError(
+                    StatusCode::BAD_REQUEST,
+                    format!("ui_bind addr must be host:port (parse error: {e})"),
+                )
+            })?;
+            match tokio::net::TcpListener::bind(ui_parsed).await {
+                Ok(l) => drop(l),
+                Err(e) => {
+                    return Err(ApiError(
+                        StatusCode::BAD_REQUEST,
+                        format!("probe-bind to ui_bind {ui_trimmed} failed: {e}"),
+                    ));
+                }
+            }
+            Some(UiBindDecision::Set(ui_trimmed))
+        }
+    };
+
+    let before_json = serde_json::json!({
+        "addr": &s.current_bind,
+        "ui_addr": &s.current_ui_bind,
+    });
+    let after_json = serde_json::json!({
+        "addr": &trimmed,
+        "ui_bind": req.ui_bind.as_ref().map(ui_update_to_audit_json),
+    });
+    let before_str = serde_json::to_string(&before_json).ok();
+    let after_str = serde_json::to_string(&after_json).ok();
 
     let tx_res: Result<(), nexus_store::StoreError> = async {
         let mut tx = s.store.begin_tx().await?;
         s.store
             .write_runtime_setting_tx(&mut tx, KEY_API_BIND, Some(&trimmed))
             .await?;
+        match &ui_decision {
+            None => {}
+            Some(UiBindDecision::Reset) => {
+                s.store.delete_runtime_setting_tx(&mut tx, KEY_UI_BIND).await?;
+            }
+            Some(UiBindDecision::Clear) => {
+                // SQL NULL = operator-persisted "off" (see resolver).
+                s.store
+                    .write_runtime_setting_tx(&mut tx, KEY_UI_BIND, None)
+                    .await?;
+            }
+            Some(UiBindDecision::Set(addr)) => {
+                s.store
+                    .write_runtime_setting_tx(&mut tx, KEY_UI_BIND, Some(addr))
+                    .await?;
+            }
+        }
         crate::auth::admin_audit::audit_admin_action_in_tx(
             &s.store,
             &mut tx,
@@ -200,17 +343,53 @@ pub async fn put_server_bind(
         ));
     }
 
+    let ui_pending = match &ui_decision {
+        // No change requested → echo back what's already persisted.
+        None => match s.store.read_runtime_setting(KEY_UI_BIND).await {
+            Ok(Some(Some(addr))) => Some(UiBindPending::Set { addr }),
+            Ok(Some(None)) => Some(UiBindPending::Clear),
+            _ => None,
+        },
+        Some(UiBindDecision::Reset) => None,
+        Some(UiBindDecision::Clear) => Some(UiBindPending::Clear),
+        Some(UiBindDecision::Set(addr)) => Some(UiBindPending::Set { addr: addr.clone() }),
+    };
+
     tracing::warn!(
         new_bind = %trimmed,
         current = %s.current_bind,
+        ui_change = ?ui_decision,
         "admin set new server.bind; restart required to apply",
     );
 
     Ok(Json(PutServerBindOut {
         current: s.current_bind.clone(),
         pending: trimmed,
+        ui_current: s.current_ui_bind.clone(),
+        ui_pending,
         restart_required: true,
     }))
+}
+
+/// Resolved ui_bind action after request validation. Lives only
+/// long enough to drive the transactional write below; mapped
+/// back to `UiBindPending` for the response.
+#[derive(Debug)]
+enum UiBindDecision {
+    Reset,
+    Clear,
+    Set(String),
+}
+
+/// Tiny adapter so the audit `after` JSON renders something
+/// human-readable for `Reset` (which has no payload) without
+/// needing a second serde-only enum.
+fn ui_update_to_audit_json(u: &UiBindUpdate) -> serde_json::Value {
+    match u {
+        UiBindUpdate::Reset => serde_json::json!({ "action": "reset" }),
+        UiBindUpdate::Clear => serde_json::json!({ "action": "clear" }),
+        UiBindUpdate::Set { addr } => serde_json::json!({ "action": "set", "addr": addr }),
+    }
 }
 
 // ===========================================================
@@ -1439,6 +1618,11 @@ pub struct PostRestartOut {
     pub restart_scheduled: bool,
     pub delay_ms: u64,
     pub current_bind: String,
+    /// Echoed for the same reason as `current_bind`: the UI can
+    /// confirm that the listener it's about to lose contact with
+    /// is the one it intended to restart, and offers a graceful
+    /// reconnect target on the alias port if configured.
+    pub current_ui_bind: Option<String>,
 }
 
 pub async fn post_restart(
@@ -1482,6 +1666,7 @@ pub async fn post_restart(
     .await;
 
     let current_bind = s.current_bind.clone();
+    let current_ui_bind = s.current_ui_bind.clone();
 
     #[cfg(unix)]
     {
@@ -1496,13 +1681,14 @@ pub async fn post_restart(
                 restart_scheduled: true,
                 delay_ms,
                 current_bind,
+                current_ui_bind,
             }),
         ))
     }
 
     #[cfg(not(unix))]
     {
-        let _ = (delay_ms, current_bind, exe);
+        let _ = (delay_ms, current_bind, current_ui_bind, exe);
         Err(ApiError(
             StatusCode::NOT_IMPLEMENTED,
             "engine self-restart is only implemented on unix targets".into(),
@@ -1538,4 +1724,83 @@ fn do_self_exec(exe: &std::path::Path) {
     let err = std::process::Command::new(exe).args(&rest).exec();
     tracing::error!(error = %err, "exec() failed during self-restart; exiting non-zero so the supervisor can recover");
     std::process::exit(70);
+}
+
+// ============================================================
+// Tests — serde round-trips for the LAN-settings wire shapes.
+// The handler-level integration tests live alongside the rest
+// of the admin endpoint coverage in `api.rs::tests`; the unit
+// tests here just pin the externally-tagged JSON shape so a
+// rename or `#[serde(rename_all = ...)]` regression caught by
+// the UI's typed client lights up here first.
+// ============================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ui_bind_update_deserialises_all_three_actions() {
+        let set: UiBindUpdate =
+            serde_json::from_str(r#"{"action":"set","addr":"0.0.0.0:80"}"#).unwrap();
+        match set {
+            UiBindUpdate::Set { addr } => assert_eq!(addr, "0.0.0.0:80"),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+
+        let clear: UiBindUpdate = serde_json::from_str(r#"{"action":"clear"}"#).unwrap();
+        assert!(matches!(clear, UiBindUpdate::Clear));
+
+        let reset: UiBindUpdate = serde_json::from_str(r#"{"action":"reset"}"#).unwrap();
+        assert!(matches!(reset, UiBindUpdate::Reset));
+    }
+
+    #[test]
+    fn put_server_bind_req_accepts_omitted_ui_bind() {
+        // Pre-extension callers (and the UI's `noop` action) PUT
+        // just `{addr}` — must still deserialise.
+        let req: PutServerBindReq =
+            serde_json::from_str(r#"{"addr":"0.0.0.0:8089"}"#).unwrap();
+        assert_eq!(req.addr, "0.0.0.0:8089");
+        assert!(req.ui_bind.is_none());
+    }
+
+    #[test]
+    fn put_server_bind_req_accepts_explicit_null_ui_bind() {
+        // Equivalent to omitting via `#[serde(default)]`.
+        let req: PutServerBindReq =
+            serde_json::from_str(r#"{"addr":"0.0.0.0:8089","ui_bind":null}"#).unwrap();
+        assert!(req.ui_bind.is_none());
+    }
+
+    #[test]
+    fn ui_bind_pending_serialises_with_action_tag() {
+        let set = UiBindPending::Set {
+            addr: "0.0.0.0:80".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(&set).unwrap(),
+            serde_json::json!({"action":"set","addr":"0.0.0.0:80"}),
+        );
+        let clear = UiBindPending::Clear;
+        assert_eq!(
+            serde_json::to_value(&clear).unwrap(),
+            serde_json::json!({"action":"clear"}),
+        );
+    }
+
+    #[test]
+    fn server_bind_out_serialises_with_null_ui_fields_when_absent() {
+        let out = ServerBindOut {
+            current: "0.0.0.0:8089".into(),
+            pending: None,
+            ui_current: None,
+            ui_pending: None,
+        };
+        let v = serde_json::to_value(&out).unwrap();
+        assert_eq!(v["current"], "0.0.0.0:8089");
+        assert!(v["pending"].is_null());
+        assert!(v["ui_current"].is_null());
+        assert!(v["ui_pending"].is_null());
+    }
 }

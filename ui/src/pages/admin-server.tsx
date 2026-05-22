@@ -35,6 +35,7 @@ import {
   restartEngine,
 } from "@/api/admin";
 import type { InferenceModelPatch } from "@/api/admin";
+import type { UiBindUpdate } from "@/api/admin";
 import { authApi } from "@/api/auth";
 import { getStorage } from "@/api/storage";
 import { Badge } from "@/components/ui/badge";
@@ -74,12 +75,43 @@ export function AdminServerPage() {
     }
   }, [bindQuery.data, bindDraft]);
 
+  // UI alias listener — three-way action selector + addr draft
+  // for the `set` case. "noop" omits `ui_bind` from the PUT body
+  // so the persisted row is left alone (the common case where
+  // the operator only wants to touch the primary listener).
+  type UiBindAction = "noop" | "set" | "clear" | "reset";
+  const [uiBindAction, setUiBindAction] = useState<UiBindAction>("noop");
+  const [uiBindDraft, setUiBindDraft] = useState<string>("");
+  useEffect(() => {
+    // Seed the draft once the query resolves. Prefer a pending
+    // `set` payload over the active `ui_current` over a blank
+    // suggestion so the input never starts empty unless the
+    // operator has truly never configured the alias.
+    if (bindQuery.data && uiBindDraft === "") {
+      const seed =
+        (bindQuery.data.ui_pending?.action === "set"
+          ? bindQuery.data.ui_pending.addr
+          : null)
+        ?? bindQuery.data.ui_current
+        ?? "0.0.0.0:80";
+      setUiBindDraft(seed);
+    }
+  }, [bindQuery.data, uiBindDraft]);
+
   const bindMutation = useMutation({
-    mutationFn: (addr: string) => putServerBind(addr),
+    mutationFn: (input: { addr: string; ui_bind?: UiBindUpdate }) =>
+      putServerBind(input.addr, input.ui_bind),
     onSuccess: (res) => {
-      toast.success(
-        `Bind address saved: ${res.pending}. Restart engine to apply.`,
-      );
+      const parts = [`Bind address saved: ${res.pending}`];
+      if (res.ui_pending?.action === "set") {
+        parts.push(`UI alias → ${res.ui_pending.addr}`);
+      } else if (res.ui_pending?.action === "clear") {
+        parts.push("UI alias disabled");
+      }
+      toast.success(`${parts.join(" · ")}. Restart engine to apply.`);
+      // Reset the action selector so a subsequent submit doesn't
+      // accidentally re-apply the same UI bind decision.
+      setUiBindAction("noop");
       qc.invalidateQueries({ queryKey: ["admin", "server", "bind"] });
     },
     onError: (e: unknown) => {
@@ -92,6 +124,18 @@ export function AdminServerPage() {
     bindQuery.data?.pending !== null
     && bindQuery.data?.pending !== undefined
     && bindQuery.data.pending !== bindQuery.data.current;
+
+  // True when there is a persisted ui_bind override that hasn't
+  // taken effect (either an explicit "off" or a `set` whose addr
+  // doesn't match the currently-bound alias). Drives the pending
+  // banner + the Restart engine card aggregation.
+  const uiPendingDiffers = (() => {
+    const p = bindQuery.data?.ui_pending;
+    if (!p) return false;
+    if (p.action === "clear") return bindQuery.data?.ui_current !== null;
+    // p.action === "set"
+    return p.addr !== bindQuery.data?.ui_current;
+  })();
 
   // Watermarks --------------------------------------------------------------
   const wmQuery = useQuery({
@@ -269,8 +313,42 @@ export function AdminServerPage() {
             </div>
           ) : null}
 
+          <Row
+            k="Admin/UI alias"
+            v={
+              bindQuery.isLoading ? (
+                <Skeleton className="h-4 w-32" />
+              ) : bindQuery.data?.ui_current ? (
+                <code className="font-mono">{bindQuery.data.ui_current}</code>
+              ) : (
+                <span className="text-muted-foreground">disabled</span>
+              )
+            }
+          />
+          {uiPendingDiffers ? (
+            <div
+              className="rounded-md border border-warning/40 bg-warning/10 p-3 text-xs"
+              data-testid="ui-bind-pending"
+            >
+              <p className="font-medium text-warning">Pending restart</p>
+              <p className="mt-0.5 text-muted-foreground">
+                {bindQuery.data?.ui_pending?.action === "set" ? (
+                  <>
+                    Second listener will bind to{" "}
+                    <code className="font-mono">
+                      {bindQuery.data.ui_pending.addr}
+                    </code>{" "}
+                    after the next restart.
+                  </>
+                ) : (
+                  <>Second listener will be disabled after the next restart.</>
+                )}
+              </p>
+            </div>
+          ) : null}
+
           <form
-            className="flex flex-col gap-2 sm:flex-row sm:items-end"
+            className="flex flex-col gap-4"
             onSubmit={(e) => {
               e.preventDefault();
               const trimmed = bindDraft.trim();
@@ -278,33 +356,100 @@ export function AdminServerPage() {
                 toast.error("Bind address must be host:port");
                 return;
               }
-              bindMutation.mutate(trimmed);
+              let ui_bind: UiBindUpdate | undefined;
+              switch (uiBindAction) {
+                case "noop":
+                  ui_bind = undefined;
+                  break;
+                case "set": {
+                  const ui = uiBindDraft.trim();
+                  if (!ui) {
+                    toast.error("UI alias address must be host:port");
+                    return;
+                  }
+                  if (ui === trimmed) {
+                    toast.error(
+                      "UI alias address must differ from the primary bind",
+                    );
+                    return;
+                  }
+                  ui_bind = { action: "set", addr: ui };
+                  break;
+                }
+                case "clear":
+                  ui_bind = { action: "clear" };
+                  break;
+                case "reset":
+                  ui_bind = { action: "reset" };
+                  break;
+              }
+              bindMutation.mutate({ addr: trimmed, ui_bind });
             }}
           >
-            <div className="flex flex-1 flex-col gap-1">
-              <Label htmlFor="bind-addr">Change bind address</Label>
-              <Input
-                id="bind-addr"
-                placeholder="0.0.0.0:8080"
-                value={bindDraft}
-                onChange={(e) => setBindDraft(e.target.value)}
-                disabled={bindQuery.isLoading || bindMutation.isPending}
-                data-testid="bind-addr-input"
-              />
-              <p className="text-xs text-muted-foreground">
-                The engine probe-binds to the new address before persisting
-                so you find out about port conflicts immediately, not on
-                next restart.
-              </p>
+            <div className="flex flex-col gap-2 sm:flex-row sm:items-end">
+              <div className="flex flex-1 flex-col gap-1">
+                <Label htmlFor="bind-addr">Primary bind address</Label>
+                <Input
+                  id="bind-addr"
+                  placeholder="0.0.0.0:8089"
+                  value={bindDraft}
+                  onChange={(e) => setBindDraft(e.target.value)}
+                  disabled={bindQuery.isLoading || bindMutation.isPending}
+                  data-testid="bind-addr-input"
+                />
+                <p className="text-xs text-muted-foreground">
+                  The engine probe-binds to the new address before persisting
+                  so you find out about port conflicts immediately, not on
+                  next restart.
+                </p>
+              </div>
             </div>
-            <Button
-              type="submit"
-              disabled={bindMutation.isPending}
-              data-testid="bind-addr-save"
-            >
-              <Save className="mr-2 h-4 w-4" />
-              {bindMutation.isPending ? "Saving…" : "Save"}
-            </Button>
+
+            <fieldset className="flex flex-col gap-2 rounded-md border p-3">
+              <legend className="px-1 text-xs font-medium text-muted-foreground">
+                Admin/UI alias listener (optional second bind)
+              </legend>
+              <p className="text-xs text-muted-foreground">
+                Bind a second listener so the admin console is reachable on
+                a different interface or port (e.g. <code>0.0.0.0:80</code>{" "}
+                on a management LAN while the primary engine port stays on
+                the camera LAN). Both listeners serve the same router; the
+                only practical difference is where they're reachable from.
+              </p>
+              <UiBindRadio
+                value={uiBindAction}
+                onChange={setUiBindAction}
+                disabled={bindQuery.isLoading || bindMutation.isPending}
+              />
+              {uiBindAction === "set" ? (
+                <div className="flex flex-col gap-1 pl-6">
+                  <Label htmlFor="ui-bind-addr">UI alias address</Label>
+                  <Input
+                    id="ui-bind-addr"
+                    placeholder="0.0.0.0:80"
+                    value={uiBindDraft}
+                    onChange={(e) => setUiBindDraft(e.target.value)}
+                    disabled={bindMutation.isPending}
+                    data-testid="ui-bind-addr-input"
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    Binding ports &lt;1024 on bare-metal needs{" "}
+                    <code>CAP_NET_BIND_SERVICE</code> on the systemd unit.
+                  </p>
+                </div>
+              ) : null}
+            </fieldset>
+
+            <div className="flex justify-end">
+              <Button
+                type="submit"
+                disabled={bindMutation.isPending}
+                data-testid="bind-addr-save"
+              >
+                <Save className="mr-2 h-4 w-4" />
+                {bindMutation.isPending ? "Saving…" : "Save"}
+              </Button>
+            </div>
           </form>
         </CardContent>
       </Card>
@@ -787,7 +932,7 @@ export function AdminServerPage() {
             supervisor needed. The page will reload automatically
             once the new image is listening.
           </p>
-          {(pendingDiffers || wmPendingDiffers || modelPendingDiffers) ? (
+          {(pendingDiffers || uiPendingDiffers || wmPendingDiffers || modelPendingDiffers) ? (
             <div
               className="rounded-md border border-warning/40 bg-warning/10 p-3 text-xs"
               data-testid="restart-pending-summary"
@@ -795,6 +940,7 @@ export function AdminServerPage() {
               <p className="font-medium text-warning">Pending changes</p>
               <ul className="mt-1 list-disc pl-4 text-muted-foreground">
                 {pendingDiffers ? <li>Bind address</li> : null}
+                {uiPendingDiffers ? <li>UI alias listener</li> : null}
                 {wmPendingDiffers ? <li>Storage watermarks</li> : null}
                 {modelPendingDiffers ? <li>Default inference model</li> : null}
               </ul>
@@ -837,6 +983,73 @@ function Row({ k, v }: { k: string; v: React.ReactNode }) {
     <div className="flex items-center justify-between gap-3 border-b border-border/30 py-1.5 last:border-b-0">
       <span className="text-muted-foreground">{k}</span>
       <div className="text-right">{v}</div>
+    </div>
+  );
+}
+
+/**
+ * Four-way radio selector for the UI alias listener change action.
+ * Plain `<input type=radio>` styled to match the surrounding
+ * shadcn aesthetic since we don't (yet) ship a RadioGroup primitive.
+ */
+function UiBindRadio({
+  value,
+  onChange,
+  disabled,
+}: {
+  value: "noop" | "set" | "clear" | "reset";
+  onChange: (v: "noop" | "set" | "clear" | "reset") => void;
+  disabled?: boolean;
+}) {
+  const opts: Array<{
+    value: "noop" | "set" | "clear" | "reset";
+    label: string;
+    hint: string;
+  }> = [
+    {
+      value: "noop",
+      label: "Leave unchanged",
+      hint: "Don't touch the persisted ui_bind row.",
+    },
+    {
+      value: "set",
+      label: "Use a specific address",
+      hint: "Persist a host:port for the second listener.",
+    },
+    {
+      value: "clear",
+      label: "Disable second listener",
+      hint: "Persist explicit 'off' — overrides nexus.toml at next boot.",
+    },
+    {
+      value: "reset",
+      label: "Use nexus.toml default",
+      hint: "Drop the override row — fall back to server.ui_bind in nexus.toml.",
+    },
+  ];
+  return (
+    <div className="flex flex-col gap-1.5" data-testid="ui-bind-action-group">
+      {opts.map((o) => (
+        <label
+          key={o.value}
+          className="flex cursor-pointer items-start gap-2 text-sm"
+        >
+          <input
+            type="radio"
+            name="ui-bind-action"
+            value={o.value}
+            checked={value === o.value}
+            onChange={() => onChange(o.value)}
+            disabled={disabled}
+            data-testid={`ui-bind-action-${o.value}`}
+            className="mt-1"
+          />
+          <span className="flex flex-col">
+            <span>{o.label}</span>
+            <span className="text-xs text-muted-foreground">{o.hint}</span>
+          </span>
+        </label>
+      ))}
     </div>
   );
 }
