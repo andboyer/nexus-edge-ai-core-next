@@ -19,6 +19,7 @@ mode = "local"
 
 [server]
 api_bind = "0.0.0.0:8089"
+ui_bind = "0.0.0.0:80"
 ui_root = "/usr/share/nexus/ui"
 
 [store]

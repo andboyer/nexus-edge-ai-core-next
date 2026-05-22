@@ -476,6 +476,17 @@ fn default_pre_roll_secs() -> u32 {
 pub struct ServerConfig {
     #[serde(default = "default_api_bind")]
     pub api_bind: String,
+    /// Optional second listener that serves the same router
+    /// (API + SPA) on a different `host:port`. Intended use is
+    /// `0.0.0.0:80` so operators can reach the admin console at
+    /// `http://<host>/` without typing the engine port, while
+    /// `api_bind` (default `0.0.0.0:8089`) stays available for
+    /// programmatic API consumers. Binding port `<1024` on a
+    /// non-root user requires `CAP_NET_BIND_SERVICE` — Docker
+    /// already has it, the systemd unit in `docs/INSTALL.md §7.7`
+    /// sets `AmbientCapabilities=CAP_NET_BIND_SERVICE`.
+    #[serde(default)]
+    pub ui_bind: Option<String>,
     /// Filesystem path served as the SPA root. The Dockerfile installs
     /// the built UI here; locally `npm run build` puts it under `ui/dist`.
     #[serde(default = "default_ui_root")]
@@ -486,6 +497,7 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             api_bind: default_api_bind(),
+            ui_bind: None,
             ui_root: default_ui_root(),
         }
     }

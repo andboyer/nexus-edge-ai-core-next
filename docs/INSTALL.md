@@ -316,18 +316,41 @@ sudo chmod 755 /etc/nexus
 
 ### 4.4 Firewall (`ufw`)
 
+The engine listens on **two TCP ports** out of the box:
+
+| Port       | Bound by                  | Purpose                                                                 |
+| ---------- | ------------------------- | ----------------------------------------------------------------------- |
+| `80/tcp`   | `[server].ui_bind`        | Admin console alias — operators reach the UI at `http://<host>/`.       |
+| `8089/tcp` | `[server].api_bind`       | Engine API (also serves the UI on this port — same router, both bindings). |
+
+Both listeners share the same axum router, the same auth, and the
+same TLS posture; the second bind is purely for operator UX so you
+don't have to type `:8089`. Open both:
+
 ```bash
 sudo ufw default deny incoming
 sudo ufw default allow outgoing
 sudo ufw allow OpenSSH
+sudo ufw allow 80/tcp   comment 'nexus-engine UI alias'
 sudo ufw allow 8089/tcp comment 'nexus-engine API + UI'
 sudo ufw --force enable
 sudo ufw status
 ```
 
-Open only `8089/tcp` for the operator UI. The engine doesn't need
-inbound from anywhere else; cameras initiate the RTSP push *to* the
-engine via outbound TCP only when the URL is `rtsp-over-TCP`.
+The engine doesn't need inbound from anywhere else; cameras
+initiate the RTSP push *to* the engine via outbound TCP only when
+the URL is `rtsp-over-TCP`.
+
+If port 80 is already taken on this host (some other web server),
+comment out the `ui_bind` line in your tier config (see §6.5 /
+§7.6) and drop the `ufw allow 80/tcp` step — operators will then
+reach the UI at `http://<host>:8089/` only.
+
+> **Bare-metal note (Install path B, §7):** binding any port
+> `<1024` from a non-root user requires `CAP_NET_BIND_SERVICE`.
+> The systemd unit in §7.7 sets `AmbientCapabilities=CAP_NET_BIND_SERVICE`
+> for exactly this reason. Docker (§6) inherits the capability
+> automatically.
 
 ### 4.5 Optional — unattended-upgrades
 
@@ -1297,6 +1320,13 @@ Restart=on-failure
 RestartSec=5s
 LimitNOFILE=65535
 
+# Allow the `nexus` user (UID 1000, non-root) to bind the UI alias
+# on port 80. `api_bind` defaults to 8089 and does not need this;
+# `ui_bind = "0.0.0.0:80"` (default in every tier config) does.
+# Comment both lines out if you remove `ui_bind` from nexus.toml.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
 # Hardening — keep the engine boxed in.
 NoNewPrivileges=true
 ProtectSystem=strict
@@ -1467,10 +1497,24 @@ curl -fsS http://localhost:8089/api/health
 # Expect: {"status":"ok"}  (or similar — non-empty 200)
 ```
 
+Also verify the UI alias is listening on port 80:
+
+```bash
+curl -fsS http://localhost/api/health
+# Same body as above. Same router on both ports.
+```
+
+If the second command fails, either:
+- `[server].ui_bind` is unset in your nexus.toml — see §6.5 / §7.6.
+- Port 80 is taken by another process — `sudo ss -ltnp | grep ':80 '`.
+- Bare-metal: the systemd unit is missing `AmbientCapabilities=CAP_NET_BIND_SERVICE`
+  (engine log will say `failed to bind server.ui_bind; … Permission denied`).
+
 ### 9.2 UI loads in a browser
 
 ```
-http://<box-ip>:8089/
+http://<box-ip>/         # preferred — served by the ui_bind alias on :80
+http://<box-ip>:8089/    # fallback — same UI, served by api_bind
 ```
 
 You should see the Nexus dashboard. The Cameras tab should list
@@ -1584,7 +1628,9 @@ the prompt list).
 ### 10.0 Admin UI quickstart
 
 The operator console is a single-page web app served by the engine
-binary itself at **`http://<engine-host>:8089/`** — no separate
+binary itself at **`http://<engine-host>/`** (port 80, served by
+`[server].ui_bind`) or **`http://<engine-host>:8089/`** (port 8089,
+served by `[server].api_bind` — same SPA, same auth) — no separate
 admin process, no `/ui` path. Sidebar groups three operational
 modes:
 

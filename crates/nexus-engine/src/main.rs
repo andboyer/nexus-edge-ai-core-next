@@ -905,19 +905,59 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
         // is required so the admin-auth middleware can pull the
         // peer address out of request extensions for the
         // loopback-fallback check (see admin_auth module).
-        let server = tokio::spawn(async move {
-            if let Err(e) = axum::serve(
-                listener,
-                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-            )
-            .await
-            {
-                tracing::error!("axum error: {e}");
+        let server = tokio::spawn({
+            let app = app.clone();
+            async move {
+                if let Err(e) = axum::serve(
+                    listener,
+                    app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                )
+                .await
+                {
+                    tracing::error!("axum error (api): {e}");
+                }
             }
         });
+        // Optional second listener so operators can reach the admin
+        // console at e.g. `http://<host>/` (port 80) without typing
+        // the engine port. Same router, same auth, same TLS posture
+        // — it is purely a second TCP bind on top of the existing
+        // app. Configured via `[server].ui_bind` in nexus.toml.
+        // Binding <1024 on the bare-metal systemd unit needs
+        // `CAP_NET_BIND_SERVICE`; Docker already has it.
+        let ui_server = if let Some(ui_bind) = cfg.server.ui_bind.clone() {
+            match tokio::net::TcpListener::bind(&ui_bind).await {
+                Ok(ui_listener) => {
+                    info!(bind = %ui_bind, "HTTP UI alias listening");
+                    Some(tokio::spawn(async move {
+                        if let Err(e) = axum::serve(
+                            ui_listener,
+                            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                        )
+                        .await
+                        {
+                            tracing::error!("axum error (ui): {e}");
+                        }
+                    }))
+                }
+                Err(e) => {
+                    tracing::error!(
+                        ui_bind = %ui_bind,
+                        error = %e,
+                        "failed to bind server.ui_bind; continuing with api_bind only",
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
         wait_for_signal().await;
         info!("shutdown signal received");
         server.abort();
+        if let Some(h) = ui_server {
+            h.abort();
+        }
     } else {
         wait_for_signal().await;
     }

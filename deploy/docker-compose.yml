@@ -23,6 +23,11 @@ services:
     restart: unless-stopped
     ports:
       - "8089:8089"
+      # Optional UI alias on the standard HTTP port so operators can
+      # reach the console at `http://<host>/`. Matches
+      # `[server].ui_bind = "0.0.0.0:80"` in nexus.toml. Comment
+      # both lines out if port 80 is already taken on the host.
+      - "80:80"
     volumes:
       - ../config:/etc/nexus:ro
       - nexus-state:/var/lib/nexus
