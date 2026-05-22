@@ -2172,9 +2172,13 @@ async fn compute_fs_stats(path: &std::path::Path) -> FsStats {
             // `fragment_size` is already `u64` on every platform we
             // support; `blocks`/`blocks_available` may be either
             // `u32` (older glibc) or `u64` (macOS/musl), so the
-            // explicit casts are still needed there.
+            // explicit casts are still needed there. The allow
+            // suppresses the macOS-only lint without removing
+            // portability on Linux.
             let frag = stat.fragment_size();
+            #[allow(clippy::unnecessary_cast)]
             let blocks = stat.blocks() as u64;
+            #[allow(clippy::unnecessary_cast)]
             let avail = stat.blocks_available() as u64;
             let total_bytes = blocks.saturating_mul(frag);
             let free_bytes = avail.saturating_mul(frag);

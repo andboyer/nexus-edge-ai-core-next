@@ -50,6 +50,13 @@ pub(crate) fn snapshot() -> Option<GpuInfo> {
     guard.snapshot()
 }
 
+// Variant sizes diverge by ~hundreds of bytes (NVML state holds a
+// thread-safe handle + cached strings; the `None` variant is empty),
+// but `GpuBackend` lives behind a single process-wide `Mutex<…>`
+// in a `LazyLock` — exactly one instance ever exists, boxing the
+// payloads would just add a heap-indirection per access for no
+// memory win. Suppress the lint here, not workspace-wide.
+#[allow(clippy::large_enum_variant)]
 enum GpuBackend {
     None,
     #[cfg(target_os = "linux")]
