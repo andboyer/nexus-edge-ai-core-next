@@ -1,0 +1,56 @@
+# Default text-prompt vocabulary for YOLOE (`gen_yoloe.py`).
+#
+# One prompt per line; blank lines and `# ...` comments are skipped.
+# Order matters — class IDs in the exported ONNX are 0..N-1 in this
+# order, and `models-manifest.json :: prompts` is regenerated in-place
+# from this file every time `gen_yoloe.py` runs.
+#
+# The list mirrors `yolo_world_default_prompts.txt` so an operator
+# swapping `kind = "yolo_world"` → `kind = "yoloe"` in the engine
+# config gets the same class catalogue. Tune per-deployment by editing
+# this file and re-running the generator.
+
+person
+vehicle
+car
+truck
+bus
+motorcycle
+bicycle
+forklift
+trailer
+backpack
+handbag
+suitcase
+package
+delivery box
+shopping cart
+dog
+cat
+bird
+deer
+firearm
+rifle
+handgun
+knife
+hardhat
+helmet
+high-visibility vest
+safety glasses
+gloves
+ladder
+scissor lift
+trash bag
+spray paint can
+crowbar
+hammer
+shovel
+excavator
+crane
+dump truck
+cement mixer
+bulldozer
+wheelbarrow
+traffic cone
+jersey barrier
+scaffolding

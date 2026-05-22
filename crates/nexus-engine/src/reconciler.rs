@@ -35,7 +35,10 @@ use futures::StreamExt;
 use nexus_bus::{topic, Bus, BusExt};
 use nexus_config::{AnnotatorConfig, CameraConfig, ClipsConfig, StaticObjectConfig};
 use nexus_inference::InferenceRouter;
-use nexus_pipeline::{spawn_camera, ClipRecorder, LatestFrameCache};
+use nexus_pipeline::{
+    spawn_camera, ClipRecorder, FrameStatsRegistry, LatestFrameCache, StaticAnchorClearRegistry,
+};
+use nexus_config::TrackerConfig;
 use nexus_rules::RuleEvaluator;
 use nexus_store::Store;
 use nexus_tracker::Tracker;
@@ -68,7 +71,12 @@ pub struct RunningCameraEntry {
 /// keeps it for its entire lifetime.
 pub struct ReconcilerArgs {
     pub router: Arc<InferenceRouter>,
-    pub tracker: Arc<dyn Tracker>,
+    /// Tracker configuration snapshot — used to instantiate a
+    /// fresh per-camera tracker on every `start_camera` call.
+    /// Trackers are stateful (track ids, IoU history) and MUST
+    /// NOT be shared across cameras, or detections from camera A
+    /// will pollute camera B's track table and frame metadata.
+    pub tracker_cfg: TrackerConfig,
     pub annotator: AnnotatorConfig,
     pub static_object: StaticObjectConfig,
     pub clips: ClipsConfig,
@@ -78,6 +86,8 @@ pub struct ReconcilerArgs {
     pub recorder: Arc<dyn ClipRecorder>,
     pub bus: Arc<dyn Bus>,
     pub cache: Arc<LatestFrameCache>,
+    pub frame_stats: Arc<FrameStatsRegistry>,
+    pub static_clear: Arc<StaticAnchorClearRegistry>,
     pub pre_roll_secs: u32,
     pub handles: HandleMap,
 }
@@ -194,6 +204,10 @@ fn stop_camera(args: &ReconcilerArgs, cam_id: CameraId) {
         info!(camera_id = cam_id, "camera reconciler: aborted supervisor");
     }
     args.recorder.remove_camera_ingester(cam_id);
+    // Reset per-camera frame stats so the next spawn starts from a
+    // clean slate (no stale fps_ema or counters from the previous
+    // session).
+    args.frame_stats.clear(cam_id);
 }
 
 fn start_camera(args: &ReconcilerArgs, cam: CameraConfig, url: &str) {
@@ -215,10 +229,13 @@ fn start_camera(args: &ReconcilerArgs, cam: CameraConfig, url: &str) {
     }
 
     let detector = args.router.detector_for_camera(&cam);
+    // Fresh per-camera tracker — see `ReconcilerArgs::tracker_cfg`
+    // for why this CANNOT be shared across cameras.
+    let tracker: Arc<dyn Tracker> = Arc::from(nexus_tracker::build_tracker(&args.tracker_cfg));
     let handle = spawn_camera(
         cam,
         detector,
-        args.tracker.clone(),
+        tracker,
         args.annotator.clone(),
         args.static_object.clone(),
         args.clips.clone(),
@@ -228,6 +245,8 @@ fn start_camera(args: &ReconcilerArgs, cam: CameraConfig, url: &str) {
         args.recorder.clone(),
         args.bus.clone(),
         args.cache.clone(),
+        args.frame_stats.clone(),
+        args.static_clear.clone(),
     );
     args.handles.lock().insert(
         cam_id,

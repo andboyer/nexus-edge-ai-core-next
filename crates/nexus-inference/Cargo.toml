@@ -26,7 +26,18 @@ ort         = ["dep:ort", "dep:ndarray"]
 [dependencies]
 nexus-types = { workspace = true }
 nexus-config = { workspace = true }
+# M3.1 Phase F: needed by the Store-backed VisualPromptStore impl
+# (used by both the engine and the nexus-inference-worker binary).
+# The lib code only references it from the visual_store_sqlite
+# module — pure-CPU / non-visual builds pay only the compile cost,
+# not a runtime one.
+nexus-store = { workspace = true }
 async-trait = { workspace = true }
+# M3.2: ensemble detector fans out members in parallel via
+# futures::future::join_all. Keeps a single dep edge for the
+# inference crate (tokio::join would also work but doesn't compose
+# over a runtime-length Vec of futures without explicit pinning).
+futures = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

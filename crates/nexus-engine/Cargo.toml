@@ -28,16 +28,9 @@ ep-directml = ["nexus-inference/ep-directml"]
 # fire AlertEvents into the outbox without needing a live RTSP
 # source + a deterministic-on-demand person track. NEVER enable in
 # production builds — the endpoint sits OUTSIDE the admin-auth gate
-# (so the e2e fixture can hit it under `auth.mode = "none"`) and
-# would let any caller inject arbitrary events. Off by default.
+# (so the e2e fixture can hit it on loopback) and would let any
+# caller inject arbitrary events. Off by default.
 test-injection = []
-# M6 Phase 4 Step 4.5 — secure-by-default release builds. Forwards
-# to `nexus-config/prod-auth` which removes `AuthMode::DevToken`
-# from the enum entirely. The release pipeline (and Docker images
-# that ship to customers) MUST flip this on; dev builds leave it
-# off so the devtoken bootstrap path remains usable on a fresh
-# clone.
-prod-auth = ["nexus-config/prod-auth"]
 
 [[bin]]
 name = "nexus-engine"
@@ -119,6 +112,24 @@ image = { workspace = true }
 async-stream = "0.3"
 sha2 = "0.10"
 
+# M-Admin Phase 0 — streaming diagnostics tarball
+# (`GET /v1/admin/diagnostics/export`). Tar entries are
+# generated in a `spawn_blocking` worker that writes through
+# a `flate2::write::GzEncoder` wrapping the sender half of a
+# bounded mpsc; axum streams the receiver half back as the
+# response body so memory stays O(buffer-size) regardless of
+# bundle size. Both crates are pure-Rust, zero C deps. The
+# `bytes` crate is workspace-pinned to avoid duplicating the
+# `Bytes` type vs the one axum uses internally.
+tar = "0.4"
+flate2 = "1"
+bytes = { workspace = true }
+
+# M-Dashboard Phase 2 — host metrics for the operator dashboard.
+# Cross-platform CPU / RAM / disk / process snapshot. Cached for 1s
+# inside `system_metrics.rs` to keep poll cost bounded.
+sysinfo = { workspace = true }
+
 # M-Install Checkpoint 2 — token bytes for the auto-provisioned
 # dev_token. `getrandom 0.3` is already in the dep graph
 # transitively (via rand-using crates); pinning it here makes
@@ -136,6 +147,12 @@ dashmap = { workspace = true }
 quick-xml = { workspace = true }
 # RTSP Digest auth (M-Admin Phase 1B Step D).
 md-5 = { workspace = true }
+# WS-UsernameToken digest for ONVIF Media SOAP auth
+# (M-Admin Phase 1B Step E — discovery::onvif_media). The spec
+# (WS-Security UsernameToken Profile 1.0 §3.1) mandates SHA-1
+# for `PasswordDigest`; no negotiation, no upgrade path. Pinned
+# to the same RustCrypto family already in the workspace.
+sha1 = "0.10"
 
 # statvfs for the watermark sampler. Unix-only — non-unix builds
 # fall back to a never-panic probe (see storage_safety.rs).
@@ -147,6 +164,17 @@ nix = { version = "0.29", default-features = false, features = [
     "fs",
     "resource",
 ] }
+
+# NVIDIA GPU telemetry. nvml-wrapper dynamically loads
+# `libnvidia-ml.so` at runtime via `Nvml::init()` — when the
+# driver isn't installed the call returns Err and `gpu.rs` falls
+# back to the Intel iGPU sysfs reader. So adding this dep does
+# NOT make the engine require an NVIDIA driver.
+#
+# Linux-only because Windows/macOS use a different shim
+# (`nvml.dll` / no support) that we don't target on the edge box.
+[target.'cfg(target_os = "linux")'.dependencies]
+nvml-wrapper = "0.10"
 
 [dev-dependencies]
 tempfile = { workspace = true }

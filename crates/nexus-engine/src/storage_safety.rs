@@ -771,10 +771,12 @@ mod tests {
                 },
                 detector: nexus_config::CameraDetector {
                     prompts: vec![],
+                    visual_prompts: vec![],
                     model_override: None,
                 },
                 behavior: nexus_config::CameraBehavior {
                     parking_lot_mode: false,
+                    anchor_ttl_secs: None,
                 },
                 zones: vec![],
             })
@@ -940,10 +942,12 @@ mod tests {
                     },
                     detector: nexus_config::CameraDetector {
                         prompts: vec![],
+                        visual_prompts: vec![],
                         model_override: None,
                     },
                     behavior: nexus_config::CameraBehavior {
                         parking_lot_mode: false,
+                        anchor_ttl_secs: None,
                     },
                     zones: vec![],
                 })
@@ -1330,10 +1334,12 @@ mod tests {
                 },
                 detector: nexus_config::CameraDetector {
                     prompts: vec![],
+                    visual_prompts: vec![],
                     model_override: None,
                 },
                 behavior: nexus_config::CameraBehavior {
                     parking_lot_mode: false,
+                    anchor_ttl_secs: None,
                 },
                 zones: vec![],
             })

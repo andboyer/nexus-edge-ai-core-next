@@ -1,7 +1,7 @@
 //! Frame sources — RTSP and a virtual generator for tests / dev boots.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -20,6 +20,23 @@ use uuid::Uuid;
 pub const RTSP_SOURCE_FRAME_WIDTH: u32 = 960;
 /// See [`RTSP_SOURCE_FRAME_WIDTH`].
 pub const RTSP_SOURCE_FRAME_HEIGHT: u32 = 540;
+
+/// Hard ceiling on the gap between consecutive frames before a
+/// live RTSP session is considered stalled and the supervisor
+/// loop forces a reconnect. `rtspsrc` will sit forever in
+/// PLAYING with no EOS / no Error when the upstream silently
+/// stops sending RTP (common with: mediamtx publisher dying,
+/// the YouTube/streamlink bridge wedging mid-segment, NAT
+/// rebinding on TCP-tunnelled streams). 15s comfortably absorbs
+/// transient hiccups at 1–15fps cameras (longest live gap we
+/// expect is ~3s of stalled buffer at 0.3fps deep cameras),
+/// while still recovering inside one preroll backoff cycle for
+/// the operator. Same threshold is also used for the
+/// "never-saw-the-first-frame" timeout — if the pipeline
+/// reports PLAYING but no sample ever arrives in 15s the source
+/// is almost certainly negotiating endlessly against a dead
+/// publisher.
+const RTSP_STALL_TIMEOUT_SECS: u64 = 15;
 
 #[derive(Debug, Error)]
 pub enum FrameSourceError {
@@ -240,6 +257,16 @@ impl RtspSource {
         let counter_cb = counter.clone();
         let logged_first = Arc::new(AtomicBool::new(false));
         let logged_first_cb = logged_first.clone();
+        // Wall-clock anchor for the stall watchdog. Reset on the
+        // pipeline→PLAYING transition below so a session that
+        // negotiates SDP but never produces a single sample still
+        // gets killed inside `RTSP_STALL_TIMEOUT_SECS`; bumped on
+        // every appsink callback so a normally-flowing session
+        // never trips the watchdog.
+        let last_frame_at: Arc<parking_lot::Mutex<Instant>> =
+            Arc::new(parking_lot::Mutex::new(Instant::now()));
+        let last_frame_at_cb = last_frame_at.clone();
+        let last_frame_at_w = last_frame_at.clone();
 
         sink.set_callbacks(
             AppSinkCallbacks::builder()
@@ -325,6 +352,11 @@ impl RtspSource {
                         *g = g.saturating_add(1);
                         *g
                     };
+                    // Stall-watchdog heartbeat. Cheap (one mutex
+                    // store on a contention-free lock) but it has
+                    // to live in the callback because the bus
+                    // thread can't observe sample flow directly.
+                    *last_frame_at_cb.lock() = Instant::now();
                     let frame = Frame {
                         camera_id,
                         frame_id,
@@ -346,6 +378,11 @@ impl RtspSource {
         pipeline
             .set_state(gst::State::Playing)
             .map_err(|e| FrameSourceError::Backend(format!("set Playing: {e}")))?;
+        // Restart the watchdog clock from "just transitioned to
+        // PLAYING"; without this a long preroll/SDP negotiation
+        // (e.g. RTSPS handshake on a slow link) could eat into
+        // the first-frame budget below.
+        *last_frame_at.lock() = Instant::now();
 
         let bus = pipeline
             .bus()
@@ -394,6 +431,45 @@ impl RtspSource {
         // dropped (typically within microseconds of `task.abort()`). Racing
         // it against the bus join means a Ctrl-C tear-down doesn't have to
         // wait for an RTSP timeout or an EOS that may never come.
+        //
+        // The stall watchdog covers the silent-failure case that
+        // neither the bus nor the supervisor catches: rtspsrc
+        // stays in PLAYING with the TCP connection alive but the
+        // upstream stops pushing RTP — no EOS, no Error, the
+        // appsink callback just goes quiet. Without this branch
+        // `run_session` would block on the bus poll forever and
+        // the outer reconnect loop in `RtspSource::run` would
+        // never get a chance to retry. Polls the shared
+        // `last_frame_at` once a second; returns a synthetic
+        // backend error after `RTSP_STALL_TIMEOUT_SECS` so the
+        // existing exponential-backoff reconnect kicks in.
+        let stall_timeout = Duration::from_secs(RTSP_STALL_TIMEOUT_SECS);
+        let cam_id_for_stall = self.camera_id;
+        let stall_watchdog = async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(1));
+            // Skip the immediate-fire tick; otherwise we'd see
+            // elapsed < 1ms on the first poll and bail uselessly
+            // if `Instant::now()` raced the PLAYING reset.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                let elapsed = last_frame_at_w.lock().elapsed();
+                if elapsed > stall_timeout {
+                    tracing::warn!(
+                        camera_id = cam_id_for_stall,
+                        elapsed_ms = elapsed.as_millis() as u64,
+                        threshold_ms = stall_timeout.as_millis() as u64,
+                        "rtsp session stalled (no frames); forcing reconnect",
+                    );
+                    return FrameSourceError::Backend(format!(
+                        "stall watchdog: no frames for {}s",
+                        elapsed.as_secs()
+                    ));
+                }
+            }
+        };
+        tokio::pin!(stall_watchdog);
+
         let bus_result = tokio::select! {
             r = bus_join => {
                 r.map_err(|e| FrameSourceError::Backend(format!("bus join: {e}")))?
@@ -402,6 +478,10 @@ impl RtspSource {
             _ = tx.closed() => {
                 shutdown.store(true, Ordering::Relaxed);
                 Err(FrameSourceError::Closed)
+            }
+            e = &mut stall_watchdog => {
+                shutdown.store(true, Ordering::Relaxed);
+                Err(e)
             }
         };
 

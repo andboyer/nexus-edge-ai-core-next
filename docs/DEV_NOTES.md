@@ -200,6 +200,44 @@ rule layer, not in the detector. If we ever need per-camera
 same kind), the router's layer-key shape can be reved without changing
 callers.
 
+## YOLOE visual-prompt mode (M3.1)
+
+`kind = "yoloe_visual"` plugs an open-vocab detector that matches
+against operator-uploaded reference crops (not text labels). The
+admin uploads a JPEG/PNG/WEBP via
+`POST /api/v1/admin/visual-prompts` (multipart `name`,
+`description?`, `image`); the engine SHA256s the bytes, persists
+the file under `runtime.visual_prompts_dir`
+(default `/var/lib/nexus/visual_prompts`), runs the encoder ONNX
+once, and writes the resulting embedding to the
+`visual_prompts` table. Attaching a prompt to a camera
+(`POST /api/v1/admin/cameras/:cid/visual-prompts/:vpid`) inserts a
+join row and fires a `CameraConfigUpdate` so the visual-mode
+detector picks up the new embeddings without restart.
+
+The image encoder is `inference.model.pack_path / yoloe26_s_image_encoder.onnx`
+— same pack directory that ships the per-frame detector. With no
+pack path configured the upload endpoint returns 503
+`encoder_not_configured`; nothing else 503s.
+
+**Worker mode quirk:** when the inference backend is
+`spawned_process`, the visual-mode worker needs read access to the
+visual-prompts table. The binary expects `NEXUS_WORKER_DB_URL`
+(SQLite URL pointing at the engine's DB) in its env; falls back to
+the mock detector if missing or unreadable, so a misconfigured
+worker degrades to "no detections" rather than panic. The worker
+IPC channel does **not** yet have a `PushConfig` RPC — embedding
+changes only land after a worker restart in spawned mode. The
+default `in_process` backend has no such limitation.
+
+Embedding-dimension override is `NEXUS_WORKER_EMBEDDING_DIM` (default
+512). Must match the encoder's output dim or `push_camera_config`
+drops the binding with a warn.
+
+Detections emitted by visual mode carry the operator-supplied label
+verbatim (no vocab-index lookup), so CEL rules read e.g.
+`object.label == "amazon_van"`.
+
 ## See also
 
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) — trait + pool + fail-soft pattern,

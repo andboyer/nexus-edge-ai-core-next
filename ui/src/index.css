@@ -1,0 +1,78 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Palette ported from the legacy SPA. The UI is dark-only by design —
+   operators run this on NOC displays 24/7 and the old palette has
+   muscle memory built up since M0. No light mode class is wired. */
+@layer base {
+  :root {
+    --background: 210 12% 5%;          /* #0b0d10 */
+    --foreground: 214 14% 87%;         /* #d6dbe2 */
+
+    --card: 213 21% 9%;                /* #11151a */
+    --card-foreground: 214 14% 87%;
+
+    --popover: 213 21% 9%;
+    --popover-foreground: 214 14% 87%;
+
+    --primary: 190 100% 61%;           /* #38e1ff */
+    --primary-foreground: 213 21% 9%;
+
+    --secondary: 214 19% 11%;          /* #161b22 */
+    --secondary-foreground: 214 14% 87%;
+
+    --muted: 214 19% 11%;
+    --muted-foreground: 215 12% 60%;   /* #8a93a3 */
+
+    --accent: 214 19% 14%;
+    --accent-foreground: 214 14% 87%;
+
+    --destructive: 345 84% 61%;        /* #ef476f */
+    --destructive-foreground: 0 0% 100%;
+
+    --success: 161 94% 43%;            /* #06d6a0 */
+    --success-foreground: 0 0% 100%;
+
+    --warning: 42 100% 70%;            /* #ffd166 */
+    --warning-foreground: 213 21% 9%;
+
+    --border: 217 22% 18%;             /* #232936 */
+    --input: 217 22% 18%;
+    --ring: 190 100% 61%;              /* accent ring */
+
+    --radius: 0.5rem;
+  }
+
+  * {
+    @apply border-border;
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    @apply bg-background text-foreground antialiased;
+    font-feature-settings: "rlig" 1, "calt" 1;
+  }
+
+  /* Scrollbars match the dark surface so they disappear into the
+     chrome rather than fighting it. */
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: hsl(var(--border));
+    border-radius: 4px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: hsl(var(--muted-foreground) / 0.5);
+  }
+}

@@ -51,10 +51,12 @@ fn sample_camera(id: i64, name: &str) -> CameraConfig {
         },
         detector: nexus_config::CameraDetector {
             prompts: vec![],
+            visual_prompts: vec![],
             model_override: None,
         },
         behavior: nexus_config::CameraBehavior {
             parking_lot_mode: false,
+            anchor_ttl_secs: None,
         },
         zones: vec![],
     }
@@ -636,6 +638,7 @@ async fn schema_migrations_table_records_apply_order() {
             "0009_audit_log".to_string(),
             "0010_local_users".to_string(),
             "0011_auth_refresh_tokens".to_string(),
+            "0012_visual_prompts".to_string(),
         ]
     );
 }

@@ -10,7 +10,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use nexus_types::CameraId;
+use nexus_types::{CameraId, VisualPromptId};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use url::Url;
@@ -27,44 +27,49 @@ pub enum ConfigError {
 
 /// Compatibility shims applied to a parsed config so the engine can
 /// emit operator-visible warnings on upgrade paths. Returned by
-/// [`Config::load_with_compat`].
+/// [`Config::load_with_compat`]. Reserved for future upgrade-path
+/// shims; currently has no fields. Kept as a typed handle so callers
+/// don't break when new shims are added.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct CompatNotice {
-    /// True when the on-disk file had no `[auth]` section and so
-    /// the loader pinned `auth.mode = none` (instead of using the
-    /// new `dev_token` default that landed in M-Install
-    /// Checkpoint 2). Engines emit a 7-day-deprecation WARN log
-    /// when this is set.
-    pub auth_grandfathered: bool,
+    // No fields. The original `auth_grandfathered` flag was retired
+    // alongside the `AuthMode::None` / `AuthMode::DevToken` variants;
+    // legacy values now produce a hard ConfigError at load time so
+    // there is nothing to surface as a soft warning anymore.
+    #[doc(hidden)]
+    _private: (),
 }
 
-/// Cheap line-scan check for `[<name>]` at the top level of a TOML
-/// document. Used by [`Config::load_with_compat`] to detect a
-/// missing `[auth]` section without re-parsing the file. Lines
-/// inside other tables (`[runtime.foo]`) are intentionally ignored
-/// — only an exact `[name]` header (after trimming whitespace and
-/// stripping inline comments) counts.
+/// Detect `auth.mode = "none"` or `auth.mode = "dev_token"` in
+/// the raw TOML source and return a hard ConfigError. Those
+/// variants were removed in M-Admin Phase 0 — operators must
+/// switch to `local`, `oidc`, or `hybrid` explicitly rather
+/// than landing on a silently-different auth posture on upgrade.
 ///
-/// This is a structural check, not a full TOML parser; it relies
-/// on the standard TOML rule that table headers occupy their own
-/// line. Round-tripping through `toml::from_str` afterwards is
-/// what actually validates the file.
-fn toml_has_top_level_table(txt: &str, name: &str) -> bool {
-    let target = format!("[{name}]");
-    for line in txt.lines() {
-        // Strip inline comments — TOML comments start with `#` and
-        // run to end-of-line. A `#` inside a string isn't a comment,
-        // but table headers can't contain strings, so the simple
-        // strip is sound for headers.
-        let no_comment = match line.find('#') {
-            Some(i) => &line[..i],
-            None => line,
+/// Scans line-by-line so a `#`-commented example mention of the
+/// legacy value (e.g. in `nexus.example.toml`) doesn't trip the
+/// check.
+fn reject_legacy_auth_mode(txt: &str) -> Result<(), ConfigError> {
+    for raw in txt.lines() {
+        let line = match raw.find('#') {
+            Some(i) => &raw[..i],
+            None => raw,
         };
-        if no_comment.trim() == target {
-            return true;
+        let trimmed = line.trim();
+        if trimmed == r#"mode = "none""# || trimmed == r#"mode = "dev_token""# {
+            let legacy = if trimmed.contains("none") {
+                "none"
+            } else {
+                "dev_token"
+            };
+            return Err(ConfigError::Validation(format!(
+                "auth.mode = \"{legacy}\" is no longer supported (removed in M-Admin Phase 0). \
+                 Set auth.mode to one of \"local\", \"oidc\", or \"hybrid\". \
+                 See config/nexus.example.toml and docs/ARCHITECTURE.md §11."
+            )));
         }
     }
-    false
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -113,26 +118,19 @@ impl Config {
 
     /// Same as [`Config::load`] but reports compatibility shims
     /// applied to the parsed config so the engine can surface them
-    /// at boot. Currently the only shim is the M-Install
-    /// Checkpoint 2 auth grandfather: configs whose file predates
-    /// the `[auth]` section keep `mode = none` for one
-    /// deprecation window instead of being silently flipped to the
-    /// new `dev_token` default.
+    /// at boot. Currently retained as a typed boundary for future
+    /// upgrade-path warnings; no shims are active today.
+    ///
+    /// Legacy `auth.mode = "none"` / `"dev_token"` values from
+    /// pre-M-Admin-Phase-0 configs are rejected here with a clear
+    /// error so operators upgrade explicitly rather than landing
+    /// on a silently-different auth posture.
     pub fn load_with_compat(path: impl AsRef<Path>) -> Result<(Self, CompatNotice), ConfigError> {
         let txt = std::fs::read_to_string(path)?;
-        let auth_section_present = toml_has_top_level_table(&txt, "auth");
-        let mut cfg: Config = toml::from_str(&txt)?;
-        let mut notice = CompatNotice::default();
-        if !auth_section_present {
-            // Pre-Checkpoint-2 dev installs never wrote an [auth]
-            // block; serde's `default` would now hand them
-            // `DevToken` and lock them out on upgrade. Pin them
-            // back to `None` and let the engine WARN for one week.
-            cfg.auth.mode = AuthMode::None;
-            notice.auth_grandfathered = true;
-        }
+        reject_legacy_auth_mode(&txt)?;
+        let cfg: Config = toml::from_str(&txt)?;
         cfg.validate()?;
-        Ok((cfg, notice))
+        Ok((cfg, CompatNotice::default()))
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
@@ -198,6 +196,14 @@ pub struct RuntimeConfig {
     /// (static-object registries, etc.). Created on demand.
     #[serde(default = "default_state_dir")]
     pub state_dir: PathBuf,
+    /// M3.1 — directory holding stored visual-prompt reference crops
+    /// (one file per `VisualPromptId`, original PNG/JPEG). The detector
+    /// encodes them once into per-prompt embedding vectors persisted in
+    /// the SQLite `visual_prompts` table; this directory is the source
+    /// of truth for the original pixels (re-encoding on model change,
+    /// thumbnail rendering in the admin UI). Created on demand.
+    #[serde(default = "default_visual_prompts_dir")]
+    pub visual_prompts_dir: PathBuf,
     /// M2.1 motion-clip recording + safety-floor configuration.
     #[serde(default)]
     pub clips: ClipsConfig,
@@ -218,6 +224,7 @@ impl Default for RuntimeConfig {
             worker_threads: 0,
             blocking_threads: default_blocking_threads(),
             state_dir: default_state_dir(),
+            visual_prompts_dir: default_visual_prompts_dir(),
             clips: ClipsConfig::default(),
             auth: RuntimeAuthConfig::default(),
             audit: RuntimeAuditConfig::default(),
@@ -231,6 +238,10 @@ fn default_blocking_threads() -> usize {
 
 fn default_state_dir() -> PathBuf {
     PathBuf::from("/var/lib/nexus/state")
+}
+
+fn default_visual_prompts_dir() -> PathBuf {
+    PathBuf::from("/var/lib/nexus/visual_prompts")
 }
 
 // ---------------------------------------------------------------------------
@@ -584,9 +595,6 @@ pub struct AuthConfig {
     pub mode: AuthMode,
     #[serde(default)]
     pub oidc: Option<OidcConfig>,
-    /// When `mode = "dev_token"`, requests must include `Authorization: Bearer <token>`.
-    #[serde(default)]
-    pub dev_token: Option<String>,
     /// Path to the admin-auth JSON file holding the shared HS256
     /// signing secret (M2.2 Phase 2 step 12). File shape:
     /// `{"secret": "..."}`. When set, every write against
@@ -601,32 +609,13 @@ pub struct AuthConfig {
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AuthMode {
-    /// No auth (dev only). The engine refuses to bind anything other
-    /// than loopback when this mode is active — see
-    /// `nexus-engine`'s startup checks. Existing dev installs whose
-    /// `nexus.toml` predates the auth section are grandfathered to
-    /// this mode for 7 days; see `Config::load_with_compat`.
-    None,
-    // M-Install Checkpoint 2 — secure by default. Anything deployed
-    // beyond a hand-rolled `mode = "none"` opt-in lands on the
-    // dev-token path automatically.
-    /// Default in dev builds. On first boot the engine generates a
-    /// 32-byte URL-safe random token at `/var/lib/nexus/dev-token`
-    /// (mode 0600) and prints it to the WARN log; clients send it
-    /// as `Authorization: Bearer <token>` on every request.
-    ///
-    /// **NOT compiled in release builds.** When `nexus-config` is
-    /// built with the `prod-auth` feature, this variant is removed
-    /// entirely so a shipped binary cannot accidentally fall back
-    /// to a shared-secret bearer. M6 Phase 4 Step 4.5.
-    #[cfg(not(feature = "prod-auth"))]
-    #[default]
-    DevToken,
     /// M6 local-users backend. Per-user argon2id passwords, lockout
     /// FSM, first-boot bootstrap admin. Rejects [`AuthConfig::oidc`].
     ///
-    /// Default in release builds (`prod-auth` feature on).
-    #[cfg_attr(feature = "prod-auth", default)]
+    /// Default for fresh installs. M-Admin Phase 0 closeout
+    /// retired the legacy `None` and `DevToken` variants — every
+    /// edge deployment now lands on a real per-user credential.
+    #[default]
     Local,
     /// M6 OIDC backend. Auth-code + PKCE against an external IdP
     /// (Authentik, Keycloak, Azure AD, Okta, Google Workspace).
@@ -707,6 +696,54 @@ pub struct OidcConfig {
     /// industries) typically flip this on.
     #[serde(default)]
     pub deny_unmapped: bool,
+    /// Full absolute callback URL handed to the IdP on both the
+    /// `/authorize` redirect and the `/token` exchange. MUST byte-
+    /// match what is registered with the IdP. When absent, the
+    /// engine falls back to the relative path
+    /// `/api/v1/auth/oidc/callback` which Authentik / Keycloak /
+    /// Okta / Google all accept.
+    ///
+    /// **Microsoft Entra ID requires this field** — Entra rejects
+    /// relative paths and demands the full `https://<host>/...`
+    /// URL exactly as registered in the App registration's
+    /// Authentication blade. Localhost over `http://` is allowed
+    /// for development; everything else must be HTTPS.
+    #[serde(default)]
+    pub redirect_uri: Option<String>,
+    /// Path to a file (mode 0600 recommended) holding the OIDC
+    /// client secret. Loaded once at boot and held in RAM; the
+    /// file is never re-read. When set, the engine sends
+    /// `client_secret=<contents>` in the token-endpoint exchange
+    /// alongside PKCE (canonical OAuth 2.0 confidential web-app
+    /// flow). Required by every IdP that registers the app as a
+    /// confidential client and configures a secret (Entra "Web"
+    /// platform with a client secret, Okta "Web" application,
+    /// Authentik "Confidential" client type, etc.). When absent,
+    /// the engine sends PKCE only — works for public clients
+    /// (Entra "Mobile and desktop" / "Single-page application"
+    /// platforms) or for confidential clients registered without
+    /// a secret.
+    #[serde(default)]
+    pub client_secret_file: Option<PathBuf>,
+    /// Name of an environment variable holding the OIDC client
+    /// secret. Resolved once at boot. Mutually exclusive with
+    /// `client_secret_file` — setting both is a config error,
+    /// not a silent precedence rule. Pick the one that matches
+    /// your deploy target:
+    ///
+    /// * **Docker Compose / systemd**: prefer `client_secret_file`
+    ///   pointing at the Docker-secret mount (`/run/secrets/...`)
+    ///   or systemd `$CREDENTIALS_DIRECTORY/...` path. Files keep
+    ///   the secret out of `/proc/<pid>/environ`.
+    /// * **Kubernetes / Nomad / PaaS (Fly, Render, etc.)**: prefer
+    ///   `client_secret_env = "NEXUS_OIDC_CLIENT_SECRET"` and wire
+    ///   the platform's Secret object to inject that env var. No
+    ///   file mounts required.
+    ///
+    /// The env var must be non-empty at engine start; whitespace
+    /// is trimmed. The engine never re-reads the env after boot.
+    #[serde(default)]
+    pub client_secret_env: Option<String>,
 }
 
 fn default_oidc_scopes() -> Vec<String> {
@@ -824,7 +861,11 @@ pub enum PoolWorkerKind {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelConfig {
-    /// "yolo" (closed-vocab YOLOv26-nano, default) | "open_vocab" | "classifier_ensemble" | "mock".
+    /// `"yolo"` (closed-vocab YOLOv26-nano, default) | `"open_vocab"` /
+    /// `"yolo_world"` | `"yoloe"` (M3.1 open-vocab text + visual prompts) |
+    /// `"yoloe_visual"` | `"yoloe_promptfree"` (M3.3 open-set auto-class)
+    /// | `"classifier_ensemble"` | `"ensemble"` (M3.2 same-camera multi-
+    /// detector fan-out — see `members` below) | `"mock"`.
     ///
     /// `yolo` matches the v1 ship — `models/yolo26n_dynamic.onnx` driven
     /// by a model-pack manifest with 320 / 640 / 1280 presets.
@@ -845,6 +886,24 @@ pub struct ModelConfig {
     pub input_height: u32,
     #[serde(default = "default_score_threshold")]
     pub score_threshold: f32,
+    /// M3.2 — same-camera detector ensemble. Meaningful when
+    /// `kind == "ensemble"`: each entry is itself a `ModelConfig`
+    /// (so members can be `yolo`, `yolo_world`, `yoloe`,
+    /// `yoloe_visual`, or even another nested `ensemble`). Per-member
+    /// fields like `pack_path`, `preset`, `input_width`,
+    /// `input_height`, `score_threshold` apply to that member only;
+    /// the parent's values are ignored when `kind == "ensemble"`.
+    /// Omitted / empty under any other `kind` (kept opt-in via
+    /// `serde(default)` so existing configs round-trip unchanged).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub members: Vec<ModelConfig>,
+    /// M3.3 — per-frame cap on detections returned by the
+    /// `yoloe_promptfree` prompt-free detector. `None` keeps every
+    /// detection that survives NMS; `Some(k)` truncates to the
+    /// K most-confident objects after the inner detector returns.
+    /// Ignored for every other `kind`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_k: Option<usize>,
 }
 
 impl Default for ModelConfig {
@@ -856,6 +915,8 @@ impl Default for ModelConfig {
             input_width: default_input_width(),
             input_height: default_input_height(),
             score_threshold: default_score_threshold(),
+            members: Vec::new(),
+            top_k: None,
         }
     }
 }
@@ -1175,6 +1236,17 @@ pub struct StaticObjectConfig {
     /// under `runtime.state_dir`. v1 default: true.
     #[serde(default = "default_true")]
     pub persistence_enabled: bool,
+    /// Time-to-live for a persisted anchor with no matching observation.
+    /// Each frame that produces a vehicle track within `match_distance_pixels`
+    /// of an anchor refreshes its `last_seen_unix_ms`; once an anchor goes
+    /// untouched for `anchor_ttl_secs` (measured against the frame's own
+    /// `captured_at`, so it works equally well across long offline periods),
+    /// the filter prunes it from the registry. Fixes the “stale anchor
+    /// keeps haunting the live viewer after the parked car drove off-screen”
+    /// failure mode that demotion-on-resumed-motion can't cover. v1 default:
+    /// 3600 (one hour). Set to `0` to disable the sweep entirely.
+    #[serde(default = "default_static_object_anchor_ttl_secs")]
+    pub anchor_ttl_secs: u32,
 }
 
 impl Default for StaticObjectConfig {
@@ -1187,6 +1259,7 @@ impl Default for StaticObjectConfig {
             match_distance_pixels: default_static_object_match_distance_pixels(),
             track_id_reuse_reset_pixels: default_static_object_track_id_reuse_reset_pixels(),
             persistence_enabled: true,
+            anchor_ttl_secs: default_static_object_anchor_ttl_secs(),
         }
     }
 }
@@ -1208,6 +1281,9 @@ fn default_static_object_match_distance_pixels() -> u32 {
 }
 fn default_static_object_track_id_reuse_reset_pixels() -> u32 {
     60
+}
+fn default_static_object_anchor_ttl_secs() -> u32 {
+    3600
 }
 
 // ---------------------------------------------------------------------------
@@ -1518,12 +1594,32 @@ pub struct CameraIngest {
 /// look for, vs. CameraIngest which controls how frames get there.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CameraDetector {
-    /// Open-vocab prompts, or labels-of-interest for ensemble.
+    /// Open-vocab text prompts, or labels-of-interest for ensemble.
     #[serde(default)]
     pub prompts: Vec<String>,
+    /// M3.1 — visual-prompt references attached to this camera.
+    /// Each entry pairs a stored reference-crop id (resolved against
+    /// `runtime.visual_prompts_dir` + the `visual_prompts` table) with
+    /// the human-facing label the detector should emit for matches
+    /// (e.g. `"amazon_van"`). Only the YOLOE visual-mode detector
+    /// reads this field; other backends ignore it.
+    #[serde(default)]
+    pub visual_prompts: Vec<VisualPromptRef>,
     /// Per-camera overrides for the inference model (kind, pack, thresholds).
     #[serde(default)]
     pub model_override: Option<ModelConfig>,
+}
+
+/// M3.1 — wire-shape reference to a stored visual prompt. Embedded in
+/// [`CameraDetector::visual_prompts`] and fan-pushed inside
+/// [`CameraConfigUpdate`]. The detector resolves `id` against the
+/// `visual_prompts` table (migration 0012) to load the embedding,
+/// then emits detections under `label` for every matching crop.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct VisualPromptRef {
+    pub id: VisualPromptId,
+    pub label: String,
 }
 
 /// Tracker / rules-pipeline behavior overrides — everything that
@@ -1537,6 +1633,14 @@ pub struct CameraBehavior {
     /// per-camera registry at `runtime.state_dir`. Default: false.
     #[serde(default)]
     pub parking_lot_mode: bool,
+    /// Per-camera override for `tracker.static_object.anchor_ttl_secs`.
+    /// When `Some`, the supervisor replaces the global TTL with this
+    /// value when constructing the camera's `StaticObjectFilter`.
+    /// `None` means "inherit the engine default". Restart required:
+    /// the value is read once at supervisor start and not hot-reloaded
+    /// — the reconciler only respawns on URL change today.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor_ttl_secs: Option<u32>,
 }
 
 /// One configured camera. Wire shape (TOML + JSON) is flat — every
@@ -1599,6 +1703,12 @@ pub enum ZoneKind {
 pub struct CameraConfigUpdate {
     pub camera_id: CameraId,
     pub prompts: Vec<String>,
+    /// M3.1 — visual-prompt attachments for this camera. Empty for
+    /// every backend except the YOLOE visual-mode detector. Defaults
+    /// to empty so older fan-push payloads that predate the field
+    /// still deserialise cleanly.
+    #[serde(default)]
+    pub visual_prompts: Vec<VisualPromptRef>,
     pub model: ModelConfig,
     pub generation: u64,
 }
@@ -1624,78 +1734,78 @@ mod tests {
         assert!(cfg.validate().is_err());
     }
 
-    // M-Install Checkpoint 2 — secure-by-default. New deployments
-    // (and any TOML that only writes `[auth]\n`) land on DevToken
-    // automatically. Failing this test means a new install without
-    // an explicit `mode = "..."` would silently leak a no-auth API.
-    //
-    // M6 Phase 4 Step 4.5 — gated off in release builds where the
-    // `DevToken` variant doesn't exist. The release-build default
-    // is `AuthMode::Local`, covered by
-    // `auth_mode_default_is_local_under_prod_auth` below.
+    // M-Admin Phase 0 closeout — secure-by-default. The legacy
+    // `None` and `DevToken` variants are gone; a fresh install
+    // (empty TOML, or one with `[auth]\n` only) lands on `Local`
+    // and the engine auto-provisions an admin secret + prints a
+    // one-time admin OTP at WARN. Failing this test would mean a
+    // new install could silently boot without a real credential.
     #[test]
-    #[cfg(not(feature = "prod-auth"))]
-    fn auth_mode_default_is_dev_token() {
-        let auth: AuthConfig = Default::default();
-        assert_eq!(auth.mode, AuthMode::DevToken);
-        let parsed: AuthConfig = toml::from_str("").unwrap();
-        assert_eq!(parsed.mode, AuthMode::DevToken);
-    }
-
-    /// M6 Phase 4 Step 4.5 — under `prod-auth` the secure-by-default
-    /// `AuthMode` falls through to `Local` (the only other mode that
-    /// gates `/api/v1/*` writes without an external dependency like
-    /// an OIDC IdP). A fresh install therefore prompts an operator
-    /// to run the bootstrap-admin flow rather than handing out a
-    /// shared-secret bearer.
-    #[test]
-    #[cfg(feature = "prod-auth")]
-    fn auth_mode_default_is_local_under_prod_auth() {
+    fn auth_mode_default_is_local() {
         let auth: AuthConfig = Default::default();
         assert_eq!(auth.mode, AuthMode::Local);
         let parsed: AuthConfig = toml::from_str("").unwrap();
         assert_eq!(parsed.mode, AuthMode::Local);
     }
 
+    // M-Admin Phase 0 closeout — pre-existing dev installs whose
+    // nexus.toml has no `[auth]` block now land on `Local` (the
+    // new default). No grandfathering; the engine auto-provisions
+    // an admin secret on first boot.
     #[test]
-    fn toml_top_level_table_detector() {
-        assert!(toml_has_top_level_table(
-            "[auth]\nmode = \"oidc\"\n",
-            "auth"
-        ));
-        assert!(toml_has_top_level_table("  [auth]   # comment\n", "auth"));
-        // Subtables (`[auth.oidc]`) must NOT count as the parent table.
-        assert!(!toml_has_top_level_table(
-            "[auth.oidc]\nissuer = \"x\"\n",
-            "auth"
-        ));
-        assert!(!toml_has_top_level_table("[server]\n", "auth"));
-        assert!(!toml_has_top_level_table("", "auth"));
-    }
-
-    // M-Install Checkpoint 2 — grandfather: pre-existing dev installs
-    // whose nexus.toml has no `[auth]` block must be pinned back to
-    // `mode = "none"` so the new DevToken default doesn't lock them
-    // out on upgrade.
-    #[test]
-    fn load_with_compat_grandfathers_missing_auth() {
+    fn load_with_compat_missing_auth_lands_on_local() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nexus.toml");
         std::fs::write(&path, "[server]\napi_bind = \"127.0.0.1:8089\"\n").unwrap();
-        let (cfg, notice) = Config::load_with_compat(&path).unwrap();
-        assert!(notice.auth_grandfathered);
-        assert_eq!(cfg.auth.mode, AuthMode::None);
+        let (cfg, _notice) = Config::load_with_compat(&path).unwrap();
+        assert_eq!(cfg.auth.mode, AuthMode::Local);
     }
 
+    /// Legacy `auth.mode = "none"` from pre-Phase-0 configs MUST
+    /// be rejected at load time with a clear error so operators
+    /// upgrade explicitly rather than silently landing on a
+    /// different posture.
     #[test]
-    #[cfg(not(feature = "prod-auth"))]
-    fn load_with_compat_respects_explicit_auth() {
+    fn load_with_compat_rejects_legacy_mode_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nexus.toml");
+        std::fs::write(&path, "[auth]\nmode = \"none\"\n").unwrap();
+        let err = Config::load_with_compat(&path).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("none") && msg.contains("no longer supported"),
+            "{msg}"
+        );
+    }
+
+    /// Same as above for the retired `dev_token` mode.
+    #[test]
+    fn load_with_compat_rejects_legacy_mode_dev_token() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nexus.toml");
         std::fs::write(&path, "[auth]\nmode = \"dev_token\"\n").unwrap();
-        let (cfg, notice) = Config::load_with_compat(&path).unwrap();
-        assert!(!notice.auth_grandfathered);
-        assert_eq!(cfg.auth.mode, AuthMode::DevToken);
+        let err = Config::load_with_compat(&path).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("dev_token") && msg.contains("no longer supported"),
+            "{msg}"
+        );
+    }
+
+    /// The legacy-mode reject must ignore the same string when it
+    /// only appears inside a `#` comment (e.g. nexus.example.toml
+    /// listing the historical option set in a doc comment).
+    #[test]
+    fn load_with_compat_ignores_legacy_mode_in_comment() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nexus.toml");
+        std::fs::write(
+            &path,
+            "[auth]\nmode = \"local\"  # historical: none | dev_token | local\n",
+        )
+        .unwrap();
+        let (cfg, _) = Config::load_with_compat(&path).unwrap();
+        assert_eq!(cfg.auth.mode, AuthMode::Local);
     }
 
     // -----------------------------------------------------------------------
@@ -1719,20 +1829,7 @@ mod tests {
     fn auth_mode_allows_local_and_oidc_matrix() {
         // Pinned matrix so future variants don't accidentally flip
         // a bit and let an `Oidc`-only deployment accept local login.
-        //
-        // M6 Phase 4 Step 4.5 — `DevToken` is omitted under
-        // `prod-auth` since the variant itself is gone.
-        #[cfg(not(feature = "prod-auth"))]
         let cases: &[(AuthMode, bool, bool)] = &[
-            (AuthMode::None, false, false),
-            (AuthMode::DevToken, false, false),
-            (AuthMode::Local, true, false),
-            (AuthMode::Oidc, false, true),
-            (AuthMode::Hybrid, true, true),
-        ];
-        #[cfg(feature = "prod-auth")]
-        let cases: &[(AuthMode, bool, bool)] = &[
-            (AuthMode::None, false, false),
             (AuthMode::Local, true, false),
             (AuthMode::Oidc, false, true),
             (AuthMode::Hybrid, true, true),
@@ -1821,6 +1918,132 @@ retention_days = 90
         assert_eq!(rc.audit.retention_days, 90);
     }
 
+    // -----------------------------------------------------------------
+    // M3.1 — VisualPromptRef wire shape + defaults
+    // -----------------------------------------------------------------
+
+    /// `runtime.visual_prompts_dir` defaults to /var/lib/nexus/visual_prompts
+    /// when the TOML omits it. Asserts the default helper agrees with
+    /// the spec in docs/M3_OPEN_VOCAB_VISUAL.md so a future tweak of
+    /// either side trips this lock.
+    #[test]
+    fn runtime_visual_prompts_dir_default_matches_spec() {
+        let r: RuntimeConfig = Default::default();
+        assert_eq!(
+            r.visual_prompts_dir,
+            std::path::PathBuf::from("/var/lib/nexus/visual_prompts")
+        );
+        let from_empty: RuntimeConfig = toml::from_str("").unwrap();
+        assert_eq!(
+            from_empty.visual_prompts_dir,
+            std::path::PathBuf::from("/var/lib/nexus/visual_prompts")
+        );
+    }
+
+    /// Operators can override `runtime.visual_prompts_dir` in TOML
+    /// (operator may want it on a faster SSD partition separate from
+    /// `state_dir`). Confirms serde sees the field.
+    #[test]
+    fn runtime_visual_prompts_dir_round_trips_via_toml() {
+        let src = r#"
+state_dir = "/var/lib/nexus/state"
+visual_prompts_dir = "/mnt/fast/visual_prompts"
+"#;
+        let rc: RuntimeConfig = toml::from_str(src).unwrap();
+        assert_eq!(
+            rc.visual_prompts_dir,
+            std::path::PathBuf::from("/mnt/fast/visual_prompts")
+        );
+    }
+
+    /// Wire-shape lock: a `[[cameras]]` table with `visual_prompts =
+    /// [{ id = 1, label = "amazon_van" }]` round-trips through TOML
+    /// → CameraConfig → JSON. Catches accidental rename / removal of
+    /// the field or its sub-keys.
+    #[test]
+    fn camera_visual_prompts_round_trip_via_toml() {
+        let src = r#"
+id = 1
+name = "front_door"
+url = "rtsp://example/cam"
+visual_prompts = [
+  { id = 1, label = "amazon_van" },
+  { id = 7, label = "fedex_truck" },
+]
+"#;
+        let cam: CameraConfig = toml::from_str(src).unwrap();
+        assert_eq!(cam.detector.visual_prompts.len(), 2);
+        assert_eq!(cam.detector.visual_prompts[0].id, 1);
+        assert_eq!(cam.detector.visual_prompts[0].label, "amazon_van");
+        assert_eq!(cam.detector.visual_prompts[1].id, 7);
+        assert_eq!(cam.detector.visual_prompts[1].label, "fedex_truck");
+
+        // The field must remain flat at the wire boundary (no
+        // `[detector]` envelope leaked by the existing #[serde(flatten)]
+        // refactor).
+        let v = serde_json::to_value(&cam).unwrap();
+        let obj = v.as_object().unwrap();
+        assert!(obj.contains_key("visual_prompts"));
+        assert!(!obj.contains_key("detector"));
+    }
+
+    /// A camera that omits `visual_prompts` must still load (existing
+    /// nexus.toml files predate M3.1). Defaults to an empty Vec via
+    /// `#[serde(default)]` on the field.
+    #[test]
+    fn camera_visual_prompts_defaults_to_empty_when_absent() {
+        let src = r#"
+id = 1
+name = "front_door"
+url = "rtsp://example/cam"
+"#;
+        let cam: CameraConfig = toml::from_str(src).unwrap();
+        assert!(cam.detector.visual_prompts.is_empty());
+    }
+
+    /// `CameraConfigUpdate` (fan-pushed to every detector slot on
+    /// reload) carries the visual-prompt attachments. JSON round-trip
+    /// asserts the new field is on the wire and defaults to empty
+    /// when an older publisher omits it.
+    #[test]
+    fn camera_config_update_visual_prompts_round_trip_via_json() {
+        let update = CameraConfigUpdate {
+            camera_id: 42,
+            prompts: vec!["person".into()],
+            visual_prompts: vec![VisualPromptRef {
+                id: 9,
+                label: "delivery_van".into(),
+            }],
+            model: ModelConfig::default(),
+            generation: 3,
+        };
+        let json = serde_json::to_string(&update).unwrap();
+        let back: CameraConfigUpdate = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.visual_prompts.len(), 1);
+        assert_eq!(back.visual_prompts[0].id, 9);
+        assert_eq!(back.visual_prompts[0].label, "delivery_van");
+
+        // Backwards-compat: a publisher that predates the field
+        // emits JSON without `visual_prompts`. Receiver must accept it.
+        let legacy = r#"{
+            "camera_id": 42,
+            "prompts": ["person"],
+            "model": {},
+            "generation": 3
+        }"#;
+        let parsed: CameraConfigUpdate = serde_json::from_str(legacy).unwrap();
+        assert!(parsed.visual_prompts.is_empty());
+    }
+
+    /// `VisualPromptRef` denies unknown fields — typos in admin JSON
+    /// surface as an error rather than silently dropping (e.g.
+    /// `lable` instead of `label`).
+    #[test]
+    fn visual_prompt_ref_denies_unknown_fields() {
+        let bad = r#"{ "id": 1, "label": "amazon_van", "lable": "typo" }"#;
+        assert!(serde_json::from_str::<VisualPromptRef>(bad).is_err());
+    }
+
     /// Wire-shape lock for the camera/rule refactor: the public TOML
     /// keys for every shipped config under `config/` must still parse
     /// after the `#[serde(flatten)]` regrouping (no nested `[ingest]`,
@@ -1848,27 +2071,6 @@ retention_days = 90
             let path = entry.path();
             if path.extension().and_then(|s| s.to_str()) != Some("toml") {
                 continue;
-            }
-            // M6 Phase 4 Step 4.5 — under `prod-auth` the
-            // `AuthMode::DevToken` variant is compiled out, so
-            // shipped dev configs that pin `mode = "dev_token"`
-            // can't parse. Those configs are still valid for the
-            // default-feature build (dev installs); skip them here
-            // rather than erroring, since prod deployments won't
-            // ship them anyway. We scan line-by-line to avoid
-            // matching the string inside a `#` comment (which
-            // would skip configs that just MENTION dev_token in
-            // a doc-comment).
-            #[cfg(feature = "prod-auth")]
-            {
-                let src = std::fs::read_to_string(&path).unwrap_or_default();
-                let pins_dev_token = src.lines().any(|raw| {
-                    let line = raw.split('#').next().unwrap_or(raw).trim();
-                    line == "mode = \"dev_token\"" || line.starts_with("mode = \"dev_token\"")
-                });
-                if pins_dev_token {
-                    continue;
-                }
             }
             let cfg =
                 Config::load(&path).unwrap_or_else(|e| panic!("load {}: {e}", path.display()));

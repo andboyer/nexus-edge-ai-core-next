@@ -38,6 +38,11 @@ pub type TrackId = u64;
 pub type RuleId = String;
 pub type EventId = Uuid;
 pub type TraceId = String;
+/// M3.1 — primary key for a stored visual reference crop used by the
+/// YOLOE visual-prompt backend. Surfaces in [`CameraConfigUpdate`] (via
+/// `VisualPromptRef`) and in admin REST payloads. Persisted by
+/// `nexus-store::visual_prompts` (migration 0012).
+pub type VisualPromptId = i64;
 
 // ---------------------------------------------------------------------------
 // Geometry
@@ -383,6 +388,56 @@ pub enum PipelineState {
     Reconnecting,
     Stopped,
     Failed,
+}
+
+// ---------------------------------------------------------------------------
+// Static-object map (parking-lot anchors)
+// ---------------------------------------------------------------------------
+//
+// One anchor per known-static vehicle location for a camera. Mirrors
+// the on-disk shape of `<state_dir>/static_objects/cam-<id>.json` (see
+// `nexus-tracker::static_object::StaticAnchor`) so the wire payload and
+// the persisted file share a single JSON-field convention. Centroid is
+// in the detector frame (typically 960x540 — same coordinate system as
+// `TrackedObject.bbox`), so the UI overlay can use the same transform.
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(TS),
+    ts(export, export_to = "../../../ui/src/api/types/")
+)]
+pub struct StaticAnchor {
+    /// Lowercased detector label (e.g. `"vehicle.car"`, `"truck"`).
+    pub label: String,
+    /// Centroid X in detector-frame pixels.
+    pub center_x: f32,
+    /// Centroid Y in detector-frame pixels.
+    pub center_y: f32,
+    /// Wall-clock (ms since UNIX epoch) of the most recent matching
+    /// observation. `null` only for anchors loaded from a registry
+    /// file written before the TTL sweep landed; the supervisor
+    /// promotes those to a real timestamp on the first matching
+    /// frame after restart. UI can render staleness from this value
+    /// (e.g. "2m ago" tooltips) and the engine prunes anchors
+    /// untouched for longer than `static_object.anchor_ttl_secs`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub last_seen_unix_ms: Option<i64>,
+}
+
+/// Returned by `GET /api/cameras/:id/static-anchors`. `anchors`
+/// is empty when the per-camera registry file is missing OR when the
+/// camera has `behavior.parking_lot_mode = false`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(TS),
+    ts(export, export_to = "../../../ui/src/api/types/")
+)]
+pub struct StaticAnchorsResponse {
+    pub camera_id: CameraId,
+    pub anchors: Vec<StaticAnchor>,
 }
 
 // ---------------------------------------------------------------------------

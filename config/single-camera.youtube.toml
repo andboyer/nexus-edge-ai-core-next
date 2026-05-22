@@ -58,7 +58,7 @@ seed_from_config = true
 log_level = "info,nexus=debug"
 
 [auth]
-mode = "none"
+mode = "local"
 
 [inference]
 backend = "in_process"

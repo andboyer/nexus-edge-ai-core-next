@@ -18,28 +18,46 @@
 
 pub mod backends;
 pub mod detectors;
+pub mod ensemble;
+#[cfg(feature = "ort")]
+pub mod encoder;
 #[cfg(feature = "ort")]
 pub mod execution_providers;
 pub mod pool;
 pub mod router;
+pub mod visual_prompts;
+pub mod visual_store_sqlite;
 pub mod worker_proto;
 #[cfg(feature = "ort")]
 pub mod yolo;
 #[cfg(feature = "ort")]
 pub mod yolo_world;
+#[cfg(feature = "ort")]
+pub mod yoloe;
+pub mod yoloe_promptfree;
+#[cfg(feature = "ort")]
+pub mod yoloe_visual;
 
 pub use backends::{
     BackendState, DetectorBackend, InProcessBackend, ThreadIsolatedBackend, WorkerProcessBackend,
 };
 pub use detectors::{
-    ClassifierEnsembleDetector, Detector, InferenceError, MockDetector, OpenVocabDetector,
+    label_matches_any_prompt, ClassifierEnsembleDetector, Detector, InferenceError, MockDetector,
+    OpenVocabDetector,
 };
 pub use pool::{BackendStatus, DetectorPool};
 pub use router::InferenceRouter;
+pub use visual_prompts::{
+    InMemoryVisualPromptStore, VisualPromptBinding, VisualPromptStore,
+};
+pub use visual_store_sqlite::StoreBackedVisualPromptStore;
 #[cfg(feature = "ort")]
 pub use yolo::YoloOrtDetector;
 #[cfg(feature = "ort")]
 pub use yolo_world::YoloWorldDetector;
+#[cfg(feature = "ort")]
+pub use yoloe::YoloeDetector;
+pub use yoloe_promptfree::YoloePromptFreeDetector;
 
 use std::sync::Arc;
 
@@ -108,6 +126,47 @@ pub fn build(cfg: &InferenceConfig) -> Result<InferenceLayer, InferenceError> {
 }
 
 fn build_detector(cfg: &InferenceConfig) -> Result<Arc<dyn Detector>, InferenceError> {
+    build_detector_with_context(cfg, &BuildContext::default())
+}
+
+/// Context plumbed through detector construction for kinds that need
+/// extra deps the bare `InferenceConfig` doesn't carry (e.g. yoloe
+/// visual-prompt embeddings backed by SQLite).
+#[derive(Default, Clone)]
+pub struct BuildContext {
+    pub visual_prompt_store: Option<Arc<dyn VisualPromptStore>>,
+    pub visual_embedding_dim: Option<usize>,
+}
+
+/// Same as [`build`] but accepts a [`BuildContext`] so yoloe-visual and
+/// related kinds can resolve their per-camera prompt store.
+pub fn build_with_context(
+    cfg: &InferenceConfig,
+    ctx: &BuildContext,
+) -> Result<InferenceLayer, InferenceError> {
+    match cfg.backend {
+        InferenceBackendKind::InProcess => {
+            info!(model = %cfg.model.kind, "building in-process detector");
+            Ok(InferenceLayer {
+                detector: build_detector_with_context(cfg, ctx)?,
+                pool: None,
+            })
+        }
+        InferenceBackendKind::Pool => {
+            // Pool-mode visual-prompt wiring (per-slot store handoff) is
+            // not yet implemented — fall back to the plain `build` path.
+            // The router will warn if a camera asked for yoloe_visual on
+            // a pool backend; for now the default in-process path is the
+            // expected production shape.
+            build(cfg)
+        }
+    }
+}
+
+fn build_detector_with_context(
+    cfg: &InferenceConfig,
+    _ctx: &BuildContext,
+) -> Result<Arc<dyn Detector>, InferenceError> {
     match cfg.model.kind.as_str() {
         // Closed-vocab YOLOv26-nano shipped as the default — matches v1's
         // `models/yolo26n_dynamic.onnx` driven by the model-pack manifest's

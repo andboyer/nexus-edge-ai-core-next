@@ -45,8 +45,8 @@ pub const BOOTSTRAP_PASSWORD_BYTES: usize = 24;
 /// state for any non-first boot.
 #[derive(Debug)]
 pub enum BootstrapOutcome {
-    /// `auth.mode` doesn't allow local users (e.g. `Oidc`,
-    /// `DevToken`, `None`). Nothing to do.
+    /// `auth.mode` doesn't allow local users (e.g. `Oidc`).
+    /// Nothing to do.
     SkippedModeDisallowsLocal,
     /// `users` table already has at least one row (active,
     /// disabled, or tombstoned). Nothing to do.
@@ -212,13 +212,9 @@ mod tests {
     #[tokio::test]
     async fn skips_when_mode_disallows_local() {
         let (store, _g) = fresh_store().await;
-        // M6 Phase 4 Step 4.5 — `DevToken` only exists when the
-        // `prod-auth` feature is off. The set of "modes that don't
-        // allow local users" is therefore feature-dependent.
-        #[cfg(not(feature = "prod-auth"))]
-        let modes: &[AuthMode] = &[AuthMode::None, AuthMode::DevToken, AuthMode::Oidc];
-        #[cfg(feature = "prod-auth")]
-        let modes: &[AuthMode] = &[AuthMode::None, AuthMode::Oidc];
+        // After M-Admin Phase 0 closeout, `Oidc` is the only
+        // shipping mode that disallows local users.
+        let modes: &[AuthMode] = &[AuthMode::Oidc];
         for mode in modes.iter().copied() {
             let out = bootstrap_if_needed(&store, mode).await.unwrap();
             assert!(

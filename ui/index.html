@@ -1,33 +1,13 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" class="dark">
   <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark" />
     <title>Nexus Edge AI</title>
-    <link rel="stylesheet" href="/src/ui/styles.css" />
   </head>
   <body>
-    <div id="app">
-      <header class="topbar">
-        <span class="brand">Nexus Edge AI</span>
-        <div class="topbar-spacer"></div>
-        <div id="topbar-auth" class="topbar-auth">
-          <input
-            id="admin-token"
-            class="token-input"
-            type="password"
-            placeholder="Admin token (loopback if empty)"
-            autocomplete="off"
-            spellcheck="false"
-          />
-          <span id="token-pill" class="token-pill token-pill-unknown" title="Auth status: unknown"></span>
-        </div>
-        <span id="health-dot" class="dot dot-unknown" title="status"></span>
-      </header>
-      <nav id="sidebar" class="sidebar"></nav>
-      <main id="main"></main>
-      <aside id="alert-ticker"></aside>
-    </div>
-    <script type="module" src="/src/main.ts"></script>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

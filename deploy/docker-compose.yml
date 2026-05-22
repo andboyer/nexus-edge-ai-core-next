@@ -29,6 +29,23 @@ services:
     environment:
       - NEXUS_CONFIG=/etc/nexus/nexus.toml
       - RUST_LOG=info,nexus=debug
+      # --- OIDC client secret (optional) ---------------------------
+      # Pick exactly ONE of the two patterns below; never both.
+      #
+      # Pattern A — Docker secret (recommended for compose deploys).
+      # Uncomment the `secrets:` block on both the engine service AND
+      # at the top level, drop the secret value into the file named
+      # in the top-level `file:`, and point your nexus.toml at the
+      # mount path: `client_secret_file = "/run/secrets/oidc"`.
+      # Docker enforces mode 0400 owned by root inside the container.
+      #
+      # Pattern B — env var (recommended for k8s / PaaS, also works
+      # under compose). Uncomment and set the value in a .env file
+      # next to this compose file (never commit .env), then point
+      # your nexus.toml at: `client_secret_env = "NEXUS_OIDC_CLIENT_SECRET"`.
+      # - NEXUS_OIDC_CLIENT_SECRET=${NEXUS_OIDC_CLIENT_SECRET}
+    # secrets:
+    #   - oidc
     # GPU passthrough lives in the per-tier overlay files. Examples:
     #   Intel iGPU / Arc:   devices: ["/dev/dri:/dev/dri"]
     #   NVIDIA:             runtime: nvidia, deploy.resources.reservations.devices ...
@@ -36,3 +53,11 @@ services:
 
 volumes:
   nexus-state: {}
+
+# Top-level `secrets:` block for Pattern A above. The file path is
+# the HOST path holding the raw secret value (no newline, mode 0600).
+# Drop a 0600 file at e.g. /etc/nexus/oidc-client-secret on the host
+# and Docker bind-mounts it as /run/secrets/oidc inside the container.
+# secrets:
+#   oidc:
+#     file: /etc/nexus/oidc-client-secret

@@ -13,6 +13,7 @@ pub mod motion;
 pub mod outbox;
 pub mod sessions;
 pub mod users;
+pub mod visual_prompts;
 pub use audit::{AuditActorKind, AuditEntry, AuditFilter, AuditOutcome, NewAuditEntry};
 pub use motion::{
     ClipClose, ClipColdMark, ClipId, ClipRow, ColdReplicaRow, ColdReplicaStats, DeleteBackendError,
@@ -22,6 +23,7 @@ pub use motion::{
 pub use outbox::{OutboxRow, OutboxSinkCounts, OutboxStatus, SuppressionReason};
 pub use sessions::{NewRefreshToken, RefreshToken, RefreshTokenId, SessionsError};
 pub use users::{NewUser, User, UserId, UsersError};
+pub use visual_prompts::{NewVisualPrompt, VisualPrompt, VisualPromptError, VisualPromptSummary};
 
 /// Re-export the SQLite transaction type so downstream crates
 /// (notably nexus-engine, which doesn't depend on `sqlx`
@@ -92,6 +94,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
     (
         "0011_auth_refresh_tokens",
         include_str!("../migrations/0011_auth_refresh_tokens.sql"),
+    ),
+    (
+        "0012_visual_prompts",
+        include_str!("../migrations/0012_visual_prompts.sql"),
     ),
 ];
 
@@ -352,6 +358,44 @@ impl Store {
         Ok(())
     }
 
+    /// INSERT a new camera, letting SQLite's `INTEGER PRIMARY
+    /// KEY` rowid alias assign the id. Mutates `cam.id` to the
+    /// assigned rowid and writes the updated JSON so the
+    /// `config_json` blob carries the same id the row carries.
+    /// Used by `POST /cameras` (operator-initiated create) where
+    /// the caller has no way to invent a stable i64 id up front.
+    pub async fn create_camera_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        cam: &mut CameraConfig,
+    ) -> Result<(), StoreError> {
+        // Insert with NULL id to trigger rowid auto-assignment.
+        // `config_json` is provisionally serialised with whatever
+        // id the caller passed in (usually 0) — we rewrite it
+        // immediately after we learn the assigned rowid so the
+        // JSON copy stays consistent with the column.
+        let placeholder_json = serde_json::to_string(cam)?;
+        let res = sqlx::query(
+            "INSERT INTO cameras (id, name, url, enabled, config_json) \
+             VALUES (NULL, ?, ?, ?, ?)",
+        )
+        .bind(&cam.name)
+        .bind(cam.ingest.url.to_string())
+        .bind(cam.ingest.enabled as i64)
+        .bind(&placeholder_json)
+        .execute(&mut **tx)
+        .await?;
+        let new_id = res.last_insert_rowid();
+        cam.id = new_id;
+        let json = serde_json::to_string(cam)?;
+        sqlx::query("UPDATE cameras SET config_json = ? WHERE id = ?")
+            .bind(&json)
+            .bind(new_id)
+            .execute(&mut **tx)
+            .await?;
+        Ok(())
+    }
+
     pub async fn delete_camera(&self, id: CameraId) -> Result<(), StoreError> {
         let mut tx = self.pool.begin().await?;
         self.delete_camera_tx(&mut tx, id).await?;
@@ -390,6 +434,43 @@ impl Store {
         self.upsert_rule_tx(&mut tx, rule).await?;
         tx.commit().await?;
         Ok(())
+    }
+
+    /// Allocate the next unused `rule-<N>` id within the same tx
+    /// the caller will use for the INSERT. Scans for ids that
+    /// match the canonical auto-id format (`rule-<positive int>`),
+    /// returns `rule-{max+1}` (or `rule-1` if no auto-id rule
+    /// exists yet). Custom string ids that don't match the
+    /// pattern are ignored — they live alongside auto-ids without
+    /// pushing the sequence forward.
+    ///
+    /// Running this inside the same tx that performs the INSERT
+    /// closes the race window: SQLite's default serialised txs
+    /// are mutually exclusive on writes, so two concurrent
+    /// `POST /rules` calls can't both see the same max and pick
+    /// the same id.
+    pub async fn next_rule_id_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    ) -> Result<String, StoreError> {
+        // GLOB filters to numeric suffixes; CAST + ORDER BY DESC
+        // picks the largest numerically (not lexicographically,
+        // which would put `rule-9` after `rule-10`).
+        let row = sqlx::query(
+            "SELECT id FROM rules WHERE id GLOB 'rule-[0-9]*' \
+             ORDER BY CAST(SUBSTR(id, 6) AS INTEGER) DESC LIMIT 1",
+        )
+        .fetch_optional(&mut **tx)
+        .await?;
+        let next: u64 = match row {
+            Some(r) => {
+                let id: String = r.get(0);
+                let suffix = id.strip_prefix("rule-").unwrap_or("");
+                suffix.parse::<u64>().unwrap_or(0).saturating_add(1).max(1)
+            }
+            None => 1,
+        };
+        Ok(format!("rule-{next}"))
     }
 
     /// M6 Phase 4 Step 4.1 — tx-aware upsert. See

@@ -16,9 +16,9 @@
 //! Pipeline:
 //!
 //! ```text
-//!   rtspsrc location=URL latency=200 protocols=tcp+udp
+//!   rtspsrc location=URL latency=500 protocols=tcp
 //!     ! rtph264depay
-//!     ! h264parse config-interval=-1
+//!     ! h264parse config-interval=0
 //!     ! video/x-h264,stream-format=byte-stream,alignment=au
 //!     ! appsink name=tap emit-signals=true sync=false
 //!         max-buffers=200 drop=false
@@ -26,9 +26,28 @@
 //!
 //! `stream-format=byte-stream,alignment=au` (Annex-B, access-unit-aligned)
 //! is what mp4mux's `appsrc` feed expects when we splice the snapshot
-//! at clip-open. `config-interval=-1` re-emits SPS/PPS in front of
-//! every keyframe — critical because a snapshot starting on the
-//! Nth keyframe must carry decoder config to be playable.
+//! at clip-open.
+//!
+//! `config-interval=0` (do NOT insert SPS/PPS) is deliberate. We
+//! used to set `-1` (insert SPS/PPS before every IDR), but that
+//! interacts badly with cameras whose H.264 stream already carries
+//! SPS/PPS in every keyframe access unit (most modern IP cameras —
+//! confirmed on the InSight 192.168.1.66 fixture). With `-1`,
+//! h264parse on the ingester emits `[AUD, SPS, PPS, SPS, PPS, IDR]`.
+//! Downstream, the recorder's `h264parse → mp4mux` chain interprets
+//! the second SPS/PPS pair as the start of a *new* access unit;
+//! that synthetic AU inherits no PTS from the source buffer, and
+//! qtmux silently rejects every PTS-less buffer with the cryptic
+//! `"Could not multiplex stream."` on EOS — leaving a 864-byte
+//! ftyp+moov stub on disk. With `config-interval=0` we pass the
+//! camera's byte-stream through unchanged: cameras that already
+//! include SPS/PPS per keyframe work end-to-end, and clips for
+//! cameras that DON'T (some Axis/Hikvision models in legacy modes)
+//! only become un-decodable when the snapshot starts mid-GOP — a
+//! known limitation we can revisit by caching the most-recent
+//! SPS/PPS NALs and prepending them to AUs that lack them.
+//! See also `gst_clip_recorder::push_sample` for the per-buffer
+//! PTS synthesis that complements this fix.
 //!
 //! Re-connect strategy: the ingester runs an async supervisor that
 //! tears the pipeline down and rebuilds it on bus error or EOS, with
@@ -250,10 +269,14 @@ async fn run_session(
     // in-order delivery; the camera buffers send-side rather than
     // silently dropping. Latency bumped to 500 ms to absorb the
     // resulting in-band re-tx jitter.
+    // h264parse config-interval=0 (trust the source). See module
+    // docstring for the multi-paragraph explanation of why -1
+    // catastrophically breaks recording on cameras that already
+    // include SPS/PPS in every keyframe access unit.
     let desc = format!(
         "rtspsrc location=\"{url_safe}\" latency=500 protocols=tcp \
          ! rtph264depay \
-         ! h264parse config-interval=-1 \
+         ! h264parse config-interval=0 \
          ! video/x-h264,stream-format=byte-stream,alignment=au \
          ! appsink name=tap emit-signals=true sync=false \
              max-buffers=200 drop=false"

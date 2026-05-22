@@ -179,15 +179,31 @@ impl ProbeMatch {
     fn into_device(self) -> Option<DiscoveredDevice> {
         let (host, port) = first_xaddr_host_port(&self.xaddrs)?;
         let scopes = parse_scopes(&self.scopes);
+        // Preserve the verbatim XAddrs so the ONVIF Media probe
+        // can talk SOAP to the exact endpoint the camera
+        // advertised — some vendors put the device service on
+        // a custom path (e.g. `/onvif/Device`, not
+        // `/onvif/device_service`) and re-deriving the URL from
+        // host + port would break those.
+        let xaddrs = if self.xaddrs.trim().is_empty() {
+            None
+        } else {
+            Some(self.xaddrs.clone())
+        };
         Some(DiscoveredDevice {
             ip: host,
             port,
             kind: DeviceKind::Onvif,
+            // WS-Discovery only tells us the ONVIF web port (XAddrs
+            // is always the HTTP device_service URL). RTSP lives
+            // elsewhere — leave None and let the UI default to 554.
+            rtsp_port: None,
             vendor: scopes.vendor,
             model: scopes.name.or_else(|| scopes.hardware.clone()),
             hardware: scopes.hardware,
             firmware: scopes.firmware,
             mac: scopes.mac,
+            onvif_xaddrs: xaddrs,
             rtsp_paths: Vec::new(),
         })
     }

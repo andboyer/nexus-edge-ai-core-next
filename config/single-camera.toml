@@ -10,9 +10,9 @@ state_dir = "./data/state"
 clips_dir = "./data/clips"
 
 [server]
-# Loopback by default — required by M-Install Checkpoint 2 when
-# auth.mode = "none". For a LAN-reachable bind, switch to
-# auth.mode = "local" (or "dev_token" for a closed-lab one-box rig).
+# Loopback by default — keeps the smoke harness off the LAN.
+# For a LAN-reachable bind switch to a non-loopback address;
+# `auth.mode = "local"` below stays valid in both cases.
 # See docs/ARCHITECTURE.md §11 for the full identity matrix.
 api_bind = "127.0.0.1:8089"
 ui_root = "ui/dist"
@@ -24,10 +24,11 @@ seed_from_config = true
 [telemetry]
 log_level = "info,nexus=debug"
 
-# Explicit so the grandfather WARN doesn't fire on the dev loop.
-# Loopback bind above keeps this safe.
+# Local mode auto-provisions <state_dir>/admin-secret on first
+# boot; the smoke harness uses loopback so no actual login is
+# required.
 [auth]
-mode = "none"
+mode = "local"
 
 [inference]
 backend = "in_process"

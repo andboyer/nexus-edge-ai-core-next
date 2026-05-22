@@ -15,10 +15,29 @@
 //! on a camera the catalog won't reflect it until the next engine
 //! restart — same lifecycle as the router itself.
 
+use std::collections::BTreeMap;
+
 use serde::Serialize;
 use tracing::warn;
 
 use nexus_inference::InferenceRouter;
+
+/// Every detector kind the engine knows how to build
+/// (`crates/nexus-inference/src/lib.rs :: build_detector` match
+/// arms). Sorted alphabetically so the UI dropdown is stable
+/// regardless of `router.detectors()` iteration order. Aliases
+/// (`yolo26n`, `closed_vocab`, `open_vocab`, `ppe`) are NOT listed
+/// here — the canonical kind names are what the camera form
+/// persists.
+pub(crate) const KNOWN_KINDS: &[&str] = &[
+    "classifier_ensemble",
+    "mock",
+    "yolo",
+    "yolo_world",
+    "yoloe",
+    "yoloe_promptfree",
+    "yoloe_visual",
+];
 
 /// Top-level response shape returned by `GET /api/v1/models/prompts`.
 #[derive(Clone, Serialize)]
@@ -28,19 +47,26 @@ pub struct ModelPromptsCatalog {
     /// against. The UI uses this to pick a prompt source when a
     /// camera has no override.
     pub default_kind: String,
-    /// One entry per detector kind the router currently has a
-    /// layer for. Always includes `default_kind`.
+    /// One entry per detector kind the engine knows how to build,
+    /// regardless of whether the router currently has a layer for
+    /// it. The UI camera form lets operators select any of these
+    /// as an override; `loaded` indicates whether picking it would
+    /// require an engine restart to materialise the layer.
     pub kinds: Vec<DetectorPromptInfo>,
+    /// Same entries as `kinds`, indexed by `kind` for cheap O(1)
+    /// lookup. The UI's chip-suggestion path consumes this shape;
+    /// the array form is kept for stable ordering in the dropdown.
+    pub by_kind: BTreeMap<String, DetectorPromptInfo>,
 }
 
 #[derive(Clone, Serialize)]
 pub struct DetectorPromptInfo {
     pub kind: String,
-    /// Open-vocab detectors (yolo_world) accept any user-supplied
-    /// prompt string and emit only labels from the baked vocab.
-    /// Closed-vocab detectors (yolo / classifier_ensemble) emit a
-    /// fixed label set so the UI should render a chip strip rather
-    /// than a free-text suggestion box.
+    /// Open-vocab detectors (yolo_world / yoloe) accept any
+    /// user-supplied prompt string and emit only labels from the
+    /// baked vocab. Closed-vocab detectors (yolo / classifier_ensemble)
+    /// emit a fixed label set so the UI should render a chip strip
+    /// rather than a free-text suggestion box.
     pub open_vocab: bool,
     /// Every label this detector kind is known to emit. Empty for
     /// detectors whose vocabulary is unknown (e.g. `mock`) — the
@@ -53,6 +79,13 @@ pub struct DetectorPromptInfo {
     /// Human-readable note describing the detector. Shown beneath
     /// the chip strip in the camera form.
     pub note: Option<String>,
+    /// `true` IFF the router has already built a layer for this
+    /// kind at engine boot. Operators who pick an unloaded kind
+    /// as a camera `model_override` won't see it take effect
+    /// until the engine restarts (the router only walks the
+    /// camera table once, at startup). The UI uses this flag to
+    /// surface a "restart engine to activate" hint.
+    pub loaded: bool,
 }
 
 #[derive(Clone, Serialize)]
@@ -61,24 +94,38 @@ pub struct DetectorPromptGroup {
     pub labels: Vec<String>,
 }
 
-/// Build the catalog by walking the router's detectors and
-/// resolving each kind's prompt vocabulary. For `yolo_world` this
-/// reads the model-pack `models-manifest.json`; for `yolo` we
-/// hard-code the COCO→domain mapping that mirrors
+/// Build the catalog by enumerating every detector kind the
+/// engine knows how to build and resolving each kind's prompt
+/// vocabulary. For `yolo_world` / `yoloe` this reads the
+/// model-pack `models-manifest.json`; for `yolo` we hard-code
+/// the COCO→domain mapping that mirrors
 /// `crates/nexus-inference/src/yolo.rs::map_coco_to_domain_label`.
 pub fn build_catalog(
     inference_cfg: &nexus_config::InferenceConfig,
     router: &InferenceRouter,
 ) -> ModelPromptsCatalog {
     let default_kind = inference_cfg.model.kind.clone();
-    let kinds = router
+    let loaded: std::collections::HashSet<String> = router
         .detectors()
         .into_iter()
-        .map(|(kind, _)| info_for_kind(&kind, inference_cfg))
+        .map(|(k, _)| k)
+        .collect();
+    let kinds: Vec<DetectorPromptInfo> = KNOWN_KINDS
+        .iter()
+        .map(|k| {
+            let mut info = info_for_kind(k, inference_cfg);
+            info.loaded = loaded.contains(*k);
+            info
+        })
+        .collect();
+    let by_kind: BTreeMap<String, DetectorPromptInfo> = kinds
+        .iter()
+        .map(|info| (info.kind.clone(), info.clone()))
         .collect();
     ModelPromptsCatalog {
         default_kind,
         kinds,
+        by_kind,
     }
 }
 
@@ -86,6 +133,9 @@ fn info_for_kind(kind: &str, cfg: &nexus_config::InferenceConfig) -> DetectorPro
     match kind {
         "yolo" | "yolo26n" | "closed_vocab" => coco_info(kind),
         "open_vocab" | "yolo_world" => yolo_world_info(kind, cfg),
+        "yoloe" => yoloe_text_info(kind, cfg),
+        "yoloe_promptfree" => yoloe_promptfree_info(kind, cfg),
+        "yoloe_visual" => yoloe_visual_info(kind),
         "classifier_ensemble" | "ppe" => DetectorPromptInfo {
             kind: kind.into(),
             open_vocab: false,
@@ -96,6 +146,7 @@ fn info_for_kind(kind: &str, cfg: &nexus_config::InferenceConfig) -> DetectorPro
                  no per-class labels. Rules can match `object.attributes['ppe.helmet']`."
                     .into(),
             ),
+            loaded: false,
         },
         "mock" => DetectorPromptInfo {
             kind: kind.into(),
@@ -105,6 +156,7 @@ fn info_for_kind(kind: &str, cfg: &nexus_config::InferenceConfig) -> DetectorPro
             note: Some(
                 "Mock detector — emits deterministic placeholder boxes (no real labels).".into(),
             ),
+            loaded: false,
         },
         other => DetectorPromptInfo {
             kind: other.into(),
@@ -112,6 +164,7 @@ fn info_for_kind(kind: &str, cfg: &nexus_config::InferenceConfig) -> DetectorPro
             prompts: vec![],
             groups: vec![],
             note: Some(format!("Unknown detector kind {other:?}.")),
+            loaded: false,
         },
     }
 }
@@ -164,6 +217,7 @@ fn coco_info(kind: &str) -> DetectorPromptInfo {
              (e.g. `object.label == 'vehicle.car'`)."
                 .into(),
         ),
+        loaded: false,
     }
 }
 
@@ -190,6 +244,76 @@ fn yolo_world_info(kind: &str, cfg: &nexus_config::InferenceConfig) -> DetectorP
              not in this list will never fire."
                 .into(),
         ),
+        loaded: false,
+    }
+}
+
+fn yoloe_text_info(kind: &str, cfg: &nexus_config::InferenceConfig) -> DetectorPromptInfo {
+    let prompts = match read_manifest_prompts(cfg, "yoloe26_s") {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(
+                kind, error = %e,
+                "model catalog: yoloe vocab unavailable; falling back to empty prompt list \
+                 (run tools/models/gen_yoloe.py to materialise the artifact + manifest entry)"
+            );
+            Vec::new()
+        }
+    };
+    DetectorPromptInfo {
+        kind: kind.into(),
+        open_vocab: true,
+        prompts,
+        groups: vec![],
+        note: Some(
+            "Open-vocab YOLOE (text-prompt mode). Vocabulary is baked at \
+             export time via tools/models/gen_yoloe.py; per-camera \
+             `prompts` selects a subset to emit."
+                .into(),
+        ),
+        loaded: false,
+    }
+}
+
+fn yoloe_promptfree_info(kind: &str, cfg: &nexus_config::InferenceConfig) -> DetectorPromptInfo {
+    // Prompt-free wraps the same yoloe26 graph but ignores per-camera
+    // prompt subsets and caps results at model.top_k. Surface the
+    // identical baked vocabulary so the UI can show what *could*
+    // come out before top_k truncation.
+    let prompts = match read_manifest_prompts(cfg, "yoloe26_s") {
+        Ok(p) => p,
+        Err(_) => Vec::new(),
+    };
+    DetectorPromptInfo {
+        kind: kind.into(),
+        open_vocab: true,
+        prompts,
+        groups: vec![],
+        note: Some(
+            "Prompt-free YOLOE — ignores per-camera `prompts` and \
+             emits every label above the score threshold, capped at \
+             `inference.model.top_k`. Useful for triage / discovery."
+                .into(),
+        ),
+        loaded: false,
+    }
+}
+
+fn yoloe_visual_info(kind: &str) -> DetectorPromptInfo {
+    DetectorPromptInfo {
+        kind: kind.into(),
+        open_vocab: false,
+        prompts: vec![],
+        groups: vec![],
+        note: Some(
+            "Visual-prompt YOLOE — classes are defined by image \
+             embeddings stored in the visual-prompt library. Attach \
+             a visual prompt to the camera in the Visual Prompts tab; \
+             this detector does not consume the per-camera `prompts` \
+             text list."
+                .into(),
+        ),
+        loaded: false,
     }
 }
 

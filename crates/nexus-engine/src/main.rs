@@ -6,13 +6,14 @@ use clap::{Parser, ValueEnum};
 use nexus_bus::build_bus;
 use nexus_config::{CameraConfig, Config, InferenceConfig, RecorderKind};
 use nexus_inference::InferenceRouter;
-use nexus_pipeline::{spawn_camera, LatestFrameCache};
+use nexus_pipeline::{spawn_camera, FrameStatsRegistry, LatestFrameCache, StaticAnchorClearRegistry};
 use nexus_rules::RuleEvaluator;
 use nexus_store::Store;
 use nexus_tracker::build_tracker;
 use tracing::{info, warn};
 
 mod admin_auth;
+mod admin_runtime;
 mod api;
 mod audit_retention;
 mod auth;
@@ -23,17 +24,20 @@ mod delivery_reload;
 mod discovery;
 #[cfg(unix)]
 mod fd_limit;
+mod gpu;
 mod models_catalog;
 mod oauth_sessions;
 mod reconciler;
 mod retention;
 mod storage_safety;
+mod system_metrics;
 // M7 Step 6F2 — only compiled when the `test-injection` feature
 // is on (off in any production build). Wires the dev-only
 // `POST /api/v1/_test/inject_event` handler.
 #[cfg(feature = "test-injection")]
 mod test_inject;
 mod usb_watch;
+mod visual_prompts_admin;
 
 /// Default config path used when neither `--config` nor `--tier` is given.
 /// Matches the M0/M1 dev-loop expectation (run from repo root).
@@ -138,6 +142,7 @@ fn main() -> Result<()> {
     let config_path = cli.resolved_config_path();
     let (mut cfg, compat) = Config::load_with_compat(&config_path)
         .with_context(|| format!("loading config {:?}", config_path))?;
+    let _ = compat; // CompatNotice is currently empty; kept for future shims.
     if cli.mock_detector {
         cfg.inference.model.kind = "mock".into();
     }
@@ -155,18 +160,18 @@ fn main() -> Result<()> {
         let _ = fd_limit::raise_fd_soft_limit();
     }
 
-    // Apply M-Install Checkpoint 2 auth posture rules:
-    // - WARN about grandfathered missing-[auth]-section configs
-    // - auto-provision dev_token at <state_dir>/dev-token when needed
-    // - refuse to boot if mode = none + non-loopback bind
+    // Apply M-Admin Phase 0 auth posture rules:
+    // - auto-provision the admin-secret file under
+    //   <state_dir>/admin-secret when mode = local | hybrid and no
+    //   path is pinned in nexus.toml
+    // - leave OIDC-only deployments alone
     //
-    // Tracing isn't initialised yet, so the WARN+INFO emitted by
+    // Tracing isn't initialised yet, so any messages emitted by
     // auth_bootstrap reach stderr through the global default
-    // subscriber (no JSON formatting, no OTLP). That is intentional
-    // — the operator-visible secret-token line MUST land before
-    // anything else can swallow it.
+    // subscriber. That is intentional — the operator-visible
+    // bootstrap line MUST land before anything else can swallow it.
     let state_dir = auth_bootstrap::state_dir(&cfg);
-    auth_bootstrap::apply(&mut cfg, &state_dir, compat)?;
+    auth_bootstrap::apply(&mut cfg, &state_dir)?;
 
     let runtime = build_runtime(&cfg.runtime)?;
     runtime.block_on(run(cfg, cli))
@@ -190,6 +195,50 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
     if cfg.store.seed_from_config {
         store.seed_from_config_if_empty(&cfg).await?;
     }
+
+    // M-Admin Phase 0 — apply any operator-persisted auth
+    // override BEFORE we touch `cfg.auth` for bootstrap, OIDC
+    // discovery, or the admin-auth-state builder. Mirrors the
+    // `preferred_usb_label` precedence: a stored row wins over
+    // `nexus.toml`. Failure to decode an existing row is loud
+    // (we want the operator to notice) but non-fatal — we fall
+    // back to the on-disk config so a corrupt setting can't
+    // hard-brick the engine.
+    let mut cfg = cfg;
+    match store.read_runtime_setting("auth_config_json").await {
+        Ok(Some(Some(json))) => match serde_json::from_str::<nexus_config::AuthConfig>(&json) {
+            Ok(parsed) => {
+                tracing::warn!(
+                    mode = ?parsed.mode,
+                    "applying operator-persisted auth.config from engine_runtime_settings (overrides nexus.toml)",
+                );
+                cfg.auth = parsed;
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "engine_runtime_settings.auth_config_json failed to decode; falling back to nexus.toml",
+                );
+            }
+        },
+        Ok(Some(None)) => {
+            tracing::debug!("auth_config_json present but NULL; using nexus.toml");
+        }
+        Ok(None) => {}
+        Err(e) => {
+            tracing::warn!(error = %e, "could not read auth_config_json from engine_runtime_settings; using nexus.toml");
+        }
+    }
+
+    // M-Admin Phase 0 follow-up — apply any operator-persisted
+    // inference-model override BEFORE we hand `cfg.inference`
+    // to the InferenceRouter / pool / catalog builders. The
+    // router is built once at boot from the merged ModelConfig
+    // and not rebuilt per-frame, so any value we don't fold in
+    // here will never take effect for the duration of the
+    // process. See [`admin_runtime::resolve_persisted_inference_model`].
+    cfg.inference.model =
+        admin_runtime::resolve_persisted_inference_model(&store, &cfg.inference.model).await;
 
     // M6 Phase 2 Step 2.7 — first-boot admin bootstrap. Runs
     // exactly once across the lifetime of the database file;
@@ -236,6 +285,60 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
     // log in until the IdP recovers + the engine is bounced.
     let oidc_login_state = match (cfg.auth.mode.allows_oidc(), cfg.auth.oidc.as_ref()) {
         (true, Some(oidc_cfg)) => {
+            // Resolve the optional client_secret ONCE at boot
+            // from either a file or an env var (mutually
+            // exclusive). Failure here is fatal — the operator
+            // asked us to use a confidential-client secret and
+            // we can't, so refusing to start is safer than
+            // silently downgrading to PKCE-only.
+            let client_secret = match (
+                oidc_cfg.client_secret_file.as_ref(),
+                oidc_cfg.client_secret_env.as_ref(),
+            ) {
+                (Some(_), Some(_)) => {
+                    return Err(anyhow::anyhow!(
+                        "auth.oidc.client_secret_file and \
+                         auth.oidc.client_secret_env are mutually \
+                         exclusive; pick one"
+                    ));
+                }
+                (Some(path), None) => {
+                    let raw = std::fs::read_to_string(path).with_context(|| {
+                        format!("reading auth.oidc.client_secret_file at {}", path.display())
+                    })?;
+                    let trimmed = raw.trim().to_string();
+                    if trimmed.is_empty() {
+                        return Err(anyhow::anyhow!(
+                            "auth.oidc.client_secret_file at {} is empty",
+                            path.display()
+                        ));
+                    }
+                    tracing::info!(
+                        path = %path.display(),
+                        "OIDC client_secret loaded from file (length redacted)",
+                    );
+                    Some(std::sync::Arc::new(trimmed))
+                }
+                (None, Some(var)) => {
+                    let raw = std::env::var(var).map_err(|_| {
+                        anyhow::anyhow!(
+                            "auth.oidc.client_secret_env points at ${var} but that env var is unset"
+                        )
+                    })?;
+                    let trimmed = raw.trim().to_string();
+                    if trimmed.is_empty() {
+                        return Err(anyhow::anyhow!(
+                            "auth.oidc.client_secret_env (${var}) is empty"
+                        ));
+                    }
+                    tracing::info!(
+                        env_var = %var,
+                        "OIDC client_secret loaded from env var (length redacted)",
+                    );
+                    Some(std::sync::Arc::new(trimmed))
+                }
+                (None, None) => None,
+            };
             match auth::oidc::OidcClient::discover(oidc_cfg.clone()).await {
                 Ok(client) => {
                     let client = std::sync::Arc::new(client);
@@ -255,6 +358,7 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
                         oidc_client: client,
                         cfg: oidc_cfg.clone(),
                         sessions: auth::oidc_login::OidcLoginSessions::new(),
+                        client_secret,
                     })
                 }
                 Err(e) => {
@@ -292,14 +396,40 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
     // camera (default + each unique override). Keeping disabled cameras
     // in the build set means re-enabling at runtime doesn't require a
     // process restart.
+    //
+    // M3.1: pass a Store-backed VisualPromptStore so the `yoloe_visual`
+    // arm (text-prompt-free open-vocab via image embeddings) can hydrate
+    // per-camera bindings on every `push_camera_config` without a
+    // restart. The optional embedding-dim override is None today —
+    // detector defaults to 512 (yoloe26_s_image_encoder).
+    let visual_prompt_store: Arc<dyn nexus_inference::VisualPromptStore> = Arc::new(
+        nexus_inference::StoreBackedVisualPromptStore::new(store.clone()),
+    );
     let router = Arc::new(
-        InferenceRouter::build(&cfg.inference, &cameras).context("building inference router")?,
+        InferenceRouter::build_with_visual_store(
+            &cfg.inference,
+            &cameras,
+            Some(visual_prompt_store),
+            None,
+        )
+        .context("building inference router")?,
     );
     let pool = router.default_pool();
     log_inference_summary(&cfg.inference, pool.is_some(), &router);
 
-    let tracker: Arc<dyn nexus_tracker::Tracker> = Arc::from(build_tracker(&cfg.tracker));
+    // Trackers are stateful (track ids, IoU history) and MUST be
+    // instantiated per-camera — a shared `Arc<dyn Tracker>` would
+    // merge every camera's detections into one global track table,
+    // surfacing camera A's bboxes (and track ids) in camera B's
+    // L7-cache entry / `/api/cameras/:id/frames/latest.json`. The
+    // reconciler now owns construction; the boot loop below builds
+    // its own per spawn from the same `cfg.tracker` snapshot.
     let cache = Arc::new(LatestFrameCache::new());
+    // M-Admin Phase 0 closeout: per-camera frame-stats registry.
+    // Shared between every supervisor task (writer) and the API
+    // layer (reader: `GET /v1/cameras/:id/stats` and the merged
+    // health column on `GET /api/cameras`).
+    let frame_stats = Arc::new(FrameStatsRegistry::new());
 
     // Recorder is a per-process singleton: the watermark sampler
     // (storage_safety) and every per-camera supervisor share the
@@ -366,6 +496,11 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
     // because the reconciler may add/remove entries at any time.
     let running: reconciler::HandleMap =
         Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+    // Shared bus that lets `DELETE /api/cameras/{id}/static-anchors`
+    // signal the per-camera supervisor to wipe its in-memory
+    // anchor state + on-disk registry. See `static_clear.rs` in
+    // nexus-pipeline for the polled-counter rationale.
+    let static_clear = StaticAnchorClearRegistry::new();
     for cam in cameras {
         if !cam.ingest.enabled {
             warn!(camera_id = cam.id, "camera disabled — skipping");
@@ -374,10 +509,14 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
         let cam_id = cam.id;
         let cam_url = cam.ingest.url.to_string();
         let detector = router.detector_for_camera(&cam);
+        // Fresh per-camera tracker — see the comment on `cfg.tracker`
+        // above for why sharing one Arc across cameras is wrong.
+        let tracker: Arc<dyn nexus_tracker::Tracker> =
+            Arc::from(build_tracker(&cfg.tracker));
         let h = spawn_camera(
             cam,
             detector,
-            tracker.clone(),
+            tracker,
             cfg.tracker.annotator.clone(),
             cfg.tracker.static_object.clone(),
             cfg.runtime.clips.clone(),
@@ -387,6 +526,8 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
             recorder.clone(),
             bus.clone(),
             cache.clone(),
+            frame_stats.clone(),
+            static_clear.clone(),
         );
         running.lock().insert(
             cam_id,
@@ -400,10 +541,19 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
     // Storage safety floor (M2.1 Stage A PR 4). Watermark sampler
     // shares the same recorder Arc as the per-camera supervisors
     // above so panic-mode flips propagate atomically.
+    //
+    // M-Admin Phase 0 — operator-persisted overrides win over
+    // nexus.toml. Mirrors the api_bind / auth_config_json pattern.
+    let (effective_low_pct, effective_panic_pct) = admin_runtime::resolve_persisted_watermarks(
+        &store,
+        cfg.runtime.clips.low_watermark_pct,
+        cfg.runtime.clips.panic_watermark_pct,
+    )
+    .await;
     let safety_cfg = storage_safety::StorageSafetyConfig {
         clips_dir: clips_dir.clone(),
-        low_watermark_pct: cfg.runtime.clips.low_watermark_pct,
-        panic_watermark_pct: cfg.runtime.clips.panic_watermark_pct,
+        low_watermark_pct: effective_low_pct,
+        panic_watermark_pct: effective_panic_pct,
         sample_interval: std::time::Duration::from_secs(
             cfg.runtime.clips.watermark_sample_interval_secs.max(1) as u64,
         ),
@@ -579,7 +729,7 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
     // engine restart.
     let reconciler_handle = reconciler::spawn(reconciler::ReconcilerArgs {
         router: router.clone(),
-        tracker: tracker.clone(),
+        tracker_cfg: cfg.tracker.clone(),
         annotator: cfg.tracker.annotator.clone(),
         static_object: cfg.tracker.static_object.clone(),
         clips: cfg.runtime.clips.clone(),
@@ -589,6 +739,8 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
         recorder: recorder.clone(),
         bus: bus.clone(),
         cache: cache.clone(),
+        frame_stats: frame_stats.clone(),
+        static_clear: static_clear.clone(),
         pre_roll_secs: cfg.runtime.clips.pre_roll_secs,
         handles: running.clone(),
     });
@@ -611,14 +763,21 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
     let api_state = api::ApiState {
         store: store.clone(),
         bus: bus.clone(),
+        // Provisional — overwritten below when `--no-api` is off
+        // with the actual bind we end up listening on (which may
+        // be the operator-persisted override). Kept on ApiState
+        // so `GET /v1/admin/server/bind` can report the active
+        // value without re-reading config.
+        current_bind: cfg.server.api_bind.clone(),
         evaluator: evaluator.clone(),
         cache: cache.clone(),
+        frame_stats: frame_stats.clone(),
         pool: pool.clone(),
         ui_root: cfg.server.ui_root.clone(),
         recorder: recorder.clone(),
         clips_dir: clips_dir.clone(),
-        low_watermark_pct: cfg.runtime.clips.low_watermark_pct,
-        panic_watermark_pct: cfg.runtime.clips.panic_watermark_pct,
+        low_watermark_pct: effective_low_pct,
+        panic_watermark_pct: effective_panic_pct,
         registry: registry.clone(),
         cache_jobs: cache_jobs.clone(),
         usb_registry: usb_registry.clone(),
@@ -672,6 +831,37 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
                 .unwrap_or_else(|| "single sign-on".to_string())
         }),
         oidc_login: oidc_login_state,
+        // M3.1 Phase H — visual-prompts admin runtime state.
+        // Resolves the image-encoder ONNX path against
+        // `inference.model.pack_path` (so the same pack directory
+        // that ships the detector also ships the encoder); the
+        // upload handler 503s when the operator hasn't set a pack
+        // path yet. Encoder session is lazy-init on first POST.
+        visual_prompts: visual_prompts_admin::VisualPromptsAdminState::from_config(
+            &cfg.runtime,
+            &cfg.inference,
+        ),
+        // M-Admin Phase 0 follow-up — snapshot the effective
+        // inference model (after the persisted override has
+        // already been merged onto `nexus.toml` further up in
+        // this function) so `GET /v1/admin/server/inference`
+        // can diff the active value against any newer pending
+        // override.
+        current_inference_model: std::sync::Arc::new(cfg.inference.model.clone()),
+        // Shared with every supervisor + the static-anchors
+        // viewer overlay endpoint. Snapshot, not live-reloaded —
+        // `runtime.state_dir` is a restart-required setting.
+        state_dir: cfg.runtime.state_dir.clone(),
+        // Operator-initiated static-anchor wipe signal. Shared with
+        // every supervisor; the `DELETE /api/cameras/{id}/static-anchors`
+        // handler bumps the per-camera counter and the supervisor
+        // notices on its next frame.
+        static_clear: static_clear.clone(),
+        // Engine-wide fallback for `behavior.anchor_ttl_secs`.
+        // Snapshot at boot; surfaced verbatim by
+        // `GET /api/v1/system/static-object-defaults` so the camera
+        // settings form can hint the inherited value.
+        default_anchor_ttl_secs: cfg.tracker.static_object.anchor_ttl_secs,
     };
 
     // M-Admin Phase 1B — start the registry eviction sweep. Holds
@@ -680,7 +870,33 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
     discovery::spawn_eviction_sweep(api_state.discovery_sessions.clone());
 
     if !cli.no_api {
-        let bind = cfg.server.api_bind.clone();
+        // M-Admin Phase 0 — operator-persisted bind override
+        // wins over `nexus.toml`. Stored as a plain `host:port`
+        // string in `engine_runtime_settings.api_bind`. Same
+        // failure shape as the auth override above: loud +
+        // non-fatal so a typo in the persisted value falls back
+        // to the on-disk config rather than bricking the listener.
+        let bind = match store.read_runtime_setting("api_bind").await {
+            Ok(Some(Some(persisted))) => {
+                tracing::warn!(
+                    persisted = %persisted,
+                    toml = %cfg.server.api_bind,
+                    "applying operator-persisted server.bind from engine_runtime_settings",
+                );
+                persisted
+            }
+            Ok(Some(None)) => {
+                tracing::debug!("api_bind present but NULL; using nexus.toml");
+                cfg.server.api_bind.clone()
+            }
+            Ok(None) => cfg.server.api_bind.clone(),
+            Err(e) => {
+                tracing::warn!(error = %e, "could not read api_bind from engine_runtime_settings; using nexus.toml");
+                cfg.server.api_bind.clone()
+            }
+        };
+        let mut api_state = api_state;
+        api_state.current_bind = bind.clone();
         let app = api::router(api_state);
         let listener = tokio::net::TcpListener::bind(&bind).await?;
         info!(bind = %bind, "HTTP API + UI listening");

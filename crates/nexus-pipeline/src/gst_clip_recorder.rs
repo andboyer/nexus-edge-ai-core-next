@@ -5,10 +5,46 @@
 //!
 //! ```text
 //!   appsrc name=src is-live=true format=time do-timestamp=false
-//!     ! h264parse config-interval=-1
+//!     ! h264parse config-interval=0
 //!     ! mp4mux fragment-duration=5000 streamable=true faststart=true
 //!     ! filesink location=/var/lib/nexus/clips/cam1/...mp4
 //! ```
+//!
+//! `config-interval=0` (trust the source) is critical: the upstream
+//! [`PreRollIngester`] already runs its own h264parse and emits
+//! source-natural byte-stream with SPS+PPS in front of every IDR
+//! (true for every modern IP camera we've tested — InSight, Reolink,
+//! mediamtx loopbacks). If this h264parse uses `config-interval=-1`
+//! ("insert SPS+PPS before every IDR") it DOUBLES the parameter sets
+//! to `[AUD, SPS, PPS, SPS, PPS, IDR]`. The duplicated SPS/PPS look
+//! like the start of a NEW access unit to the parser's own framing
+//! logic; the synthetic AU inherits no PTS from the source buffer,
+//! and mp4mux silently rejects every PTS-less buffer with the
+//! cryptic `error: Buffer has no PTS.` (gstqtmux.c:5927). The on-
+//! disk file ends at 864 bytes (ftyp+moov stub) and the bus error
+//! at EOS is the generic `Could not multiplex stream.` with no
+//! further context. Diagnose with `GST_DEBUG=qtmux:5,h264parse:4`.
+//!
+//! Same-PTS sample coalescing ([`coalesce_same_pts`]): some IP
+//! cameras (the InSight at `192.168.1.66` on our bench, both
+//! `stream1` and `stream2`) emit access units the upstream
+//! [`PreRollIngester`]'s h264parse splits into TWO appsink
+//! emissions sharing one PTS — one tiny buffer carrying just
+//! `[AUD, SEI]` (~35 bytes) and a second carrying the actual
+//! `[slice ...]` payload. The recorder's h264parse sees these as
+//! two separate AUs; it emits the first to mp4mux as a 35-byte
+//! buffer WITH NO PTS (because the AU it represents is incomplete
+//! until the slice arrives) which mp4mux flags as
+//! `Sample with zero duration ... due to missing or backward
+//! timestamps`. The very next valid buffer then trips the
+//! `Buffer has no PTS` error against the cached previous buffer
+//! and the whole clip dies at 864 bytes. We re-aggregate by
+//! buffering any sample whose PTS equals the pending sample's PTS
+//! and concatenating their byte-stream data into one push — both
+//! in the snapshot pre-push pass and in the live pump. mp4mux
+//! sees one PTS-bearing AU per frame and writes a healthy clip.
+//! Live-pump pending buffers are flushed on a 200 ms inactivity
+//! timer so a stalled stream can't strand the very last AU.
 //!
 //! At [`ClipRecorder::open`]:
 //!
@@ -226,10 +262,15 @@ impl GstClipRecorder {
         // disk stalls, which keeps the upstream broadcast channel from
         // filling up and dropping samples (the most common cause of
         // visibly choppy clips).
+        // h264parse config-interval=0 (trust the source). See module
+        // docstring: -1 doubles SPS/PPS because the upstream ingester
+        // already includes them per-keyframe, which makes mp4mux drop
+        // every buffer with "Buffer has no PTS." and the output is
+        // an 864-byte ftyp+moov stub.
         format!(
             "appsrc name=src is-live=false format=time do-timestamp=false \
                      stream-type=stream max-bytes=67108864 block=true \
-             ! h264parse config-interval=-1 \
+             ! h264parse config-interval=0 \
              ! video/x-h264,stream-format=avc,alignment=au \
              ! mp4mux fragment-duration=5000 streamable=true faststart=true \
              ! filesink location=\"{location_safe}\" sync=false"
@@ -367,22 +408,52 @@ impl ClipRecorder for GstClipRecorder {
         // block=true can stall briefly on filesink/disk pressure
         // (and we MUST NOT block the tokio worker on a GStreamer
         // synchronous call).
+        //
+        // Pre-pass: coalesce any consecutive samples sharing a PTS
+        // into one combined sample so the recorder's h264parse sees
+        // a complete AU per push. See `coalesce_same_pts` for why
+        // the InSight cameras need this.
         let snapshot_tail_pts = snapshot.iter().filter_map(|s| s.pts).next_back();
-        let snapshot_for_blocking = snapshot;
-        let appsrc_for_blocking = appsrc.clone();
-        let preroll_count = match tokio::task::spawn_blocking(move || {
-            let mut n = 0usize;
-            for sample in &snapshot_for_blocking {
-                push_sample(&appsrc_for_blocking, sample, base_pts).map_err(|e| {
-                    RecorderError::Io(std::io::Error::other(format!("push pre-roll sample: {e}")))
-                })?;
-                n += 1;
+        let snapshot_for_blocking: Vec<NalSample> = {
+            let mut pending: Option<NalSample> = None;
+            let mut out: Vec<NalSample> = Vec::with_capacity(snapshot.len());
+            for s in snapshot {
+                if let Some(flushed) = coalesce_same_pts(&mut pending, s) {
+                    out.push(flushed);
+                }
             }
-            Ok::<usize, RecorderError>(n)
-        })
+            if let Some(last) = pending.take() {
+                out.push(last);
+            }
+            out
+        };
+        let appsrc_for_blocking = appsrc.clone();
+        let (preroll_count, preroll_last_written_pts_ns) = match tokio::task::spawn_blocking(
+            move || {
+                let mut n = 0usize;
+                let mut last_written: Option<u64> = None;
+                for sample in &snapshot_for_blocking {
+                    let written = push_sample(
+                        &appsrc_for_blocking,
+                        sample,
+                        base_pts,
+                        last_written,
+                        FALLBACK_FRAME_INTERVAL_NS,
+                    )
+                    .map_err(|e| {
+                        RecorderError::Io(std::io::Error::other(format!(
+                            "push pre-roll sample: {e}"
+                        )))
+                    })?;
+                    last_written = Some(written);
+                    n += 1;
+                }
+                Ok::<(usize, Option<u64>), RecorderError>((n, last_written))
+            },
+        )
         .await
         {
-            Ok(Ok(n)) => n,
+            Ok(Ok((n, last))) => (n, last),
             Ok(Err(e)) => {
                 let _ = pipeline.set_state(gst::State::Null);
                 return Err(e);
@@ -430,6 +501,7 @@ impl ClipRecorder for GstClipRecorder {
             live_rx,
             base_pts,
             last_pushed_pts,
+            preroll_last_written_pts_ns,
             pump_stop_rx,
         ));
 
@@ -516,8 +588,21 @@ impl ClipRecorder for GstClipRecorder {
                     Some(msg) => match msg.view() {
                         gst::MessageView::Eos(..) => return,
                         gst::MessageView::Error(e) => {
-                            warn!(error = %e.error(), "gst recorder bus error during close drain");
+                            warn!(
+                                error = %e.error(),
+                                debug = %e.debug().unwrap_or_else(|| "<none>".into()),
+                                src = ?e.src().map(|s| s.path_string()),
+                                "gst recorder bus error during close drain"
+                            );
                             return;
+                        }
+                        gst::MessageView::Warning(w) => {
+                            warn!(
+                                warning = %w.error(),
+                                debug = %w.debug().unwrap_or_else(|| "<none>".into()),
+                                src = ?w.src().map(|s| s.path_string()),
+                                "gst recorder bus warning during close drain"
+                            );
                         }
                         _ => {}
                     },
@@ -769,15 +854,105 @@ async fn hash_file_sha256(path: &Path) -> std::io::Result<String> {
     Ok(hex)
 }
 
+/// Re-aggregate a single logical access unit that the upstream
+/// ingester's h264parse split across two appsink emissions sharing
+/// one PTS (the InSight 192.168.1.66 cameras do this — see the
+/// module docstring for the full pathology).
+///
+/// State: caller holds a mutable `Option<NalSample>` slot. For each
+/// incoming `NalSample`:
+///
+/// * If the slot is empty, store `incoming` there and return `None`.
+/// * If the slot's `pts` matches `incoming.pts` (and both are
+///   `Some`), concatenate `incoming.data` onto the pending sample's
+///   data, OR-combine `is_keyframe`, prefer the earlier `dts`, and
+///   return `None`. The merged sample stays in the slot.
+/// * Otherwise the pending sample is now complete — swap it out and
+///   return it; `incoming` takes its place in the slot.
+///
+/// Callers are responsible for draining the slot when no more
+/// samples are coming (end of snapshot, stop signal, inactivity
+/// timer). Returning `None` does **not** mean "drop this sample";
+/// it means "still buffering".
+fn coalesce_same_pts(
+    pending: &mut Option<NalSample>,
+    incoming: NalSample,
+) -> Option<NalSample> {
+    match pending.take() {
+        None => {
+            *pending = Some(incoming);
+            None
+        }
+        Some(prev) => {
+            // Only merge when BOTH carry the same Some(pts). Two
+            // None-PTS samples are NOT considered a match — the
+            // PTS-synthesis path in push_sample handles those
+            // individually, and merging by accident would lose
+            // frames if the source ever legitimately emits
+            // multiple PTS-less samples in a row.
+            if prev.pts.is_some() && prev.pts == incoming.pts {
+                let mut merged = prev;
+                merged.data.extend_from_slice(&incoming.data);
+                merged.is_keyframe = merged.is_keyframe || incoming.is_keyframe;
+                // Prefer the earlier (smaller) dts so monotonic
+                // expectations downstream still hold.
+                merged.dts = match (merged.dts, incoming.dts) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (Some(a), None) => Some(a),
+                    (None, Some(b)) => Some(b),
+                    (None, None) => None,
+                };
+                *pending = Some(merged);
+                None
+            } else {
+                *pending = Some(incoming);
+                Some(prev)
+            }
+        }
+    }
+}
+
 /// Push one [`NalSample`] into appsrc, rebasing PTS/DTS so the
 /// recording's timeline starts at zero. `appsrc` is configured with
 /// `block=true`, so this call may block on filesink/disk pressure;
 /// callers MUST run it inside a `spawn_blocking` (the live pump
 /// already does, the snapshot prepend in `open()` runs once on the
 /// open path which is acceptable).
-fn push_sample(appsrc: &AppSrc, sample: &NalSample, base_pts: Duration) -> Result<(), String> {
+///
+/// **PTS is ALWAYS set on the outgoing buffer**, even when
+/// `sample.pts` is `None`. mp4mux/qtmux silently rejects every
+/// buffer after the first that has no PTS — the on-disk file
+/// stays as a 864-byte ftyp+moov stub, the close drain trips
+/// `Could not multiplex stream.`, and no operator-visible error
+/// is logged from inside the muxer itself. Some IP cameras (the
+/// InSight at `192.168.1.66` on our test bench, for one) drop
+/// PTS on individual delta frames; we'd lose every clip from
+/// those cameras without this synthesis.
+///
+/// Fallback chain when `sample.pts` is `None`:
+///
+///   1. Use `sample.dts` rebased.
+///   2. Use `last_written_pts_ns + fallback_interval_ns` (i.e.
+///      assume the camera's nominal frame rate).
+///   3. Use `0` (only fires for the very first sample of a clip
+///      when both PTS and DTS are missing — vanishingly rare
+///      because the pre-roll keyframe almost always carries a
+///      PTS, and even if it doesn't `0` is a perfectly valid
+///      start time for mp4mux).
+///
+/// Returns the PTS (in rebased nanoseconds) that was actually
+/// written to the buffer so the caller can use it as the
+/// synthesis anchor for the next sample.
+fn push_sample(
+    appsrc: &AppSrc,
+    sample: &NalSample,
+    base_pts: Duration,
+    last_written_pts_ns: Option<u64>,
+    fallback_interval_ns: u64,
+) -> Result<u64, String> {
     let mut buf =
         gst::Buffer::with_size(sample.data.len()).map_err(|e| format!("alloc gst::Buffer: {e}"))?;
+    let pts_ns: u64;
     {
         let buf_mut = buf.get_mut().ok_or("buffer not unique")?;
         let mut map = buf_mut
@@ -785,14 +960,40 @@ fn push_sample(appsrc: &AppSrc, sample: &NalSample, base_pts: Duration) -> Resul
             .map_err(|e| format!("map_writable: {e}"))?;
         map.copy_from_slice(&sample.data);
         drop(map);
-        if let Some(pts) = sample.pts {
-            let rebased = pts.saturating_sub(base_pts);
-            buf_mut.set_pts(gst::ClockTime::from_nseconds(rebased.as_nanos() as u64));
-        }
-        if let Some(dts) = sample.dts {
-            let rebased = dts.saturating_sub(base_pts);
-            buf_mut.set_dts(gst::ClockTime::from_nseconds(rebased.as_nanos() as u64));
-        }
+
+        // Resolve a PTS we can hand to mp4mux. Synthesis order
+        // matches the docstring above.
+        let raw_pts_ns: u64 = if let Some(pts) = sample.pts {
+            pts.saturating_sub(base_pts).as_nanos() as u64
+        } else if let Some(dts) = sample.dts {
+            dts.saturating_sub(base_pts).as_nanos() as u64
+        } else {
+            last_written_pts_ns
+                .map(|prev| prev.saturating_add(fallback_interval_ns))
+                .unwrap_or(0)
+        };
+        // mp4mux requires monotonic-non-decreasing PTS. If a
+        // jittery source backslides, nudge forward by 1 ns so
+        // the muxer still accepts the buffer rather than
+        // tripping the same silent-reject pathology we synth'd
+        // around in the first place.
+        pts_ns = match last_written_pts_ns {
+            Some(prev) if raw_pts_ns < prev => prev.saturating_add(1),
+            _ => raw_pts_ns,
+        };
+        buf_mut.set_pts(gst::ClockTime::from_nseconds(pts_ns));
+
+        // DTS: prefer the source's value when present, else mirror
+        // the (possibly synthesised) PTS. IP cameras don't emit
+        // B-frames over RTSP so DTS == PTS is correct for the
+        // fallback case.
+        let dts_ns: u64 = if let Some(dts) = sample.dts {
+            dts.saturating_sub(base_pts).as_nanos() as u64
+        } else {
+            pts_ns
+        };
+        buf_mut.set_dts(gst::ClockTime::from_nseconds(dts_ns));
+
         if !sample.is_keyframe {
             buf_mut.set_flags(gst::BufferFlags::DELTA_UNIT);
         }
@@ -800,8 +1001,17 @@ fn push_sample(appsrc: &AppSrc, sample: &NalSample, base_pts: Duration) -> Resul
     appsrc
         .push_buffer(buf)
         .map_err(|e| format!("appsrc push_buffer: {e:?}"))?;
-    Ok(())
+    Ok(pts_ns)
 }
+
+/// Default inter-frame interval used by [`push_sample`] when a
+/// buffer arrives with neither PTS nor DTS. 30 fps (≈33.3 ms) is
+/// the safe default — every IP camera we ship for runs at 25 or
+/// 30 fps and synthesising a 33 ms gap for a 25 fps stream just
+/// stretches the wall-clock timeline by 33 %, which is still
+/// playable and only affects samples whose PTS was missing in
+/// the first place.
+const FALLBACK_FRAME_INTERVAL_NS: u64 = 33_333_333;
 
 /// Forward live broadcast samples into appsrc until the stop signal
 /// fires. De-dups against the snapshot tail by skipping any sample
@@ -809,6 +1019,14 @@ fn push_sample(appsrc: &AppSrc, sample: &NalSample, base_pts: Duration) -> Resul
 /// Each push runs inside `spawn_blocking` because appsrc is
 /// configured with `block=true` and the underlying push can stall
 /// for tens of ms on filesink/disk pressure.
+///
+/// Same-PTS coalescing: an in-flight `pending` slot holds the most
+/// recent NalSample until either (a) a new sample arrives with a
+/// different PTS (flush `pending`, replace), (b) a new sample
+/// arrives with the same PTS (concatenate into `pending`), or (c)
+/// the 200 ms flush timer fires without a new arrival (flush
+/// `pending` so a stalled stream doesn't strand the last AU). See
+/// the module docstring + [`coalesce_same_pts`] for the pathology.
 async fn run_live_pump(
     camera_id: CameraId,
     clip_id: ClipId,
@@ -816,14 +1034,86 @@ async fn run_live_pump(
     mut live_rx: broadcast::Receiver<NalSample>,
     base_pts: Duration,
     mut last_pushed_pts: Option<Duration>,
+    mut last_written_pts_ns: Option<u64>,
     mut stop: oneshot::Receiver<()>,
 ) {
+    let mut pending: Option<NalSample> = None;
+    // Inactivity flush: if no new sample arrives within 200 ms,
+    // drain `pending` so a stalled or low-FPS stream doesn't sit
+    // on the last buffered AU forever. 200 ms is well over 6× a
+    // 30 fps inter-frame interval — a healthy stream will always
+    // displace `pending` on the next recv() before the timer fires.
+    const LIVE_PUMP_FLUSH_AFTER: Duration = Duration::from_millis(200);
+
+    // Local helper: push one sample, updating cursor state. Returns
+    // `Ok(())` on success or `Err(())` if the push failed (caller
+    // should bail out of the pump). Logging happens inside.
+    async fn push_one(
+        camera_id: CameraId,
+        clip_id: ClipId,
+        appsrc: &AppSrc,
+        sample: NalSample,
+        base_pts: Duration,
+        last_pushed_pts: &mut Option<Duration>,
+        last_written_pts_ns: &mut Option<u64>,
+    ) -> Result<(), ()> {
+        let push_appsrc = appsrc.clone();
+        let pushed_pts = sample.pts;
+        let anchor = *last_written_pts_ns;
+        let result = tokio::task::spawn_blocking(move || {
+            push_sample(
+                &push_appsrc,
+                &sample,
+                base_pts,
+                anchor,
+                FALLBACK_FRAME_INTERVAL_NS,
+            )
+        })
+        .await;
+        match result {
+            Ok(Ok(written_pts_ns)) => {
+                *last_written_pts_ns = Some(written_pts_ns);
+                if let Some(spts) = pushed_pts {
+                    *last_pushed_pts = Some(spts);
+                }
+                Ok(())
+            }
+            Ok(Err(e)) => {
+                warn!(camera_id, clip_id, error = %e, "live pump push failed; ending pump");
+                Err(())
+            }
+            Err(join_err) => {
+                warn!(camera_id, clip_id, error = %join_err, "live pump spawn_blocking panicked; ending pump");
+                Err(())
+            }
+        }
+    }
+
     loop {
         tokio::select! {
             biased;
             _ = &mut stop => {
                 debug!(camera_id, clip_id, "live pump received stop signal");
+                if let Some(last) = pending.take() {
+                    let _ = push_one(
+                        camera_id, clip_id, &appsrc, last, base_pts,
+                        &mut last_pushed_pts, &mut last_written_pts_ns,
+                    ).await;
+                }
                 return;
+            }
+            _ = tokio::time::sleep(LIVE_PUMP_FLUSH_AFTER), if pending.is_some() => {
+                // Inactivity flush — the pending AU has been
+                // sitting here longer than a reasonable inter-
+                // frame interval, so push it as-is and clear.
+                if let Some(last) = pending.take() {
+                    if push_one(
+                        camera_id, clip_id, &appsrc, last, base_pts,
+                        &mut last_pushed_pts, &mut last_written_pts_ns,
+                    ).await.is_err() {
+                        return;
+                    }
+                }
             }
             recv = live_rx.recv() => match recv {
                 Ok(sample) => {
@@ -834,24 +1124,11 @@ async fn run_live_pump(
                             continue;
                         }
                     }
-                    let push_appsrc = appsrc.clone();
-                    let pushed_pts = sample.pts;
-                    let result = tokio::task::spawn_blocking(move || {
-                        push_sample(&push_appsrc, &sample, base_pts)
-                    })
-                    .await;
-                    match result {
-                        Ok(Ok(())) => {
-                            if let Some(spts) = pushed_pts {
-                                last_pushed_pts = Some(spts);
-                            }
-                        }
-                        Ok(Err(e)) => {
-                            warn!(camera_id, clip_id, error = %e, "live pump push failed; ending pump");
-                            return;
-                        }
-                        Err(join_err) => {
-                            warn!(camera_id, clip_id, error = %join_err, "live pump spawn_blocking panicked; ending pump");
+                    if let Some(to_push) = coalesce_same_pts(&mut pending, sample) {
+                        if push_one(
+                            camera_id, clip_id, &appsrc, to_push, base_pts,
+                            &mut last_pushed_pts, &mut last_written_pts_ns,
+                        ).await.is_err() {
                             return;
                         }
                     }
@@ -877,6 +1154,74 @@ mod tests {
     use nexus_config::{CameraConfig, StoreConfig};
     use std::path::PathBuf;
     use url::Url;
+
+    fn sample(pts_ms: Option<u64>, data: &[u8], is_kf: bool) -> NalSample {
+        NalSample {
+            pts: pts_ms.map(Duration::from_millis),
+            dts: pts_ms.map(Duration::from_millis),
+            is_keyframe: is_kf,
+            data: data.to_vec(),
+        }
+    }
+
+    #[test]
+    fn coalesce_merges_same_pts_pair() {
+        // Two samples sharing pts=66ms — the exact InSight 192.168.1.66
+        // pathology: an [AUD, SEI] tiny buffer followed by [slice ...].
+        let mut pending: Option<NalSample> = None;
+        // First arrival: just buffered, nothing to flush yet.
+        assert!(coalesce_same_pts(&mut pending, sample(Some(66), &[9, 0, 6, 25], false)).is_none());
+        assert!(pending.is_some());
+        // Second arrival with the same pts: merges into pending, still
+        // nothing to flush.
+        assert!(coalesce_same_pts(&mut pending, sample(Some(66), &[5, 0, 0, 0, 0], true)).is_none());
+        let merged = pending.as_ref().unwrap();
+        assert_eq!(merged.pts, Some(Duration::from_millis(66)));
+        assert_eq!(merged.data, vec![9, 0, 6, 25, 5, 0, 0, 0, 0]);
+        assert!(merged.is_keyframe, "keyframe flag must OR-combine");
+    }
+
+    #[test]
+    fn coalesce_different_pts_flushes_previous() {
+        let mut pending: Option<NalSample> = None;
+        assert!(coalesce_same_pts(&mut pending, sample(Some(33), b"first", false)).is_none());
+        // Different PTS — previous gets flushed, new one buffered.
+        let flushed = coalesce_same_pts(&mut pending, sample(Some(66), b"second", false))
+            .expect("must flush previous on PTS change");
+        assert_eq!(flushed.pts, Some(Duration::from_millis(33)));
+        assert_eq!(flushed.data, b"first".to_vec());
+        let still_pending = pending.as_ref().unwrap();
+        assert_eq!(still_pending.pts, Some(Duration::from_millis(66)));
+        assert_eq!(still_pending.data, b"second".to_vec());
+    }
+
+    #[test]
+    fn coalesce_none_pts_never_merges() {
+        // Two PTS-less samples in a row — must NOT merge (would lose
+        // frames if a source ever legitimately emits two PTS-less
+        // samples back to back; the synthesis path in push_sample
+        // handles them individually instead).
+        let mut pending: Option<NalSample> = None;
+        assert!(coalesce_same_pts(&mut pending, sample(None, b"a", false)).is_none());
+        let flushed = coalesce_same_pts(&mut pending, sample(None, b"b", false))
+            .expect("two None-PTS samples must NOT merge");
+        assert_eq!(flushed.data, b"a".to_vec());
+        assert_eq!(pending.as_ref().unwrap().data, b"b".to_vec());
+    }
+
+    #[test]
+    fn coalesce_dts_keeps_earlier() {
+        // When merging, dts should keep the earlier (smaller) value so
+        // downstream monotonic expectations still hold.
+        let mut pending: Option<NalSample> = None;
+        let mut a = sample(Some(66), b"x", false);
+        a.dts = Some(Duration::from_millis(60));
+        let mut b = sample(Some(66), b"y", false);
+        b.dts = Some(Duration::from_millis(70));
+        coalesce_same_pts(&mut pending, a);
+        coalesce_same_pts(&mut pending, b);
+        assert_eq!(pending.as_ref().unwrap().dts, Some(Duration::from_millis(60)));
+    }
 
     async fn fixture() -> (Arc<Store>, tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();

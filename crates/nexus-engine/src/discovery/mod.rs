@@ -25,6 +25,7 @@
 //! `/22`), and the audit-log contract.
 
 pub mod onvif;
+pub mod onvif_media;
 pub mod rtsp_probe;
 pub mod scan;
 
@@ -95,6 +96,18 @@ pub struct DiscoveredDevice {
     pub ip: String,
     pub port: u16,
     pub kind: DeviceKind,
+    /// Port to actually talk RTSP to. Distinct from `port` because
+    /// a single physical camera typically exposes its ONVIF /
+    /// web service on `:80` AND its RTSP service on `:554`. When
+    /// the CIDR scan finds both, we surface the ONVIF entry (more
+    /// metadata) but remember the RTSP port here so the probe and
+    /// the final camera URL hit the right socket.
+    ///
+    /// `None` when discovery couldn't confirm an RTSP port — the
+    /// UI then defaults to the RFC-standard 554, which is right
+    /// for the overwhelming majority of IP cameras.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rtsp_port: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vendor: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -105,6 +118,19 @@ pub struct DiscoveredDevice {
     pub firmware: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mac: Option<String>,
+    /// Verbatim `<wsd:XAddrs>` value from the WS-Discovery
+    /// ProbeMatch (or `None` for CIDR-scan-only finds with no
+    /// SOAP service detected). Used by the inline
+    /// `onvif-streams` probe to call ONVIF Media `GetProfiles`
+    /// then `GetStreamUri` and skip the brute-force RTSP path
+    /// sweep — vendor-correct URIs in two SOAP round-trips
+    /// beats guessing through 13 candidate paths.
+    ///
+    /// Whitespace-separated when the camera advertises multiple
+    /// device-service endpoints (e.g. IPv4 + IPv6); the consumer
+    /// picks the first parseable URL.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub onvif_xaddrs: Option<String>,
     /// RTSP paths the operator can plug straight into a camera
     /// URL. Populated by the inline probe-rtsp handler post-Verify;
     /// empty on initial probe.
@@ -169,6 +195,41 @@ pub struct ProbeRtspReq {
     pub password: Option<String>,
 }
 
+/// Request body for `POST /api/v1/admin/discovery/sessions/:session_id/onvif-streams`.
+///
+/// `xaddr` is the verbatim WS-Discovery XAddrs URL
+/// (`http://<host>:<port>/onvif/device_service` in the common
+/// case, or whatever vendor-specific path the camera advertised
+/// — see `DiscoveredDevice::onvif_xaddrs`). Username + password
+/// are mandatory: ONVIF Media `GetProfiles` is gated on every
+/// camera I've seen, anonymous calls always return
+/// `NotAuthorized`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProbeOnvifReq {
+    pub xaddr: String,
+    pub username: String,
+    pub password: String,
+}
+
+/// Response body for the ONVIF Media probe. On success,
+/// `streams` contains one entry per camera profile with the
+/// authoritative RTSP URI the camera advertised. On failure,
+/// `streams` is empty and `error` carries the operator-facing
+/// reason (typically `"NotAuthorized"` for wrong creds or
+/// `"connect failed"` for network issues).
+///
+/// The UI treats any failure as a signal to fall back to the
+/// brute-force RTSP path sweep (`POST .../probe-rtsp`); the
+/// `error` string is logged but not surfaced to the operator
+/// unless the path sweep ALSO fails.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProbeOnvifResult {
+    pub ok: bool,
+    pub streams: Vec<onvif_media::MediaStream>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SdpStream {
     pub codec: String,
@@ -176,6 +237,23 @@ pub struct SdpStream {
     pub resolution: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub control: Option<String>,
+}
+
+/// Per-path summary returned in [`ProbeRtspResult::streams`].
+///
+/// One entry per RTSP path that answered DESCRIBE with `200 OK` +
+/// a parseable SDP body. `codec` / `resolution` come from the
+/// first video track in that path's SDP (typically the H.264 or
+/// H.265 main track). Used by the UI to populate a path dropdown
+/// per discovered camera with human-readable labels like
+/// `"/Streaming/Channels/101 — H264 1920x1080"`.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProbeStream {
+    pub path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub codec: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolution: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -191,6 +269,17 @@ pub struct ProbeRtspResult {
     /// without the operator hand-typing the vendor-specific path.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    /// Full list of working RTSP paths discovered during this
+    /// probe, in the order the candidates were tried (typically
+    /// main-stream first, sub-stream second). For an explicit
+    /// operator-supplied path this contains at most one entry.
+    /// For the empty/`"/"` path-discovery case the probe runs all
+    /// [`DEFAULT_PATHS`](rtsp_probe::DEFAULT_PATHS) in parallel
+    /// and reports every one that DESCRIBE-200'd, letting the UI
+    /// surface a "main vs sub" picker on cameras that publish
+    /// both at once (Hikvision / Dahua / Reolink all do).
+    #[serde(default)]
+    pub streams: Vec<ProbeStream>,
 }
 
 // ---------------------------------------------------------------------------
@@ -461,6 +550,51 @@ pub async fn post_probe_rtsp(
     Ok(Json(rtsp_probe::probe(&req).await))
 }
 
+/// `POST /api/v1/admin/discovery/sessions/:session_id/onvif-streams`
+///
+/// Runs inline (≤5 s per profile, typically <2 s total for 2–4
+/// profiles) against the supplied ONVIF Media service URL.
+/// Authoritative replacement for the brute-force path sweep:
+/// the camera tells us its exact profile list + RTSP URIs.
+///
+/// On any failure (auth, network, malformed response) returns
+/// `{ ok: false, streams: [], error: "..." }` with HTTP 200 —
+/// the UI uses the empty streams list as a signal to fall back
+/// to `probe-rtsp`. Returning an HTTP error here would force
+/// the UI to distinguish "endpoint missing" from "camera said
+/// no"; one shape is simpler.
+pub async fn post_probe_onvif(
+    State(s): State<ApiState>,
+    Path(session_id): Path<Uuid>,
+    Json(req): Json<ProbeOnvifReq>,
+) -> Result<Json<ProbeOnvifResult>, ApiError> {
+    s.store
+        .write_audit(
+            "api",
+            "discovery_probe_onvif",
+            &format!("session/{session_id}"),
+            &serde_json::json!({
+                "xaddr": &req.xaddr,
+                // Username only for audit trail; password is
+                // never logged.
+                "username": &req.username,
+            }),
+        )
+        .await?;
+    match onvif_media::query_streams(&req.xaddr, &req.username, &req.password).await {
+        Ok(streams) => Ok(Json(ProbeOnvifResult {
+            ok: !streams.is_empty(),
+            streams,
+            error: None,
+        })),
+        Err(err) => Ok(Json(ProbeOnvifResult {
+            ok: false,
+            streams: Vec::new(),
+            error: Some(err),
+        })),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // CIDR guardrail validation
 // ---------------------------------------------------------------------------
@@ -718,11 +852,13 @@ mod tests {
                 ip: "192.168.1.10".to_string(),
                 port: 554,
                 kind: DeviceKind::Rtsp,
+                rtsp_port: Some(554),
                 vendor: None,
                 model: None,
                 hardware: None,
                 firmware: None,
                 mac: None,
+                onvif_xaddrs: None,
                 rtsp_paths: Vec::new(),
             });
         }

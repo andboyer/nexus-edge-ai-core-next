@@ -181,15 +181,96 @@ impl Detector for ClassifierEnsembleDetector {
         frame: &Frame,
         prompts: &[String],
     ) -> Result<Vec<Detection>, InferenceError> {
-        // Treat prompts as the enabled-class list.
-        let mut out = self.fallback.detect(frame, prompts).await?;
-        if !prompts.is_empty() {
-            out.retain(|d| prompts.iter().any(|p| p.eq_ignore_ascii_case(&d.label)));
-        }
-        Ok(out)
+        // The per-camera `prompts` whitelist is enforced uniformly
+        // for every detector kind by the pipeline supervisor (see
+        // `label_matches_any_prompt`), so no retain is needed here.
+        self.fallback.detect(frame, prompts).await
     }
 
     fn name(&self) -> &'static str {
         "classifier_ensemble"
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared label/prompts matching used by the pipeline supervisor to enforce
+// the per-camera `prompts` whitelist uniformly for every detector kind.
+//
+// Matching is case-insensitive and accepts either:
+//   * an exact match against the full emitted label (`person`,
+//     `vehicle.car`, `hardhat`), or
+//   * a match against the last `.`-delimited segment of the label, so
+//     operator-friendly bare nouns work for the closed-vocab YOLO/COCO
+//     path that emits namespaced labels (`animal.dog`, `vehicle.truck`,
+//     `carried.suitcase`). For open-vocab kinds (yolo_world, yoloe)
+//     labels are unnamespaced, so the suffix branch is a no-op.
+//
+// An empty prompt list disables the filter entirely (the common case
+// for cameras that haven't restricted their class set).
+// ---------------------------------------------------------------------------
+
+/// Returns `true` when `label` satisfies the per-camera `prompts`
+/// whitelist. See module docs for matching rules. An empty `prompts`
+/// slice is treated as "no filter" and always returns `true`.
+pub fn label_matches_any_prompt(label: &str, prompts: &[String]) -> bool {
+    if prompts.is_empty() {
+        return true;
+    }
+    let tail = label.rsplit('.').next().unwrap_or(label);
+    prompts
+        .iter()
+        .any(|p| p.eq_ignore_ascii_case(label) || p.eq_ignore_ascii_case(tail))
+}
+
+#[cfg(test)]
+mod prompt_filter_tests {
+    use super::*;
+
+    #[test]
+    fn empty_prompts_allows_everything() {
+        assert!(label_matches_any_prompt("person", &[]));
+        assert!(label_matches_any_prompt("vehicle.car", &[]));
+        assert!(label_matches_any_prompt("", &[]));
+    }
+
+    #[test]
+    fn exact_match_case_insensitive() {
+        let prompts = vec!["Person".into(), "Hardhat".into()];
+        assert!(label_matches_any_prompt("person", &prompts));
+        assert!(label_matches_any_prompt("PERSON", &prompts));
+        assert!(label_matches_any_prompt("hardhat", &prompts));
+        assert!(!label_matches_any_prompt("vest", &prompts));
+    }
+
+    #[test]
+    fn suffix_match_strips_namespace_for_coco_yolo() {
+        // Operator writes the bare noun; closed-vocab YOLO emits the
+        // namespaced label. Both directions should work.
+        let prompts = vec!["dog".into(), "car".into(), "suitcase".into()];
+        assert!(label_matches_any_prompt("animal.dog", &prompts));
+        assert!(label_matches_any_prompt("vehicle.car", &prompts));
+        assert!(label_matches_any_prompt("carried.suitcase", &prompts));
+        assert!(!label_matches_any_prompt("animal.cat", &prompts));
+        assert!(!label_matches_any_prompt("vehicle.truck", &prompts));
+    }
+
+    #[test]
+    fn fully_qualified_prompts_still_match() {
+        // Operators copying from the COCO taxonomy paste the
+        // namespaced label verbatim; that must still work.
+        let prompts = vec!["animal.dog".into(), "vehicle.car".into()];
+        assert!(label_matches_any_prompt("animal.dog", &prompts));
+        assert!(label_matches_any_prompt("vehicle.car", &prompts));
+        assert!(!label_matches_any_prompt("person", &prompts));
+    }
+
+    #[test]
+    fn unnamespaced_label_matches_unnamespaced_prompt() {
+        // YOLO-World / YOLOe path: labels are bare nouns. Plain
+        // exact match should win without the suffix branch firing.
+        let prompts = vec!["excavator".into(), "crane".into()];
+        assert!(label_matches_any_prompt("excavator", &prompts));
+        assert!(label_matches_any_prompt("Crane", &prompts));
+        assert!(!label_matches_any_prompt("forklift", &prompts));
     }
 }

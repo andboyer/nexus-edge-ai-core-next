@@ -48,10 +48,10 @@ pub enum AuditActorKind {
     LocalUser,
     /// M6 OIDC backend.
     OidcUser,
-    /// Legacy M-Install Checkpoint 2 shared bearer. Will be
-    /// removed when `--features prod-auth` graduates the auth
-    /// stack — until then, every dev_token-backed write still
-    /// lands an audit row with this actor_kind.
+    /// Legacy M-Install Checkpoint 2 shared bearer. Retired by
+    /// M-Admin Phase 0 closeout — kept as a variant so historical
+    /// audit rows that already landed with this actor_kind still
+    /// deserialise. New writes never use this value.
     DevToken,
     /// Engine-internal action (boot bootstrap, retention sweeper,
     /// background tasks).

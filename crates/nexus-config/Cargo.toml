@@ -5,15 +5,6 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
-[features]
-# M6 Phase 4 Step 4.5 — secure-by-default for shippable release
-# binaries. With `prod-auth` enabled, the `AuthMode::DevToken`
-# variant is excluded from the enum entirely, so any code that
-# tries to construct or match it fails at compile time. Release
-# builds in CI flip this on; dev builds leave it off so the
-# devtoken bootstrap path remains usable.
-prod-auth = []
-
 [dependencies]
 nexus-types = { workspace = true }
 serde = { workspace = true }

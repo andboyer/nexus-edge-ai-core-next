@@ -32,7 +32,8 @@ use tracing::{info, warn};
 
 use crate::detectors::{Detector, InferenceError};
 use crate::pool::DetectorPool;
-use crate::{build, InferenceLayer};
+use crate::visual_prompts::VisualPromptStore;
+use crate::{build_with_context, BuildContext, InferenceLayer};
 
 pub struct InferenceRouter {
     /// Default layer — used by every camera that doesn't override.
@@ -55,10 +56,26 @@ impl InferenceRouter {
         default_cfg: &InferenceConfig,
         cameras: &[CameraConfig],
     ) -> Result<Self, InferenceError> {
+        Self::build_with_visual_store(default_cfg, cameras, None, None)
+    }
+
+    /// Same as [`Self::build`] but also wires a [`VisualPromptStore`]
+    /// (required when any camera uses `model_override.kind =
+    /// "yoloe_visual"`) and an optional embedding-dim override.
+    pub fn build_with_visual_store(
+        default_cfg: &InferenceConfig,
+        cameras: &[CameraConfig],
+        visual_prompt_store: Option<Arc<dyn VisualPromptStore>>,
+        visual_embedding_dim: Option<usize>,
+    ) -> Result<Self, InferenceError> {
+        let ctx = BuildContext {
+            visual_prompt_store,
+            visual_embedding_dim,
+        };
         let default_kind = default_cfg.model.kind.clone();
         let mut layers: BTreeMap<String, InferenceLayer> = BTreeMap::new();
 
-        let default_layer = build(default_cfg)?;
+        let default_layer = build_with_context(default_cfg, &ctx)?;
         info!(kind = %default_kind, "router: built default inference layer");
         layers.insert(default_kind.clone(), default_layer);
 
@@ -77,7 +94,7 @@ impl InferenceRouter {
                 continue;
             }
             let derived = derive_inference_cfg(default_cfg, override_cfg);
-            match build(&derived) {
+            match build_with_context(&derived, &ctx) {
                 Ok(layer) => {
                     info!(
                         kind = %kind,
@@ -206,6 +223,7 @@ mod tests {
             },
             detector: nexus_config::CameraDetector {
                 prompts: vec![],
+                visual_prompts: vec![],
                 model_override: override_kind.map(|k| ModelConfig {
                     kind: k.into(),
                     ..Default::default()
@@ -213,6 +231,7 @@ mod tests {
             },
             behavior: nexus_config::CameraBehavior {
                 parking_lot_mode: false,
+                anchor_ttl_secs: None,
             },
             zones: vec![],
         }
@@ -279,5 +298,80 @@ mod tests {
         let cfg = cfg_with_kind("mock");
         let router = InferenceRouter::build(&cfg, &[]).unwrap();
         assert!(router.default_pool().is_none());
+    }
+
+    #[test]
+    fn router_builds_yoloe_visual_layer_with_visual_store() {
+        // With ort off (CI default for `cargo test`), the yoloe_visual
+        // arm falls back to MockDetector with a warn — but the router
+        // MUST still register a layer keyed by the override kind so
+        // `detector_for_camera` resolves it instead of bouncing to the
+        // default. With ort on, the same arm builds the real detector
+        // when pack_path is set; we don't exercise that here (needs
+        // real ONNX) — the unit covers the routing shape only.
+        use crate::visual_prompts::InMemoryVisualPromptStore;
+        use std::sync::Arc;
+
+        let cfg = cfg_with_kind("mock");
+        let cams = vec![cam(1, None), cam(2, Some("yoloe_visual"))];
+        let store: Arc<dyn crate::visual_prompts::VisualPromptStore> =
+            Arc::new(InMemoryVisualPromptStore::new());
+        let router =
+            InferenceRouter::build_with_visual_store(&cfg, &cams, Some(store), Some(8)).unwrap();
+        let kinds: Vec<String> = router.detectors().into_iter().map(|(k, _)| k).collect();
+        assert!(kinds.contains(&"mock".to_string()));
+        assert!(kinds.contains(&"yoloe_visual".to_string()));
+    }
+
+    /// M3.2 — a camera with `model_override.kind = "ensemble"` resolves
+    /// to a real `EnsembleDetector` (`name() == "ensemble"`) that fans
+    /// frames to its declared members. We don't run inference here —
+    /// that's covered by ensemble unit tests — only the routing shape.
+    #[test]
+    fn router_builds_ensemble_layer_for_camera() {
+        use url::Url;
+        let cfg = cfg_with_kind("mock");
+        let mut cam2 = cam(2, None);
+        cam2.detector.model_override = Some(ModelConfig {
+            kind: "ensemble".into(),
+            members: vec![
+                ModelConfig {
+                    kind: "mock".into(),
+                    ..Default::default()
+                },
+                ModelConfig {
+                    kind: "mock".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        });
+        let cams = vec![
+            CameraConfig {
+                id: 1,
+                name: "default-cam".into(),
+                ingest: nexus_config::CameraIngest {
+                    url: Url::parse("virtual://test").unwrap(),
+                    enabled: true,
+                    max_fps: 0,
+                },
+                detector: nexus_config::CameraDetector {
+                    prompts: vec![],
+                    visual_prompts: vec![],
+                    model_override: None,
+                },
+                behavior: nexus_config::CameraBehavior {
+                    parking_lot_mode: false,
+                    anchor_ttl_secs: None,
+                },
+                zones: vec![],
+            },
+            cam2.clone(),
+        ];
+        let router = InferenceRouter::build(&cfg, &cams).unwrap();
+        let kinds: Vec<String> = router.detectors().into_iter().map(|(k, _)| k).collect();
+        assert!(kinds.contains(&"ensemble".to_string()), "got {kinds:?}");
+        let d = router.detector_for_camera(&cam2);
+        assert_eq!(d.name(), "ensemble");
     }
 }

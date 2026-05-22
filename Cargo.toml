@@ -65,7 +65,7 @@ opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
 clap = { version = "4", features = ["derive", "env"] }
 
 # HTTP
-axum = { version = "0.8", features = ["macros", "ws"] }
+axum = { version = "0.8", features = ["macros", "multipart", "ws"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = [
     "cors",
@@ -128,6 +128,14 @@ ts-rs = { version = "10", features = [
 once_cell = "1"
 url = { version = "2", features = ["serde"] }
 tempfile = "3"
+
+# Host metrics for `/api/v1/system/metrics` (M-Dashboard Phase 2).
+# Cross-platform CPU / RAM / disk / process info. `default-features = false`
+# strips out the Apple-only system-extensions probe which we don't need.
+sysinfo = { version = "0.32", default-features = false, features = [
+    "system",
+    "disk",
+] }
 
 # Crypto — used by `nexus-storage::token_crypto` to encrypt OAuth
 # refresh tokens at rest before they hit `storage_backends.config_json`

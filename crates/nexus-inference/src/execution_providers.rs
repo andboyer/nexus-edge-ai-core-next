@@ -70,6 +70,11 @@ use tracing::warn;
 /// `NEXUS_OPENVINO_DEVICE=skip` to force-false (useful for verifying the
 /// CPU-fallback path on a box that *does* have an iGPU). Unset / any other
 /// value goes through autodetection.
+// rust 1.95+ clippy tightened `doc_lazy_continuation`: prose paragraphs
+// after a bullet list are now flagged. The mixed bullets-plus-prose
+// shape above is intentional documentation; suppress narrowly on this
+// item rather than reflowing into one giant indented list.
+#[allow(clippy::doc_lazy_continuation)]
 pub fn openvino_runtime_available() -> bool {
     if let Ok(v) = std::env::var("NEXUS_OPENVINO_DEVICE") {
         match v.trim().to_ascii_lowercase().as_str() {
@@ -133,8 +138,7 @@ pub fn selected_for_priority(
 /// branches deterministically, regardless of the host the test runs on.
 fn selected_for_priority_inner(
     ep_priority: &[String],
-    #[cfg_attr(not(feature = "ep-openvino"), allow(unused_variables))]
-    openvino_available: bool,
+    #[cfg_attr(not(feature = "ep-openvino"), allow(unused_variables))] openvino_available: bool,
 ) -> (Vec<ExecutionProviderDispatch>, Vec<String>) {
     let mut dispatchers: Vec<ExecutionProviderDispatch> = Vec::new();
     let mut names: Vec<String> = Vec::new();
@@ -312,8 +316,7 @@ mod tests {
     #[test]
     fn openvino_then_cpu_when_feature_on() {
         // Force the device-present branch so the test is host-independent.
-        let (_, names) =
-            selected_for_priority_inner(&["openvino".into(), "cpu".into()], true);
+        let (_, names) = selected_for_priority_inner(&["openvino".into(), "cpu".into()], true);
         assert_eq!(names, vec!["openvino", "cpu"]);
     }
 
@@ -332,8 +335,7 @@ mod tests {
     #[cfg(feature = "ep-openvino")]
     #[test]
     fn openvino_dropped_when_device_absent() {
-        let (eps, names) =
-            selected_for_priority_inner(&["openvino".into(), "cpu".into()], false);
+        let (eps, names) = selected_for_priority_inner(&["openvino".into(), "cpu".into()], false);
         // Only CPU is registered; openvino was dropped silently.
         assert_eq!(eps.len(), 1);
         assert_eq!(names, vec!["cpu"]);

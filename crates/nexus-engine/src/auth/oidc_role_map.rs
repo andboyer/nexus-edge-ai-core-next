@@ -185,6 +185,9 @@ mod tests {
             ],
             role_map,
             deny_unmapped,
+            redirect_uri: None,
+            client_secret_file: None,
+            client_secret_env: None,
         }
     }
 

@@ -1,69 +1,38 @@
 //! Boot-time auth posture enforcement.
 //!
-//! Responsibilities (added in M-Install Checkpoint 2):
+//! M-Admin Phase 0 closeout retired the legacy `AuthMode::None`
+//! and `AuthMode::DevToken` variants — there are no more
+//! shared-secret or no-auth code paths to wire up here. This
+//! module now does exactly one thing:
 //!
-//! 1. **Secure-by-default token provisioning.** When `auth.mode =
-//!    "dev_token"` and no `dev_token` is configured in TOML, the
-//!    engine reads the persisted token from `<state_dir>/dev-token`.
-//!    If that file is missing it generates a fresh 32-byte URL-safe
-//!    random token, persists it with mode 0600, and prints it to
-//!    the WARN log so operators can copy it into their browser
-//!    exactly once.
+//! **Auto-provisioned admin secret for `Local` / `Hybrid`.** When
+//! `auth.mode in {"local", "hybrid"}` and `auth.admin_secret_path`
+//! is unset, the engine writes a fresh 32-byte URL-safe random
+//! secret to `<state_dir>/admin-secret` (mode 0600) and patches
+//! `cfg.auth.admin_secret_path` so the session-JWT signer can
+//! find it. Operators who already manage a secret (k8s Secret,
+//! Docker secret, systemd LoadCredential) keep their existing
+//! `admin_secret_path = ...` pin and this branch is a no-op.
 //!
-//! 2. **Auto-provisioned admin secret for `Local` / `Hybrid`.** When
-//!    `auth.mode in {"local", "hybrid"}` and `auth.admin_secret_path`
-//!    is unset, the engine writes a fresh 32-byte URL-safe random
-//!    secret to `<state_dir>/admin-secret` (mode 0600) and patches
-//!    `cfg.auth.admin_secret_path` so the session-JWT signer can
-//!    find it. This is the customer-facing default since M6 closure
-//!    (see [docs/ARCHITECTURE.md §11][arch11]); operators who
-//!    already manage a secret (k8s Secret, Docker secret, systemd
-//!    LoadCredential) keep their existing `admin_secret_path = ...`
-//!    pin and this branch is a no-op.
-//!
-//!    [arch11]: ../../../docs/ARCHITECTURE.md#11-identity--authentication
-//!
-//! 3. **Non-loopback `mode = none` rejection.** Operators can
-//!    still opt into "no auth" with `auth.mode = "none"`, but
-//!    only when the API binds to `127.0.0.1` (or `::1`). Any
-//!    other bind value with `mode = none` aborts boot — the
-//!    engine refuses to leak unauthenticated writes onto a LAN.
-//!
-//! 4. **Grandfather WARN.** When `nexus-config`'s
-//!    `load_with_compat` reports that the on-disk `nexus.toml`
-//!    had no `[auth]` section, this module logs a one-time
-//!    deprecation warning that names the upgrade deadline
-//!    (7 days from boot). The grandfather window itself is
-//!    enforced by the config crate; this module just surfaces it
-//!    to the operator.
+//! `Oidc` mode is a no-op — pure-OIDC deployments don't need a
+//! local admin secret (the IdP signs everything). The OIDC
+//! verifier is built later from `cfg.auth.oidc`; if that block
+//! is missing, the verifier itself surfaces a clear error.
 
 use std::fs;
 use std::io::Write;
-use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 use base64::engine::{general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use chrono::{Duration, Utc};
-use nexus_config::{AuthMode, CompatNotice, Config};
-
-/// File on disk that holds the auto-generated dev token. Lives
-/// alongside the engine state directory so a wipe of `/var/lib/nexus`
-/// rotates the token along with the rest of the box's identity.
-#[cfg(not(feature = "prod-auth"))]
-const DEV_TOKEN_FILE: &str = "dev-token";
+use nexus_config::{AuthMode, Config};
 
 /// File on disk that holds the auto-generated admin secret used to
-/// sign session JWTs in `auth.mode in {local, hybrid}`. Same
-/// rotate-with-state-dir semantics as the dev token.
+/// sign session JWTs in `auth.mode in {local, hybrid}`. Lives
+/// alongside the engine state directory so a wipe of
+/// `/var/lib/nexus` rotates the secret along with the rest of the
+/// box's identity.
 const ADMIN_SECRET_FILE: &str = "admin-secret";
-
-/// Length, in raw bytes, of the generated dev token. URL-safe-no-pad
-/// base64 expands this to 43 characters — long enough for a 256-bit
-/// secret and short enough to copy/paste into a browser tab without
-/// truncation.
-#[cfg(not(feature = "prod-auth"))]
-const DEV_TOKEN_BYTES: usize = 32;
 
 /// Length, in raw bytes, of the auto-generated admin secret. 32 bytes
 /// of CSPRNG output — the HS256 session signer treats this as opaque
@@ -71,44 +40,16 @@ const DEV_TOKEN_BYTES: usize = 32;
 /// base64 keeps it inspectable + copy-pasteable).
 const ADMIN_SECRET_BYTES: usize = 32;
 
-/// Apply Checkpoint-2 auth-posture rules. Mutates `cfg.auth.dev_token`
-/// and `cfg.auth.admin_secret_path` in place when their respective
-/// secrets are auto-generated, so the rest of the engine sees the
-/// resolved values.
+/// Apply Phase-0 auth-posture rules. Mutates
+/// `cfg.auth.admin_secret_path` in place when the secret is
+/// auto-generated, so the rest of the engine sees the resolved
+/// value.
 ///
 /// `state_dir` is `cfg.runtime.state_dir` resolved by the caller —
 /// passed in (instead of re-derived here) so the test path can
 /// point at a tempdir.
-///
-/// Returns `Err` for boot-fatal posture violations (currently only
-/// the non-loopback `mode = none` case).
-pub fn apply(cfg: &mut Config, state_dir: &Path, notice: CompatNotice) -> Result<()> {
-    if notice.auth_grandfathered {
-        let deadline = Utc::now() + Duration::days(7);
-        eprintln!(
-            "nexus-engine: WARN nexus.toml has no [auth] section; \
-             pinning auth.mode = \"none\" for backward compatibility. \
-             This grandfather will be removed on or after {}. Add an \
-             explicit [auth] block to silence this warning — see \
-             config/nexus.example.toml.",
-            deadline.format("%Y-%m-%d")
-        );
-    }
-
+pub fn apply(cfg: &mut Config, state_dir: &Path) -> Result<()> {
     match cfg.auth.mode {
-        AuthMode::None => enforce_loopback_only(&cfg.server.api_bind)?,
-        #[cfg(not(feature = "prod-auth"))]
-        AuthMode::DevToken => {
-            if cfg.auth.dev_token.is_none() {
-                let token = ensure_dev_token(state_dir)?;
-                cfg.auth.dev_token = Some(token);
-            } else {
-                eprintln!(
-                    "nexus-engine: auth: dev_token sourced from nexus.toml \
-                     (auto-provisioning skipped)"
-                );
-            }
-        }
         AuthMode::Local | AuthMode::Hybrid => {
             if cfg.auth.admin_secret_path.is_none() {
                 let path = ensure_admin_secret(state_dir)?;
@@ -130,93 +71,11 @@ pub fn apply(cfg: &mut Config, state_dir: &Path, notice: CompatNotice) -> Result
     Ok(())
 }
 
-/// True iff `bind` resolves (textually OR via std::net parsing) to
-/// a loopback address. We accept three shapes:
-///
-/// * `"127.0.0.1:8089"` — the canonical LAN-only bind.
-/// * `"[::1]:8089"`     — IPv6 loopback.
-/// * `"localhost:8089"` — string-only check; we don't DNS-resolve
-///   here because boot must not block on resolver state.
-fn enforce_loopback_only(bind: &str) -> Result<()> {
-    // Fast path: textual match on the exact strings INSTALL.md
-    // recommends. Avoids parsing pitfalls on hosts where
-    // SocketAddr's lexer is stricter than the operator expected.
-    let lower = bind.to_ascii_lowercase();
-    if lower.starts_with("127.0.0.1:")
-        || lower.starts_with("[::1]:")
-        || lower.starts_with("localhost:")
-    {
-        return Ok(());
-    }
-
-    // Slow path: try to parse and check the IP. Anything that
-    // doesn't parse + isn't textually loopback is rejected.
-    if let Ok(addr) = bind.parse::<SocketAddr>() {
-        if addr.ip().is_loopback() {
-            return Ok(());
-        }
-    }
-
-    Err(anyhow!(
-        "auth.mode = \"none\" is only allowed when server.api_bind is on \
-         loopback (127.0.0.1, [::1], or localhost). Got `{bind}`. Either \
-         change the bind to loopback or set auth.mode = \"dev_token\" / \
-         \"oidc\". See INSTALL.md §11 for details."
-    ))
-}
-
-/// Read `<state_dir>/dev-token` if present; otherwise generate a
-/// fresh 32-byte URL-safe random token, write it with mode 0600,
-/// and log the value at WARN so operators can copy it once.
-#[cfg(not(feature = "prod-auth"))]
-fn ensure_dev_token(state_dir: &Path) -> Result<String> {
-    let path = state_dir.join(DEV_TOKEN_FILE);
-
-    if path.exists() {
-        let s = fs::read_to_string(&path)
-            .with_context(|| format!("reading dev token from {}", path.display()))?
-            .trim()
-            .to_string();
-        if s.is_empty() {
-            return Err(anyhow!(
-                "dev token file {} exists but is empty; delete it to regenerate",
-                path.display()
-            ));
-        }
-        eprintln!(
-            "nexus-engine: auth: dev_token loaded from disk path={}",
-            path.display()
-        );
-        return Ok(s);
-    }
-
-    fs::create_dir_all(state_dir)
-        .with_context(|| format!("creating state dir {}", state_dir.display()))?;
-    let token = generate_token(DEV_TOKEN_BYTES);
-    write_secret(&path, token.as_bytes())
-        .with_context(|| format!("writing dev token to {}", path.display()))?;
-
-    // The whole point of WARN here is operator visibility — INFO
-    // gets filtered out on noisy boxes. We deliberately print the
-    // token in plaintext: it lives in a 0600 file the operator
-    // can read anyway, and surfacing it once at boot beats forcing
-    // a `cat /var/lib/nexus/dev-token` round-trip on first use.
-    eprintln!(
-        "nexus-engine: WARN auth: generated new dev token. \
-         Send `Authorization: Bearer <dev_token>` on every API call. \
-         path={} dev_token={} \
-         (file mode 0600; delete to rotate)",
-        path.display(),
-        token
-    );
-    Ok(token)
-}
-
 /// Read `<state_dir>/admin-secret` if present; otherwise generate a
 /// fresh 32-byte URL-safe random secret, write it with mode 0600,
-/// and return the path. Unlike the dev-token branch we DON'T log
-/// the secret value — it's the HS256 signing key for session JWTs,
-/// not an operator-visible bearer token.
+/// and return the path. We DON'T log the secret value — it's the
+/// HS256 signing key for session JWTs, not an operator-visible
+/// bearer token.
 fn ensure_admin_secret(state_dir: &Path) -> Result<PathBuf> {
     let path = state_dir.join(ADMIN_SECRET_FILE);
 
@@ -297,115 +156,6 @@ mod tests {
     use nexus_config::AuthConfig;
 
     #[test]
-    fn loopback_bind_is_accepted() {
-        for ok in [
-            "127.0.0.1:8089",
-            "127.0.0.1:1",
-            "[::1]:8089",
-            "localhost:8089",
-            "LOCALHOST:9000",
-        ] {
-            enforce_loopback_only(ok).unwrap_or_else(|e| panic!("`{ok}` rejected: {e}"));
-        }
-    }
-
-    #[test]
-    fn non_loopback_bind_is_rejected_for_mode_none() {
-        for bad in ["0.0.0.0:8089", "192.168.1.10:8089", "[::]:8089"] {
-            let err = enforce_loopback_only(bad).unwrap_err();
-            let msg = err.to_string();
-            assert!(
-                msg.contains("loopback") && msg.contains(bad),
-                "expected loopback-rejection for `{bad}`, got: {msg}"
-            );
-        }
-    }
-
-    #[test]
-    #[cfg(not(feature = "prod-auth"))]
-    fn ensure_dev_token_generates_then_reads_back() {
-        let dir = tempfile::tempdir().unwrap();
-        let first = ensure_dev_token(dir.path()).unwrap();
-        assert!(!first.is_empty(), "generated token must be non-empty");
-        // 32 bytes -> 43 chars URL-safe-no-pad.
-        assert_eq!(first.len(), 43, "token len = {}", first.len());
-
-        // Second call must return the same value (no rotation on
-        // boot).
-        let second = ensure_dev_token(dir.path()).unwrap();
-        assert_eq!(first, second);
-
-        // File must exist with the token bytes (no trailing
-        // newline once trimmed).
-        let on_disk = std::fs::read_to_string(dir.path().join(DEV_TOKEN_FILE)).unwrap();
-        assert_eq!(on_disk.trim(), first);
-
-        // Mode-0600 check on unix.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let meta = std::fs::metadata(dir.path().join(DEV_TOKEN_FILE)).unwrap();
-            let mode = meta.permissions().mode() & 0o777;
-            assert_eq!(mode, 0o600, "dev-token must be 0600, got 0o{mode:o}");
-        }
-    }
-
-    #[test]
-    #[cfg(not(feature = "prod-auth"))]
-    fn apply_dev_token_branch_populates_field() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut cfg = Config {
-            auth: AuthConfig {
-                mode: AuthMode::DevToken,
-                dev_token: None,
-                ..AuthConfig::default()
-            },
-            ..Config::default()
-        };
-        apply(&mut cfg, dir.path(), CompatNotice::default()).unwrap();
-        assert!(cfg.auth.dev_token.as_deref().map(str::len) == Some(43));
-    }
-
-    #[test]
-    fn apply_none_branch_blocks_non_loopback() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut cfg = Config {
-            auth: AuthConfig {
-                mode: AuthMode::None,
-                ..AuthConfig::default()
-            },
-            server: nexus_config::ServerConfig {
-                api_bind: "0.0.0.0:8089".into(),
-                ..nexus_config::ServerConfig::default()
-            },
-            ..Config::default()
-        };
-        let err = apply(&mut cfg, dir.path(), CompatNotice::default()).unwrap_err();
-        assert!(err.to_string().contains("loopback"));
-    }
-
-    #[test]
-    fn apply_none_branch_accepts_loopback() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut cfg = Config {
-            auth: AuthConfig {
-                mode: AuthMode::None,
-                ..AuthConfig::default()
-            },
-            server: nexus_config::ServerConfig {
-                api_bind: "127.0.0.1:8089".into(),
-                ..nexus_config::ServerConfig::default()
-            },
-            ..Config::default()
-        };
-        apply(&mut cfg, dir.path(), CompatNotice::default()).unwrap();
-        assert!(
-            cfg.auth.dev_token.is_none(),
-            "mode=none must NOT auto-provision"
-        );
-    }
-
-    #[test]
     fn ensure_admin_secret_generates_then_reads_back() {
         let dir = tempfile::tempdir().unwrap();
         let first = ensure_admin_secret(dir.path()).unwrap();
@@ -454,7 +204,7 @@ mod tests {
             },
             ..Config::default()
         };
-        apply(&mut cfg, dir.path(), CompatNotice::default()).unwrap();
+        apply(&mut cfg, dir.path()).unwrap();
         let p = cfg
             .auth
             .admin_secret_path
@@ -475,7 +225,7 @@ mod tests {
             },
             ..Config::default()
         };
-        apply(&mut cfg, dir.path(), CompatNotice::default()).unwrap();
+        apply(&mut cfg, dir.path()).unwrap();
         assert!(cfg.auth.admin_secret_path.is_some());
     }
 
@@ -492,7 +242,7 @@ mod tests {
             },
             ..Config::default()
         };
-        apply(&mut cfg, dir.path(), CompatNotice::default()).unwrap();
+        apply(&mut cfg, dir.path()).unwrap();
         assert_eq!(cfg.auth.admin_secret_path.as_ref(), Some(&pinned));
         // The auto-provision file MUST NOT have been created.
         assert!(!dir.path().join(ADMIN_SECRET_FILE).exists());
@@ -509,7 +259,7 @@ mod tests {
             },
             ..Config::default()
         };
-        apply(&mut cfg, dir.path(), CompatNotice::default()).unwrap();
+        apply(&mut cfg, dir.path()).unwrap();
         assert!(
             cfg.auth.admin_secret_path.is_none(),
             "pure-OIDC mode must NOT auto-provision an admin secret"

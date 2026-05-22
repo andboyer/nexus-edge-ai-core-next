@@ -716,14 +716,11 @@ mod tests {
     async fn thread_isolated_worker_supports_block_in_place() {
         let cfg = InferenceConfig::default();
         let detector: Arc<dyn Detector> = Arc::new(BlockInPlaceProbe);
-        let backend = ThreadIsolatedBackend::start(0, detector, &cfg)
-            .expect("worker spawn");
+        let backend = ThreadIsolatedBackend::start(0, detector, &cfg).expect("worker spawn");
 
         // Wait briefly for the worker to swap into Ready.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while backend.state() != BackendState::Ready
-            && std::time::Instant::now() < deadline
-        {
+        while backend.state() != BackendState::Ready && std::time::Instant::now() < deadline {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         assert_eq!(backend.state(), BackendState::Ready);
@@ -734,4 +731,3 @@ mod tests {
         assert!(res.unwrap().is_empty());
     }
 }
-

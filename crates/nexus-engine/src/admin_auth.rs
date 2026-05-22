@@ -180,13 +180,6 @@ pub struct AdminAuthState {
     /// Only `None` when no `auth.admin_secret_path` is configured;
     /// cloud-backend admin writes then fail closed.
     secret: Option<String>,
-    /// Plain-string bearer for `auth.mode = "dev_token"` deployments.
-    /// Auto-provisioned by `auth_bootstrap::apply` on first boot and
-    /// pushed into `cfg.auth.dev_token`. When `Some(_)` the middleware
-    /// accepts `Authorization: Bearer <dev_token>` from ANY peer
-    /// (including remote ones), bypassing the loopback-only fallback.
-    /// Compared constant-time. `None` outside DevToken mode.
-    dev_token: Option<String>,
     allow_remote: bool,
 }
 
@@ -207,16 +200,10 @@ impl AdminAuthState {
         let key = secret
             .as_deref()
             .map(|s| DecodingKey::from_secret(s.as_bytes()));
-        // `cfg.dev_token` is populated by `auth_bootstrap::apply`
-        // when `auth.mode = DevToken` (and left None otherwise),
-        // so this clone is also the gate that decides whether the
-        // bearer path below is active at all.
-        let dev_token = cfg.dev_token.clone();
         let allow_remote = std::env::var(ALLOW_REMOTE_ENV).as_deref() == Ok("1");
         Ok(Self {
             key,
             secret,
-            dev_token,
             allow_remote,
         })
     }
@@ -230,33 +217,13 @@ impl AdminAuthState {
     }
 
     /// Test-only constructor — used by the integration tests to
-    /// avoid touching the filesystem. Leaves `dev_token` unset;
-    /// use [`Self::from_parts`] when a test exercises the
-    /// DevToken-mode bearer path.
+    /// avoid touching the filesystem.
     #[cfg(test)]
     pub fn from_secret_bytes(secret: Option<&[u8]>, allow_remote: bool) -> Self {
         let secret_str = secret.map(|b| String::from_utf8_lossy(b).into_owned());
         Self {
             key: secret.map(DecodingKey::from_secret),
             secret: secret_str,
-            dev_token: None,
-            allow_remote,
-        }
-    }
-
-    /// Test-only constructor with explicit `dev_token`. Same
-    /// semantics as [`Self::from_secret_bytes`] otherwise.
-    #[cfg(test)]
-    pub fn from_parts(
-        secret: Option<&[u8]>,
-        dev_token: Option<&str>,
-        allow_remote: bool,
-    ) -> Self {
-        let secret_str = secret.map(|b| String::from_utf8_lossy(b).into_owned());
-        Self {
-            key: secret.map(DecodingKey::from_secret),
-            secret: secret_str,
-            dev_token: dev_token.map(str::to_owned),
             allow_remote,
         }
     }
@@ -345,19 +312,11 @@ fn verify_token(token: &str, key: &DecodingKey) -> Result<AdminClaims, AdminAuth
 /// 2. No JWT (or bad JWT) AND secret IS configured → 401.
 ///    (Once a secret is configured, the bearer is mandatory —
 ///    no loopback bypass. Plan-of-record §380.)
-/// 3. DevToken mode (`auth.mode = "dev_token"`, secret NOT
-///    configured) AND bearer matches `cfg.auth.dev_token` → allow.
-///    Match is constant-time so timing differences don't leak
-///    which prefix matched.
-/// 4. DevToken mode AND bearer present but doesn't match → 401.
-///    Don't fall through to the loopback bypass: a wrong bearer
-///    from any peer is an attack signal, not a typo by the local
-///    operator.
-/// 5. No JWT/dev_token bearer AND peer is loopback → allow.
+/// 3. No JWT AND peer is loopback → allow.
 ///    (Loopback-only callers — local curl, cron — stay friction-
-///    less even in DevToken mode.)
-/// 6. No secret/dev_token bearer match AND `NEXUS_ADMIN_BEARER_ALLOW_REMOTE=1` → allow.
-/// 7. Otherwise → 401.
+///    less when the box hasn't yet provisioned a secret.)
+/// 4. No secret AND `NEXUS_ADMIN_BEARER_ALLOW_REMOTE=1` → allow.
+/// 5. Otherwise → 401.
 pub async fn admin_auth_layer(
     State(state): State<Arc<AdminAuthState>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -396,36 +355,7 @@ pub async fn admin_auth_layer(
         return Ok(next.run(req).await);
     }
 
-    // Path 3 + 4 (DevToken mode, secret NOT configured): plain-
-    // string bearer compared constant-time. A bearer that's
-    // present but mismatched is a hard 401 — we deliberately do
-    // NOT fall through to loopback bypass for that case.
-    if let Some(expected) = state.dev_token.as_deref() {
-        if let Some(provided) = extract_bearer(&req) {
-            if constant_time_eq(provided.as_bytes(), expected.as_bytes()) {
-                tracing::info!(
-                    peer = %peer,
-                    path = %req.uri().path(),
-                    method = %req.method(),
-                    "admin write authorised by dev_token bearer"
-                );
-                let ctx = SessionContext {
-                    user_id: 0,
-                    role: Role::Admin,
-                    jti: "dev-token".to_string(),
-                    is_legacy_admin: true,
-                };
-                req.extensions_mut().insert(ctx);
-                return Ok(next.run(req).await);
-            }
-            tracing::warn!(peer = %peer, "admin write rejected: dev_token mismatch");
-            return Err(AdminAuthError::Invalid);
-        }
-        // No bearer in DevToken mode — fall through to loopback
-        // / allow_remote bypass below so local curl still works.
-    }
-
-    // Path 5 + 6 + 7 (no JWT, no dev_token match): loopback or escape-hatch.
+    // Path 3 + 4 + 5 (no JWT): loopback or escape-hatch.
     if peer_is_loopback(&peer) {
         tracing::debug!(peer = %peer, "admin write allowed: loopback peer (no secret configured)");
         let ctx = SessionContext {
@@ -452,22 +382,6 @@ pub async fn admin_auth_layer(
         return Ok(next.run(req).await);
     }
     Err(AdminAuthError::Missing)
-}
-
-/// Constant-time byte-slice equality. Returns `false` immediately
-/// on length mismatch (length is not a secret), then ORs every
-/// byte XOR so the total comparison time is independent of WHERE
-/// the first differing byte sits. Used to compare dev-token
-/// bearers without leaking the secret prefix via timing.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff: u8 = 0;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
 }
 
 // `admin_auth_layer` attaches as a tower layer via
@@ -682,97 +596,6 @@ mod tests {
         let app = make_app(AdminAuthState::from_secret_bytes(None, true));
         let res = app.oneshot(req_with_peer(&[], remote())).await.unwrap();
         assert_eq!(res.status(), StatusCode::NO_CONTENT);
-    }
-
-    // ------------------------------------------------------------------
-    // DevToken-mode tests. With `auth.mode = "dev_token"` the engine
-    // auto-provisions a 32-byte URL-safe bearer (see auth_bootstrap.rs)
-    // and pushes it into `cfg.auth.dev_token`. The middleware below
-    // must accept that exact bearer from ANY peer (including the LAN
-    // bind that motivates the mode in the first place).
-    // ------------------------------------------------------------------
-
-    const TEST_DEV_TOKEN: &str = "TEST_DEV_TOKEN_43_chars__padded__padded__pad";
-
-    #[tokio::test]
-    async fn dev_token_bearer_match_allows_remote_write() {
-        let app = make_app(AdminAuthState::from_parts(None, Some(TEST_DEV_TOKEN), false));
-        let res = app
-            .oneshot(req_with_peer(
-                &[("authorization", &format!("Bearer {TEST_DEV_TOKEN}"))],
-                remote(),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(res.status(), StatusCode::NO_CONTENT);
-    }
-
-    #[tokio::test]
-    async fn dev_token_bearer_match_allows_loopback_write() {
-        let app = make_app(AdminAuthState::from_parts(None, Some(TEST_DEV_TOKEN), false));
-        let res = app
-            .oneshot(req_with_peer(
-                &[("authorization", &format!("Bearer {TEST_DEV_TOKEN}"))],
-                loopback(),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(res.status(), StatusCode::NO_CONTENT);
-    }
-
-    #[tokio::test]
-    async fn dev_token_bearer_mismatch_returns_401_no_loopback_fallthrough() {
-        // Wrong bearer from a LOOPBACK peer must still be a 401 —
-        // a non-matching bearer is an attack signal regardless of
-        // where the connection came from.
-        let app = make_app(AdminAuthState::from_parts(None, Some(TEST_DEV_TOKEN), false));
-        let res = app
-            .oneshot(req_with_peer(
-                &[("authorization", "Bearer not-the-real-token-not-the-real-toke")],
-                loopback(),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[tokio::test]
-    async fn dev_token_bearer_mismatch_returns_401_remote() {
-        let app = make_app(AdminAuthState::from_parts(None, Some(TEST_DEV_TOKEN), false));
-        let res = app
-            .oneshot(req_with_peer(
-                &[("authorization", "Bearer attacker-guess-attacker-guess-attacker")],
-                remote(),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[tokio::test]
-    async fn dev_token_no_bearer_loopback_still_allowed() {
-        // Local curl shouldn't have to discover the dev_token —
-        // loopback bypass continues to apply when no bearer is
-        // sent at all.
-        let app = make_app(AdminAuthState::from_parts(None, Some(TEST_DEV_TOKEN), false));
-        let res = app.oneshot(req_with_peer(&[], loopback())).await.unwrap();
-        assert_eq!(res.status(), StatusCode::NO_CONTENT);
-    }
-
-    #[tokio::test]
-    async fn dev_token_no_bearer_remote_is_rejected() {
-        let app = make_app(AdminAuthState::from_parts(None, Some(TEST_DEV_TOKEN), false));
-        let res = app.oneshot(req_with_peer(&[], remote())).await.unwrap();
-        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[test]
-    fn constant_time_eq_basic_cases() {
-        assert!(constant_time_eq(b"", b""));
-        assert!(constant_time_eq(b"abc", b"abc"));
-        assert!(!constant_time_eq(b"abc", b"abd"));
-        assert!(!constant_time_eq(b"abc", b"ab"));
-        assert!(!constant_time_eq(b"", b"a"));
     }
 
     #[test]

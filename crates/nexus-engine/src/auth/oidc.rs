@@ -643,6 +643,9 @@ E0Lok+SwQ+nuukOoF+8OH2Ug
             role_claims: vec!["groups".into()],
             role_map: OidcRoleMap::default(),
             deny_unmapped: false,
+            redirect_uri: None,
+            client_secret_file: None,
+            client_secret_env: None,
         }
     }
 

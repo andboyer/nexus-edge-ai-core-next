@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use nexus_bus::{topic, Bus, BusExt};
 use nexus_config::{AnnotatorConfig, CameraConfig, ClipsConfig, StaticObjectConfig};
-use nexus_inference::Detector;
+use nexus_inference::{label_matches_any_prompt, Detector};
 use nexus_rules::RuleEvaluator;
 use nexus_store::{EventStore, MotionEventKind, NewMotionEvent, Store};
 use nexus_tracker::{
@@ -28,7 +28,9 @@ use crate::post_roll::{PostRoll, PostRollAction};
 use crate::recorder::{
     ClipFinal, ClipHandle, ClipRecorder, OpenClip, RecorderError, MAX_CLIP_DURATION_MS,
 };
+use crate::static_clear::StaticAnchorClearRegistry;
 use crate::source::{FrameSource, VirtualSource};
+use crate::stats::FrameStatsRegistry;
 
 pub struct CameraHandle {
     pub camera_id: CameraId,
@@ -51,6 +53,8 @@ pub fn spawn_camera(
     recorder: Arc<dyn ClipRecorder>,
     bus: Arc<dyn Bus>,
     cache: Arc<LatestFrameCache>,
+    stats: Arc<FrameStatsRegistry>,
+    static_clear: Arc<StaticAnchorClearRegistry>,
 ) -> CameraHandle {
     let camera_id = cfg.id;
     let task = tokio::spawn(run_camera(
@@ -66,6 +70,8 @@ pub fn spawn_camera(
         recorder,
         bus,
         cache,
+        stats,
+        static_clear,
     ));
     CameraHandle { camera_id, task }
 }
@@ -84,6 +90,8 @@ async fn run_camera(
     recorder: Arc<dyn ClipRecorder>,
     bus: Arc<dyn Bus>,
     cache: Arc<LatestFrameCache>,
+    stats: Arc<FrameStatsRegistry>,
+    static_clear: Arc<StaticAnchorClearRegistry>,
 ) {
     let span = info_span!(
         "camera.pipeline",
@@ -124,19 +132,31 @@ async fn run_camera(
         // Static-object filter is only built when the camera opted in.
         // We always pass the persistence path (under state_dir) so a
         // toggle from off → on picks up any registry that may already
-        // exist on disk.
+        // exist on disk. Apply per-camera `anchor_ttl_secs` override on
+        // top of the engine-wide `tracker.static_object` snapshot — the
+        // override is the only field a camera can tune today, but the
+        // pattern scales to additional knobs (dwell_frames, etc.) by
+        // adding more `if let Some(...) = ...` clauses here.
+        let mut effective_static_cfg = static_object_cfg;
+        if let Some(ttl) = cfg.behavior.anchor_ttl_secs {
+            effective_static_cfg.anchor_ttl_secs = ttl;
+        }
         let mut static_filter = if cfg.behavior.parking_lot_mode {
             let path = state_dir
                 .join("static_objects")
                 .join(format!("cam-{}.json", cfg.id));
             Some(StaticObjectFilter::new(
-                static_object_cfg,
+                effective_static_cfg,
                 cfg.id,
                 Some(path),
             ))
         } else {
             None
         };
+        // Snapshot the current operator-clear sequence so the first
+        // frame after spawn doesn't trigger a spurious wipe just
+        // because some other camera bumped its counter previously.
+        let mut last_static_clear_seq = static_clear.current(cfg.id);
 
         // Motion-event emitter + per-camera clip handle. Single
         // open clip at a time per camera: opens on the first Born
@@ -157,6 +177,29 @@ async fn run_camera(
 
         while let Some(frame) = rx.recv().await {
             decoded += 1;
+            // M-Admin Phase 0 closeout: keep per-camera fps EMA +
+            // last-frame timestamp + source dims up to date so the
+            // UI can render a live health column without polling
+            // the bus PIPELINE_STATUS topic on every frame.
+            stats.observe_frame(cfg.id, frame.captured_at, frame.width, frame.height);
+
+            // Honour any operator-initiated anchor wipe issued via
+            // `DELETE /api/cameras/{id}/static-anchors` since the
+            // previous frame. Cheap: one atomic load per frame.
+            // Skipped entirely for cameras where the filter is
+            // disabled (`parking_lot_mode = false`).
+            if let Some(filter) = static_filter.as_mut() {
+                let current_seq = static_clear.current(cfg.id);
+                if current_seq != last_static_clear_seq {
+                    debug!(
+                        camera_id = cfg.id,
+                        seq = current_seq,
+                        "static-anchor clear signalled — wiping in-memory + on-disk registry"
+                    );
+                    filter.clear();
+                    last_static_clear_seq = current_seq;
+                }
+            }
             let frame_id = frame.frame_id;
             let trace_id = frame.trace_id.clone();
 
@@ -174,6 +217,7 @@ async fn run_camera(
             };
             if !pass {
                 debug!(camera_id = cfg.id, frame_id, "gate dropped frame");
+                stats.observe_dropped(cfg.id);
                 continue;
             }
 
@@ -234,6 +278,33 @@ async fn run_camera(
                         continue;
                     }
                 }
+            };
+            // Per-camera `prompts` whitelist applied uniformly across
+            // every detector kind. Open-vocab models (yolo_world,
+            // yoloe) also receive `prompts` as input to scope their
+            // classes; this retain is idempotent for them. Closed-vocab
+            // YOLO/COCO ignores the input `prompts` and emits every
+            // mapped class, so this is the only enforcement point
+            // that catches it. Empty prompts disables the filter
+            // (see `label_matches_any_prompt`).
+            let detections: Vec<_> = if prompts.is_empty() {
+                detections
+            } else {
+                let before = detections.len();
+                let kept: Vec<_> = detections
+                    .into_iter()
+                    .filter(|d| label_matches_any_prompt(&d.label, &prompts))
+                    .collect();
+                if before != kept.len() {
+                    debug!(
+                        camera_id = cfg.id,
+                        frame_id,
+                        before,
+                        after = kept.len(),
+                        "prompts whitelist dropped detections"
+                    );
+                }
+                kept
             };
             detected += 1;
 

@@ -190,6 +190,13 @@ pub struct OidcLoginState {
     pub oidc_client: Arc<OidcClient>,
     pub cfg: OidcConfig,
     pub sessions: OidcLoginSessions,
+    /// Optional OIDC client secret, loaded from
+    /// `cfg.auth.oidc.client_secret_file` at engine boot. When
+    /// present, sent alongside PKCE to the token endpoint
+    /// (confidential web-app flow); when `None`, PKCE-only.
+    /// Wrapped in `Arc` so cloning `OidcLoginState` doesn't
+    /// duplicate the secret in the heap.
+    pub client_secret: Option<Arc<String>>,
 }
 
 impl FromRef<ApiState> for OidcLoginState {
@@ -422,6 +429,7 @@ pub async fn get_callback(
     let token_resp = exchange_code(
         &s.oidc_client.token_endpoint(),
         &s.cfg,
+        s.client_secret.as_deref().map(|s| s.as_str()),
         &code,
         &pending.pkce_verifier,
     )
@@ -611,7 +619,7 @@ fn build_authorization_url(
 ) -> String {
     let client_id = cfg.client_id.as_deref().unwrap_or(cfg.audience.as_str());
     let scopes = cfg.scopes.join(" ");
-    let redirect_uri = oidc_redirect_uri();
+    let redirect_uri = oidc_redirect_uri(cfg);
     // `state_redirect_to` is held in the session map, NOT in the
     // URL — keeping the URL short and not surfacing operator
     // navigation paths to the IdP.
@@ -639,20 +647,22 @@ fn build_authorization_url(
 }
 
 /// The redirect URI we hand to the IdP. The OIDC spec requires
-/// this be byte-identical between `/start` and `/callback`.
-fn oidc_redirect_uri() -> String {
-    // For now we hard-code the relative path. A future config
-    // knob would let multi-host deployments override the host
-    // portion; the IdP needs to be told the exact value at
-    // client-registration time so this string can't actually
-    // vary at runtime without operator action.
-    //
-    // Most IdPs accept a relative path for the redirect_uri
-    // when validating against the registered client, but a few
-    // (Entra) require the full URL. Operators who hit that can
-    // set `auth.oidc.redirect_uri = "..."` once that config
-    // knob exists.
-    "/api/v1/auth/oidc/callback".to_string()
+/// this be byte-identical between the `/authorize` redirect
+/// and the `/token` exchange.
+///
+/// Resolution order:
+///
+///   1. `cfg.redirect_uri` if set — used verbatim. Operators
+///      MUST set this to the exact URL registered with the IdP
+///      (Entra requires a full HTTPS URL; localhost over HTTP
+///      is allowed for development).
+///   2. Fallback to the relative path
+///      `/api/v1/auth/oidc/callback` — accepted by Authentik,
+///      Keycloak, Okta, Google; rejected by Entra.
+fn oidc_redirect_uri(cfg: &OidcConfig) -> String {
+    cfg.redirect_uri
+        .clone()
+        .unwrap_or_else(|| "/api/v1/auth/oidc/callback".to_string())
 }
 
 fn url_encode(s: &str) -> String {
@@ -839,19 +849,26 @@ struct TokenEndpointResponse {
 async fn exchange_code(
     token_endpoint: &str,
     cfg: &OidcConfig,
+    client_secret: Option<&str>,
     code: &str,
     pkce_verifier: &str,
 ) -> Result<TokenEndpointResponse, String> {
     let client = reqwest::Client::new();
     let client_id = cfg.client_id.as_deref().unwrap_or(cfg.audience.as_str());
-    let redirect_uri = oidc_redirect_uri();
-    let params = [
-        ("grant_type", "authorization_code"),
-        ("code", code),
-        ("redirect_uri", &redirect_uri),
-        ("client_id", client_id),
-        ("code_verifier", pkce_verifier),
-    ];
+    let redirect_uri = oidc_redirect_uri(cfg);
+    // Build the form params dynamically because
+    // `client_secret` is optional. The fixed five always go in;
+    // the secret only when an operator has wired it via
+    // `client_secret_file`.
+    let mut params: Vec<(&str, &str)> = Vec::with_capacity(6);
+    params.push(("grant_type", "authorization_code"));
+    params.push(("code", code));
+    params.push(("redirect_uri", &redirect_uri));
+    params.push(("client_id", client_id));
+    params.push(("code_verifier", pkce_verifier));
+    if let Some(secret) = client_secret {
+        params.push(("client_secret", secret));
+    }
     let resp = client
         .post(token_endpoint)
         .form(&params)
@@ -907,6 +924,62 @@ mod tests {
         assert_eq!(sanitise_redirect_to(Some("/good")), "/good");
     }
 
+    fn cfg_with_redirect(redirect_uri: Option<&str>) -> OidcConfig {
+        OidcConfig {
+            issuer: "https://idp.test/".into(),
+            audience: "cid".into(),
+            jwks_uri: None,
+            client_id: None,
+            display_name: None,
+            scopes: vec!["openid".into()],
+            role_claims: vec!["groups".into()],
+            role_map: Default::default(),
+            deny_unmapped: false,
+            redirect_uri: redirect_uri.map(str::to_string),
+            client_secret_file: None,
+            client_secret_env: None,
+        }
+    }
+
+    #[test]
+    fn redirect_uri_defaults_to_relative_callback() {
+        assert_eq!(
+            oidc_redirect_uri(&cfg_with_redirect(None)),
+            "/api/v1/auth/oidc/callback",
+        );
+    }
+
+    #[test]
+    fn redirect_uri_override_is_used_verbatim() {
+        // The OIDC spec mandates byte-identity between the
+        // authorize redirect_uri and the token redirect_uri, so
+        // we must NOT canonicalise or trim. This test pins that.
+        let cfg = cfg_with_redirect(Some("https://nexus.example.com/api/v1/auth/oidc/callback"));
+        assert_eq!(
+            oidc_redirect_uri(&cfg),
+            "https://nexus.example.com/api/v1/auth/oidc/callback",
+        );
+    }
+
+    #[test]
+    fn build_auth_url_uses_redirect_uri_override_when_set() {
+        // Entra-style absolute URL — must appear URL-encoded in
+        // the authorize URL.
+        let cfg = cfg_with_redirect(Some("http://localhost:8089/api/v1/auth/oidc/callback"));
+        let url = build_authorization_url(
+            "https://login.microsoftonline.com/TENANT/oauth2/v2.0/authorize",
+            &cfg,
+            "S",
+            "N",
+            "C",
+        );
+        assert!(url.contains(
+            "redirect_uri=http%3A%2F%2Flocalhost%3A8089%2Fapi%2Fv1%2Fauth%2Foidc%2Fcallback"
+        ));
+        // The fallback relative path must NOT appear.
+        assert!(!url.contains("redirect_uri=%2Fapi%2Fv1"));
+    }
+
     #[test]
     fn pkce_challenge_matches_rfc7636_example() {
         // RFC 7636 Appendix B fixture:
@@ -937,6 +1010,9 @@ mod tests {
             role_claims: vec!["groups".into()],
             role_map: Default::default(),
             deny_unmapped: false,
+            redirect_uri: None,
+            client_secret_file: None,
+            client_secret_env: None,
         };
         let url = build_authorization_url(
             "https://idp.test/auth",
@@ -968,6 +1044,9 @@ mod tests {
             role_claims: vec!["groups".into()],
             role_map: Default::default(),
             deny_unmapped: false,
+            redirect_uri: None,
+            client_secret_file: None,
+            client_secret_env: None,
         };
         // Some IdPs publish auth endpoints with an existing `?prompt=...`
         let url =

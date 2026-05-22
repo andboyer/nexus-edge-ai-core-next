@@ -45,9 +45,9 @@ use md5::{Digest, Md5};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
-use tracing::debug;
+use tracing::{debug, info};
 
-use super::{ProbeRtspReq, ProbeRtspResult, SdpStream};
+use super::{ProbeRtspReq, ProbeRtspResult, ProbeStream, SdpStream};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(1_500);
 const READ_TIMEOUT: Duration = Duration::from_millis(3_000);
@@ -62,14 +62,14 @@ const MAX_RESPONSE: usize = 64 * 1024;
 ///   * Axis — `/axis-media/media.amp`
 ///   * Reolink — `/h264Preview_01_main`
 ///   * Foscam — `/videoMain`
-///   * TP-Link Tapo / VIGI — `/stream1`
+///   * TP-Link Tapo / VIGI — `/stream1` (main), `/stream2` (sub)
 ///   * Generic ONVIF profile names — `/Streaming/Channels/1`, `/live`
 ///   * Last-resort `/` for everything else (the camera's own root,
 ///     used by some Bosch and budget devices).
 ///
-/// Substream variants (`102`, `subtype=1`, …) live AFTER the
-/// matching main-stream entry so the bandwidth-hungry main feed is
-/// the default Add suggestion when both work.
+/// Substream variants (`102`, `subtype=1`, `stream2`, …) live AFTER
+/// the matching main-stream entry so the bandwidth-hungry main feed
+/// is the default Add suggestion when both work.
 const DEFAULT_PATHS: &[&str] = &[
     "/Streaming/Channels/101",
     "/Streaming/Channels/102",
@@ -80,6 +80,7 @@ const DEFAULT_PATHS: &[&str] = &[
     "/h264Preview_01_sub",
     "/videoMain",
     "/stream1",
+    "/stream2",
     "/live",
     "/Streaming/Channels/1",
     "/",
@@ -98,54 +99,139 @@ pub(crate) async fn probe(req: &ProbeRtspReq) -> ProbeRtspResult {
         vec![requested.to_string()]
     };
 
-    let mut last: Option<ProbeRtspResult> = None;
-    for candidate in &candidates {
+    // Probe every candidate in parallel. Per-path latency is
+    // dominated by CONNECT_TIMEOUT (1.5s) + READ_TIMEOUT (3s)
+    // worst case, so a 12-candidate sweep that ran sequentially
+    // would cost up to ~50s — unacceptable for a synchronous
+    // operator-facing endpoint. Running all 12 concurrent TCP
+    // probes against one host is fine (each socket is
+    // independent in the kernel) and bounds wall-clock to ~5s.
+    let attempts = candidates.iter().map(|c| {
         let attempt = ProbeRtspReq {
             host: req.host.clone(),
             port: req.port,
-            path: candidate.clone(),
+            path: c.clone(),
             username: req.username.clone(),
             password: req.password.clone(),
         };
-        match probe_inner(&attempt).await {
-            Ok(mut r) => {
-                if r.ok {
-                    r.path = Some(candidate.clone());
-                    return r;
+        let path = c.clone();
+        async move { (path, probe_inner(&attempt).await) }
+    });
+    let results = futures::future::join_all(attempts).await;
+
+    // Partition into (winning, auth-blocked, other-failure). The
+    // winners list is returned to the UI so the operator sees
+    // "main + sub" when both work; the failures determine the
+    // status field surfaced when nothing answered.
+    let mut winners: Vec<(String, Vec<SdpStream>)> = Vec::new();
+    let mut auth_status: Option<u16> = None;
+    let mut other_status: Option<u16> = None;
+    // Per-path summary table for diagnostics. Logged at INFO so
+    // the operator-facing error message can be cross-referenced
+    // against the engine log when a probe sweep returns no
+    // winners (e.g. all 12 vendor paths return 405 because the
+    // camera is non-standard).
+    let mut summary: Vec<(String, String)> = Vec::with_capacity(candidates.len());
+    for (path, r) in results {
+        match r {
+            Ok(probe_result) => {
+                let tag = if probe_result.ok {
+                    format!("200 OK ({} sdp tracks)", probe_result.sdp_streams.len())
+                } else {
+                    format!("status {}", probe_result.status)
+                };
+                summary.push((path.clone(), tag));
+                if probe_result.ok {
+                    winners.push((path, probe_result.sdp_streams));
+                } else if probe_result.status == 401 || probe_result.status == 403 {
+                    auth_status.get_or_insert(probe_result.status);
+                } else if probe_result.status != 0 {
+                    other_status.get_or_insert(probe_result.status);
                 }
-                // Auth failure means the camera *did* answer; trying
-                // a different path won't get us past the gate. Stop
-                // here so the operator sees the 401 and supplies
-                // credentials (or fixes the ones they typed).
-                if r.status == 401 || r.status == 403 {
-                    r.path = Some(candidate.clone());
-                    return r;
-                }
-                last = Some(r);
             }
             Err(e) => {
+                summary.push((path.clone(), format!("io error: {e}")));
                 debug!(
                     host = %req.host,
                     port = req.port,
-                    path = %candidate,
+                    path = %path,
                     error = %e,
                     "rtsp Verify candidate failed"
                 );
             }
         }
     }
+    let summary_str = summary
+        .iter()
+        .map(|(p, s)| format!("{p} -> {s}"))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    // INFO when nothing answered with 200 (operator-actionable
+    // failure — they want to see the per-path status); DEBUG
+    // when at least one path won (sweep succeeded, summary is
+    // noise unless someone is actively debugging).
+    if winners.is_empty() {
+        info!(
+            host = %req.host,
+            port = req.port,
+            with_creds = req.username.is_some(),
+            winners = winners.len(),
+            candidates = candidates.len(),
+            "rtsp probe sweep: {summary_str}"
+        );
+    } else {
+        debug!(
+            host = %req.host,
+            port = req.port,
+            with_creds = req.username.is_some(),
+            winners = winners.len(),
+            candidates = candidates.len(),
+            "rtsp probe sweep: {summary_str}"
+        );
+    }
 
-    // Every candidate either errored or returned ok=false. Return
-    // the last non-error reply so the UI surfaces the camera's
-    // actual status code (e.g. 401 means "creds wrong", 404 means
-    // "we tried every default path and none matched — operator
-    // needs to supply the path manually").
-    last.unwrap_or(ProbeRtspResult {
+    if !winners.is_empty() {
+        // Build the per-path summary in the candidate order so
+        // the UI shows main-stream above sub-stream (DEFAULT_PATHS
+        // is curated that way; explicit-path callers have only one).
+        let streams: Vec<ProbeStream> = winners
+            .iter()
+            .map(|(path, sdp_streams)| {
+                let video = sdp_streams
+                    .iter()
+                    .find(|s| {
+                        let c = s.codec.to_ascii_uppercase();
+                        c.starts_with("H26") || c == "AV1" || c == "VP9" || c == "VP8"
+                    })
+                    .or_else(|| sdp_streams.first());
+                ProbeStream {
+                    path: path.clone(),
+                    codec: video.map(|s| s.codec.clone()),
+                    resolution: video.and_then(|s| s.resolution.clone()),
+                }
+            })
+            .collect();
+        let (first_path, first_sdp) = winners.into_iter().next().expect("non-empty");
+        return ProbeRtspResult {
+            ok: true,
+            status: 200,
+            sdp_streams: first_sdp,
+            path: Some(first_path),
+            streams,
+        };
+    }
+
+    // Nothing answered with 200. Prefer 401/403 over other
+    // statuses since auth is the actionable failure the operator
+    // can fix (typing creds), where 404/500 mostly mean
+    // "wrong device or wrong path list".
+    ProbeRtspResult {
         ok: false,
-        status: 0,
+        status: auth_status.or(other_status).unwrap_or(0),
         sdp_streams: Vec::new(),
         path: None,
-    })
+        streams: Vec::new(),
+    }
 }
 
 async fn probe_inner(req: &ProbeRtspReq) -> io::Result<ProbeRtspResult> {
@@ -153,24 +239,43 @@ async fn probe_inner(req: &ProbeRtspReq) -> io::Result<ProbeRtspResult> {
     let host = req.host.trim();
     let url = format!("rtsp://{host}:{port}{path}", port = req.port);
 
+    // Keep ONE TCP connection open across every leg of this
+    // probe (OPTIONS → DESCRIBE-noauth → DESCRIBE-with-auth).
+    // Cheap embedded RTSP servers (verified on TP-Link
+    // IP-Camera firmware ca. 2024 / 2026) bind their digest
+    // nonces to the originating TCP connection: presenting a
+    // nonce from leg-1 over a *fresh* socket makes the server
+    // treat it as stale and reply 401 with a brand-new nonce,
+    // forever. The same nonce sent over the same socket works
+    // first try. Spec-pedants would point to RFC 2617 §3.3
+    // (`stale=true`/`false`) — TP-Link omits the field, so we
+    // have to compensate by keeping the socket alive.
+    let mut conn = RtspConn::connect(host, req.port).await?;
+
     // OPTIONS — purely a liveness check. Even if the camera
     // requires auth on DESCRIBE, OPTIONS is usually open.
-    let options_text = send_rtsp(
-        host,
-        req.port,
-        &build_request("OPTIONS", &url, 1, None, None),
-    )
-    .await?;
+    let options_text = conn
+        .send_recv(&build_request("OPTIONS", &url, 1, None, None))
+        .await?;
     let (options_status, _options_headers, _) = split_response(&options_text);
 
     // DESCRIBE leg 1 — no auth.
-    let describe_text = send_rtsp(
-        host,
-        req.port,
-        &build_request("DESCRIBE", &url, 2, None, Some("application/sdp")),
-    )
-    .await?;
+    let describe_text = conn
+        .send_recv(&build_request(
+            "DESCRIBE",
+            &url,
+            2,
+            None,
+            Some("application/sdp"),
+        ))
+        .await?;
     let (status_1, headers_1, body_1) = split_response(&describe_text);
+    debug!(
+        host = %req.host, port = req.port, path = %path,
+        options_status, status_1, body_1_len = body_1.len(),
+        challenges = %find_all_header_values(headers_1, "WWW-Authenticate").join(" || "),
+        "rtsp probe: leg-1 DESCRIBE (no auth) response"
+    );
 
     if status_1 == 200 && !body_1.is_empty() {
         return Ok(ProbeRtspResult {
@@ -180,6 +285,7 @@ async fn probe_inner(req: &ProbeRtspReq) -> io::Result<ProbeRtspResult> {
             // Filled in by the caller in `probe()` once it knows
             // which candidate path won — leave None here.
             path: None,
+            streams: Vec::new(),
         });
     }
 
@@ -210,6 +316,12 @@ async fn probe_inner(req: &ProbeRtspReq) -> io::Result<ProbeRtspResult> {
                     continue;
                 };
                 let auth_header = build_digest_response(&params, user, pw, "DESCRIBE", &url, 3);
+                debug!(
+                    host = %req.host, port = req.port, path = %path,
+                    realm = %params.realm, qop = ?params.qop, algorithm = ?params.algorithm,
+                    auth_header_redacted = %redact_response(&auth_header),
+                    "rtsp digest retry: sending DESCRIBE with computed response"
+                );
                 let body = build_request(
                     "DESCRIBE",
                     &url,
@@ -217,14 +329,22 @@ async fn probe_inner(req: &ProbeRtspReq) -> io::Result<ProbeRtspResult> {
                     Some(&auth_header),
                     Some("application/sdp"),
                 );
-                let text = send_rtsp(host, req.port, &body).await?;
-                let (status_2, _h2, body_2) = split_response(&text);
+                // Same socket as leg-1 — see RtspConn comment.
+                let text = conn.send_recv(&body).await?;
+                let (status_2, h2, body_2) = split_response(&text);
+                debug!(
+                    host = %req.host, port = req.port, path = %path,
+                    status = status_2, body_len = body_2.len(),
+                    headers = %h2.lines().take(12).collect::<Vec<_>>().join(" | "),
+                    "rtsp digest retry: server response"
+                );
                 if status_2 == 200 && !body_2.is_empty() {
                     return Ok(ProbeRtspResult {
                         ok: true,
                         status: 200,
                         sdp_streams: parse_sdp(body_2),
                         path: None,
+                        streams: Vec::new(),
                     });
                 }
                 last_status = status_2;
@@ -246,7 +366,10 @@ async fn probe_inner(req: &ProbeRtspReq) -> io::Result<ProbeRtspResult> {
                     Some(&auth_header),
                     Some("application/sdp"),
                 );
-                let text = send_rtsp(host, req.port, &body).await?;
+                // Basic doesn't need socket reuse (no nonce),
+                // but use the same conn for symmetry and so we
+                // don't pay a second TCP handshake.
+                let text = conn.send_recv(&body).await?;
                 let (status_2, _h2, body_2) = split_response(&text);
                 if status_2 == 200 && !body_2.is_empty() {
                     return Ok(ProbeRtspResult {
@@ -254,6 +377,7 @@ async fn probe_inner(req: &ProbeRtspReq) -> io::Result<ProbeRtspResult> {
                         status: 200,
                         sdp_streams: parse_sdp(body_2),
                         path: None,
+                        streams: Vec::new(),
                     });
                 }
                 last_status = status_2;
@@ -264,6 +388,7 @@ async fn probe_inner(req: &ProbeRtspReq) -> io::Result<ProbeRtspResult> {
                 status: last_status,
                 sdp_streams: Vec::new(),
                 path: None,
+                streams: Vec::new(),
             });
         }
     }
@@ -280,59 +405,79 @@ async fn probe_inner(req: &ProbeRtspReq) -> io::Result<ProbeRtspResult> {
         },
         sdp_streams: Vec::new(),
         path: None,
+        streams: Vec::new(),
     })
 }
 
-/// Connect, write request, read reply head + body (up to
-/// `MAX_RESPONSE` bytes), close the socket. Reused for both
-/// OPTIONS and DESCRIBE.
-async fn send_rtsp(host: &str, port: u16, req: &str) -> io::Result<String> {
-    // Resolve the host. `IpAddr::parse` first so we don't pay
-    // for DNS when the operator already typed a dotted-quad.
-    let addr = if let Ok(ip) = host.parse::<IpAddr>() {
-        SocketAddr::new(ip, port)
-    } else {
-        let mut iter = tokio::net::lookup_host((host, port)).await?;
-        iter.next()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no DNS result"))?
-    };
+/// Persistent RTSP/TCP connection used for the duration of
+/// one probe attempt (per candidate path). We keep this around
+/// the whole probe so the camera's digest-auth nonce stays
+/// valid across the OPTIONS / DESCRIBE-noauth / DESCRIBE-auth
+/// sequence; see the comment in `probe_inner` for the
+/// motivating TP-Link behaviour.
+struct RtspConn {
+    stream: TcpStream,
+}
 
-    let mut stream = timeout(CONNECT_TIMEOUT, TcpStream::connect(addr))
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "connect timeout"))??;
-    stream.set_nodelay(true).ok();
-    timeout(READ_TIMEOUT, stream.write_all(req.as_bytes()))
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "write timeout"))??;
-
-    let mut out = Vec::with_capacity(8 * 1024);
-    let mut buf = [0u8; 4096];
-    loop {
-        let n = match timeout(READ_TIMEOUT, stream.read(&mut buf)).await {
-            Ok(Ok(0)) => break,
-            Ok(Ok(n)) => n,
-            Ok(Err(e)) => return Err(e),
-            Err(_) => break, // read timeout — return whatever we have
+impl RtspConn {
+    async fn connect(host: &str, port: u16) -> io::Result<Self> {
+        // Resolve the host. `IpAddr::parse` first so we don't
+        // pay for DNS when the operator already typed a
+        // dotted-quad.
+        let addr = if let Ok(ip) = host.parse::<IpAddr>() {
+            SocketAddr::new(ip, port)
+        } else {
+            let mut iter = tokio::net::lookup_host((host, port)).await?;
+            iter.next()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no DNS result"))?
         };
-        out.extend_from_slice(&buf[..n]);
-        if out.len() >= MAX_RESPONSE {
-            break;
-        }
-        // Cheap optimization: if we already have `\r\n\r\n` and
-        // (no Content-Length or we've read at least that many
-        // body bytes) we can stop early. Doing it inline keeps
-        // the function ~50 LoC; the cost of the extra wakeup
-        // when the camera trickles bytes is negligible.
-        if let Some(head_end) = window_index(&out, b"\r\n\r\n") {
-            let head = &out[..head_end];
-            if let Some(cl) = parse_content_length(head) {
-                if out.len() - (head_end + 4) >= cl {
-                    break;
+
+        let stream = timeout(CONNECT_TIMEOUT, TcpStream::connect(addr))
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "connect timeout"))??;
+        stream.set_nodelay(true).ok();
+        Ok(Self { stream })
+    }
+
+    /// Write one RTSP request and read back exactly one reply
+    /// (head + body bounded by `Content-Length`, or just head
+    /// if no `Content-Length` advertised — RTSP servers don't
+    /// chunk, so absence of CL means empty body).
+    async fn send_recv(&mut self, req: &str) -> io::Result<String> {
+        timeout(READ_TIMEOUT, self.stream.write_all(req.as_bytes()))
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "write timeout"))??;
+
+        let mut out = Vec::with_capacity(8 * 1024);
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = match timeout(READ_TIMEOUT, self.stream.read(&mut buf)).await {
+                Ok(Ok(0)) => break, // server closed — return whatever we have
+                Ok(Ok(n)) => n,
+                Ok(Err(e)) => return Err(e),
+                Err(_) => break, // read timeout — return whatever we have
+            };
+            out.extend_from_slice(&buf[..n]);
+            if out.len() >= MAX_RESPONSE {
+                break;
+            }
+            // Frame on `\r\n\r\n`. With Content-Length: wait for
+            // CL body bytes after the head. Without: return
+            // immediately — keeping the socket open for the
+            // next request. (The old send_rtsp closed the
+            // socket after each call so it could afford to
+            // block on EOF; we cannot.)
+            if let Some(head_end) = window_index(&out, b"\r\n\r\n") {
+                let head = &out[..head_end];
+                match parse_content_length(head) {
+                    Some(cl) if out.len() - (head_end + 4) >= cl => break,
+                    None => break,
+                    _ => {}
                 }
             }
         }
+        Ok(String::from_utf8_lossy(&out).into_owned())
     }
-    Ok(String::from_utf8_lossy(&out).into_owned())
 }
 
 fn window_index(hay: &[u8], needle: &[u8]) -> Option<usize> {
@@ -632,6 +777,32 @@ fn md5_hex(s: &str) -> String {
         out.push_str(&format!("{b:02x}"));
     }
     out
+}
+
+/// Replace the `response="..."` value in a Digest authorization
+/// header with a short prefix + `...`, leaving every other field
+/// (realm, nonce, uri, qop, nc, cnonce, algorithm) intact. Used
+/// for debug logging — the response hash is the only field that
+/// would let an observer brute-force the password offline; every
+/// other field is already on the wire in cleartext. We keep the
+/// 8-char prefix so two consecutive logs are visually
+/// distinguishable for "did the response change between
+/// attempts?" diagnosis.
+fn redact_response(header: &str) -> String {
+    let needle = "response=\"";
+    let Some(start) = header.find(needle) else {
+        return header.to_string();
+    };
+    let value_start = start + needle.len();
+    let Some(end_offset) = header[value_start..].find('"') else {
+        return header.to_string();
+    };
+    let value_end = value_start + end_offset;
+    let prefix = &header[..value_start];
+    let value = &header[value_start..value_end];
+    let suffix = &header[value_end..];
+    let short = value.chars().take(8).collect::<String>();
+    format!("{prefix}{short}...{suffix}")
 }
 
 // ---------------------------------------------------------------------------

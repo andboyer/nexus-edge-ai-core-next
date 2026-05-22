@@ -65,9 +65,8 @@ json_logs = false
 # signing secret auto-provisions to `<runtime.state_dir>/admin-secret`
 # (mode 0600). See `docs/ARCHITECTURE.md §11` for the full identity
 # model and `docs/INSTALL.md §8.3` for the alternatives below.
-mode = "local" # none | dev_token | local | oidc | hybrid
+mode = "local" # local | oidc | hybrid
 # admin_secret_path = "/var/lib/nexus/state/admin-secret"  # pin to skip autoprovision
-# dev_token = "change-me"  # only relevant when mode = "dev_token"
 #
 # --- Identity architecture (read before changing `mode`) ----------
 # The shipping product authenticates end users at the cloud-console

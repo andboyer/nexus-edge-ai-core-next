@@ -22,6 +22,12 @@ Thumbs.db
 # never commit the .onnx / manifest files.
 /models/*
 !/models/.gitkeep
+# Upstream model checkpoints / torchscript dumps occasionally land at
+# the repo root from `tools/models/gen_*.py` runs. They are large
+# binaries — keep them out of git, same rationale as /models/*.
+/*.pt
+/*.onnx
+/mobileclip2_b.ts
 *.db
 *.db-journal
 *.db-wal
@@ -50,3 +56,6 @@ __pycache__
 
 # OTEL
 otel.log
+
+# Personal VS Code workspace file (machine-local paths).
+/nexus-edge-ai-core-next.code-workspace

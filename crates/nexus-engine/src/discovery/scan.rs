@@ -97,12 +97,21 @@ async fn probe_host(host: IpAddr, ports: &[u16]) -> Option<DiscoveredDevice> {
         tasks.push(tokio::spawn(probe_one(host, port)));
     }
     let mut best: Option<DiscoveredDevice> = None;
+    // Remember the RTSP port even when ONVIF wins the merge.
+    // Cameras with both services open lose their RTSP entry when
+    // we pick the ONVIF one as `best`; without this side-channel
+    // the UI would later send Probe to port 80 and get 405 from
+    // the camera's HTTP listener for every candidate path.
+    let mut rtsp_port_seen: Option<u16> = None;
     for t in tasks {
         let r = match t.await {
             Ok(r) => r,
             Err(_) => continue,
         };
         if let Some(dev) = r {
+            if dev.kind == DeviceKind::Rtsp {
+                rtsp_port_seen = Some(dev.port);
+            }
             match (&best, dev.kind) {
                 (None, _) => best = Some(dev),
                 (Some(cur), DeviceKind::Onvif) if cur.kind == DeviceKind::Rtsp => {
@@ -112,7 +121,16 @@ async fn probe_host(host: IpAddr, ports: &[u16]) -> Option<DiscoveredDevice> {
             }
         }
     }
-    best
+    best.map(|mut dev| {
+        if dev.rtsp_port.is_none() {
+            dev.rtsp_port = rtsp_port_seen.or(if dev.kind == DeviceKind::Rtsp {
+                Some(dev.port)
+            } else {
+                None
+            });
+        }
+        dev
+    })
 }
 
 /// One TCP probe. Dispatches on port to RTSP vs ONVIF flavour.
@@ -155,11 +173,17 @@ async fn probe_rtsp_options(host: IpAddr, port: u16) -> Option<DiscoveredDevice>
         ip: host.to_string(),
         port,
         kind: DeviceKind::Rtsp,
+        rtsp_port: Some(port),
         vendor,
         model: server.clone(),
         hardware: None,
         firmware: None,
         mac: None,
+        // CIDR scan only does an RTSP OPTIONS probe — no SOAP
+        // service discovery on this path. The ONVIF Media query
+        // is skipped for these devices; brute-force path sweep
+        // remains the only option.
+        onvif_xaddrs: None,
         rtsp_paths: Vec::new(),
     })
 }
@@ -221,11 +245,23 @@ async fn probe_onvif_soap(host: IpAddr, port: u16) -> Option<DiscoveredDevice> {
         ip: host.to_string(),
         port,
         kind: DeviceKind::Onvif,
+        // Leave None — the merge in `probe_host` will fill this
+        // in if the parallel 554 probe also succeeded, otherwise
+        // the UI defaults to 554 (correct for ~all IP cameras).
+        rtsp_port: None,
         vendor,
         model: server.clone(),
         hardware: None,
         firmware: None,
         mac: None,
+        // Synthesise the standard ONVIF service URL from
+        // (host, port) so the inline `onvif-streams` probe has
+        // something to point at. Vendors that put device_service
+        // on a non-standard path won't be reachable via this
+        // CIDR-scan find — they need WS-Discovery (which
+        // captures the verbatim XAddrs) to populate the real
+        // URL. Acceptable: CIDR scan is the fallback path.
+        onvif_xaddrs: Some(format!("http://{host}:{port}/onvif/device_service")),
         rtsp_paths: Vec::new(),
     })
 }

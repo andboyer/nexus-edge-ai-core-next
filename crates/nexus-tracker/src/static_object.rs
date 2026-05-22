@@ -78,12 +78,19 @@ struct PerTrackState {
 
 /// Persisted record of a known-static vehicle location for a camera.
 /// `label` is the lowercased TrackedObject label; centers are in
-/// pixel coordinates.
+/// pixel coordinates. `last_seen_unix_ms` is the wall-clock time of
+/// the most recent matching observation — stamped from the frame's
+/// `captured_at` so a long offline gap correctly ages the anchor.
+/// Optional so existing registry files (from before the TTL sweep
+/// landed) deserialise unchanged; first matching observation after
+/// load promotes it from `None` to `Some(frame_ms)`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StaticAnchor {
     pub label: String,
     pub center_x: f32,
     pub center_y: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_seen_unix_ms: Option<i64>,
 }
 
 /// On-disk shape of the per-camera registry. v1's shape was
@@ -139,6 +146,36 @@ impl StaticObjectFilter {
         &self.anchors
     }
 
+    /// Wipe every persisted anchor and per-track state for this
+    /// camera, then remove the on-disk registry file (so a restart
+    /// doesn't resurrect what the operator just cleared). Used by
+    /// `DELETE /api/cameras/{id}/static-anchors` — the supervisor
+    /// polls a shared clear-registry per frame and invokes this
+    /// when an operator requests a reset.
+    ///
+    /// Existing parked vehicles still in view will re-promote
+    /// naturally after `dwell_frames` static frames; this is the
+    /// intended behaviour (operators clear the map because a
+    /// vehicle drove off undetected, not because they want
+    /// permanent suppression of an in-view car).
+    pub fn clear(&mut self) {
+        self.anchors.clear();
+        self.state_by_track.clear();
+        if let Some(path) = &self.persistence_path {
+            match fs::remove_file(path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    warn!(
+                        camera_id = self.camera_id,
+                        path = %path.display(),
+                        "static-object registry clear failed: {e}",
+                    );
+                }
+            }
+        }
+    }
+
     /// Classify each track in `objects` as static-or-not, and stamp
     /// [`STATIC_ATTRIBUTE_KEY`] = `true` on the attributes map of any
     /// object that the suppression FSM has promoted (or that matches
@@ -163,6 +200,9 @@ impl StaticObjectFilter {
         let cfg_match_dist = self.cfg.match_distance_pixels.max(1) as f32;
         let cfg_reset_px = self.cfg.track_id_reuse_reset_pixels as f64;
         let cfg_persistence = self.cfg.persistence_enabled;
+        // Wall-clock used to refresh / age anchors. Pulled from the
+        // frame so tests and replay scenarios behave deterministically.
+        let frame_ms = _frame.captured_at.timestamp_millis();
 
         // Build a "static?" verdict per-index without touching the
         // objects yet, because we mutate `self.anchors` inside the
@@ -241,6 +281,13 @@ impl StaticObjectFilter {
                 if state.moving_consecutive_frames >= cfg_sig_frames {
                     self.anchors.remove(idx);
                     dirty = true;
+                } else {
+                    // Still parked — refresh `last_seen` so the TTL
+                    // sweep doesn't prune an anchor whose vehicle is
+                    // visibly still there. In-memory update only; the
+                    // disk write is debounced to structural changes
+                    // (promote / demote / sweep / centroid drift).
+                    self.anchors[idx].last_seen_unix_ms = Some(frame_ms);
                 }
             }
 
@@ -259,7 +306,13 @@ impl StaticObjectFilter {
             // anchors across a fast restart.
             if state.static_promoted
                 && cfg_persistence
-                && Self::upsert_anchor(&mut self.anchors, &label_lc, center, cfg_match_dist)
+                && Self::upsert_anchor(
+                    &mut self.anchors,
+                    &label_lc,
+                    center,
+                    cfg_match_dist,
+                    frame_ms,
+                )
             {
                 dirty = true;
             }
@@ -301,6 +354,32 @@ impl StaticObjectFilter {
 
         if dirty {
             self.save_registry();
+        }
+
+        // ---- TTL sweep ----
+        // After per-track classification, prune any anchor whose last
+        // matching observation is older than `anchor_ttl_secs`. Anchors
+        // loaded from disk in the legacy (pre-TTL) shape carry
+        // `last_seen_unix_ms = None`; bootstrap those to the current
+        // frame so they get one full TTL window after restart before
+        // becoming eligible for sweeping. Only persists when an actual
+        // removal happens to avoid disk thrash from the per-frame
+        // refresh stamps above.
+        if cfg_persistence && self.cfg.anchor_ttl_secs > 0 {
+            let ttl_ms = (self.cfg.anchor_ttl_secs as i64).saturating_mul(1_000);
+            let mut swept = false;
+            self.anchors.retain_mut(|a| {
+                let last = a.last_seen_unix_ms.get_or_insert(frame_ms);
+                if frame_ms.saturating_sub(*last) > ttl_ms {
+                    swept = true;
+                    false
+                } else {
+                    true
+                }
+            });
+            if swept {
+                self.save_registry();
+            }
         }
     }
 
@@ -346,12 +425,17 @@ impl StaticObjectFilter {
         label_lc: &str,
         center: (f32, f32),
         max_dist_px: f32,
+        now_ms: i64,
     ) -> bool {
         if let Some(idx) = Self::match_anchor(anchors, label_lc, center, max_dist_px) {
             // Average toward the new observation — same shape as v1
             // (`(old + new) * 0.5`). Tiny drift; only triggers a save
-            // when the average actually moves the centroid.
+            // when the average actually moves the centroid. Refresh
+            // `last_seen_unix_ms` unconditionally so a parked vehicle
+            // whose centroid never drifts beyond the 0.01 threshold
+            // still keeps its TTL fresh.
             let prev = (anchors[idx].center_x, anchors[idx].center_y);
+            anchors[idx].last_seen_unix_ms = Some(now_ms);
             let new_cx = (anchors[idx].center_x + center.0) * 0.5;
             let new_cy = (anchors[idx].center_y + center.1) * 0.5;
             if (new_cx - prev.0).abs() < 0.01 && (new_cy - prev.1).abs() < 0.01 {
@@ -365,6 +449,7 @@ impl StaticObjectFilter {
                 label: label_lc.to_string(),
                 center_x: center.0,
                 center_y: center.1,
+                last_seen_unix_ms: Some(now_ms),
             });
             true
         }
@@ -519,6 +604,7 @@ mod tests {
             movement_ema_alpha: 1.0,
             match_distance_pixels: 5,
             track_id_reuse_reset_pixels: 0,
+            anchor_ttl_secs: 0,
             persistence_enabled: false,
         };
         let mut f = StaticObjectFilter::new(cfg, 1, None);
@@ -546,6 +632,7 @@ mod tests {
             movement_ema_alpha: 1.0,
             match_distance_pixels: 5,
             track_id_reuse_reset_pixels: 0,
+            anchor_ttl_secs: 0,
             persistence_enabled: false,
         };
         let mut f = StaticObjectFilter::new(cfg, 1, None);
@@ -568,6 +655,7 @@ mod tests {
             movement_ema_alpha: 1.0,
             match_distance_pixels: 5,
             track_id_reuse_reset_pixels: 0,
+            anchor_ttl_secs: 0,
             persistence_enabled: false,
         };
         let mut f = StaticObjectFilter::new(cfg, 1, None);
@@ -587,6 +675,7 @@ mod tests {
             movement_ema_alpha: 1.0,
             match_distance_pixels: 20,
             track_id_reuse_reset_pixels: 0,
+            anchor_ttl_secs: 0,
             persistence_enabled: true,
         };
         let mut f = StaticObjectFilter::new(cfg, 1, None);
@@ -611,6 +700,7 @@ mod tests {
             movement_ema_alpha: 1.0,
             match_distance_pixels: 30,
             track_id_reuse_reset_pixels: 0,
+            anchor_ttl_secs: 0,
             persistence_enabled: true,
         };
         let mut f = StaticObjectFilter::new(cfg, 1, None);
@@ -618,6 +708,7 @@ mod tests {
             label: "vehicle.car".into(),
             center_x: 500.0,
             center_y: 500.0,
+            last_seen_unix_ms: None,
         });
 
         // A fresh track sitting near the anchor should be suppressed
@@ -637,6 +728,7 @@ mod tests {
             movement_ema_alpha: 1.0,
             match_distance_pixels: 30,
             track_id_reuse_reset_pixels: 0,
+            anchor_ttl_secs: 0,
             persistence_enabled: true,
         };
         let mut f = StaticObjectFilter::new(cfg, 1, None);
@@ -644,6 +736,7 @@ mod tests {
             label: "vehicle.car".into(),
             center_x: 500.0,
             center_y: 500.0,
+            last_seen_unix_ms: None,
         });
 
         // Frame 0: at the anchor, suppressed.
@@ -682,6 +775,7 @@ mod tests {
             movement_ema_alpha: 1.0,
             match_distance_pixels: 20,
             track_id_reuse_reset_pixels: 0,
+            anchor_ttl_secs: 0,
             persistence_enabled: true,
         };
         // Writer phase.
@@ -727,6 +821,7 @@ mod tests {
             persistence_enabled: false,
             // Guard at 100 px — well below the 400 px jump below.
             track_id_reuse_reset_pixels: 100,
+            anchor_ttl_secs: 0,
         };
         let mut f = StaticObjectFilter::new(cfg, 1, None);
 
@@ -770,6 +865,7 @@ mod tests {
             match_distance_pixels: 5,
             persistence_enabled: false,
             track_id_reuse_reset_pixels: 0,
+            anchor_ttl_secs: 0,
         };
         let mut f = StaticObjectFilter::new(cfg, 1, None);
         for i in 0..3 {
@@ -785,6 +881,121 @@ mod tests {
         assert!(
             objs.is_empty(),
             "with guard disabled, the new occupant inherits suppression"
+        );
+    }
+
+    #[test]
+    fn stale_anchor_is_swept_after_ttl_with_no_matching_observation() {
+        // Seed a registry with one anchor whose last_seen is well in
+        // the past. Run classify against a frame whose timestamp is
+        // beyond the TTL — the anchor MUST be pruned so the UI overlay
+        // and suppression FSM don't keep showing it after the vehicle
+        // has driven out of view.
+        let cfg = StaticObjectConfig {
+            dwell_frames: 999,
+            significant_movement_pixels: 10,
+            significant_movement_frames: 2,
+            movement_ema_alpha: 1.0,
+            match_distance_pixels: 30,
+            track_id_reuse_reset_pixels: 0,
+            persistence_enabled: true,
+            // 60-second TTL — frames 0 ms vs 120_000 ms straddles it.
+            anchor_ttl_secs: 60,
+        };
+        let mut f = StaticObjectFilter::new(cfg, 1, None);
+        f.anchors.push(StaticAnchor {
+            label: "vehicle.car".into(),
+            center_x: 100.0,
+            center_y: 100.0,
+            // Stale relative to the frame timestamp below.
+            last_seen_unix_ms: Some(0),
+        });
+
+        // Classify a frame with NO objects at the anchor location.
+        // Frame timestamp is 120_000 ms — 120 s after last_seen,
+        // beyond the 60 s TTL.
+        let mut objs: Vec<TrackedObject> = vec![];
+        f.classify(&frame(1, 1, 120_000), &mut objs);
+
+        assert!(
+            f.anchors().is_empty(),
+            "stale anchor must be swept once TTL elapses without an observation"
+        );
+    }
+
+    #[test]
+    fn fresh_observation_refreshes_anchor_ttl() {
+        // Inverse of the above: a parked vehicle keeps reappearing in
+        // every frame. Even with a tight TTL the anchor must stay put.
+        let cfg = StaticObjectConfig {
+            dwell_frames: 999,
+            significant_movement_pixels: 10,
+            significant_movement_frames: 2,
+            movement_ema_alpha: 1.0,
+            match_distance_pixels: 30,
+            track_id_reuse_reset_pixels: 0,
+            persistence_enabled: true,
+            anchor_ttl_secs: 1,
+        };
+        let mut f = StaticObjectFilter::new(cfg, 1, None);
+        f.anchors.push(StaticAnchor {
+            label: "vehicle.car".into(),
+            center_x: 200.0,
+            center_y: 200.0,
+            last_seen_unix_ms: Some(0),
+        });
+
+        // Frame at t = 5 s, vehicle still parked at the anchor.
+        let mut objs = vec![vehicle(42, 200.0, 200.0)];
+        f.classify(&frame(1, 1, 5_000), &mut objs);
+
+        assert_eq!(
+            f.anchors().len(),
+            1,
+            "anchor with a matching observation must NOT be swept"
+        );
+    }
+
+    #[test]
+    fn legacy_anchor_without_last_seen_gets_one_full_ttl_grace_period() {
+        // Anchors persisted by an earlier engine version carry
+        // last_seen_unix_ms = None. The first classify call must
+        // bootstrap them with the current frame timestamp, NOT
+        // immediately sweep them. This avoids a one-time mass-prune
+        // event after upgrading the binary.
+        let cfg = StaticObjectConfig {
+            dwell_frames: 999,
+            significant_movement_pixels: 10,
+            significant_movement_frames: 2,
+            movement_ema_alpha: 1.0,
+            match_distance_pixels: 30,
+            track_id_reuse_reset_pixels: 0,
+            persistence_enabled: true,
+            anchor_ttl_secs: 60,
+        };
+        let mut f = StaticObjectFilter::new(cfg, 1, None);
+        f.anchors.push(StaticAnchor {
+            label: "vehicle.car".into(),
+            center_x: 300.0,
+            center_y: 300.0,
+            last_seen_unix_ms: None,
+        });
+
+        // Classify with no objects at the anchor — but since the
+        // legacy anchor's last_seen is None, the bootstrap path
+        // stamps the current frame_ms and keeps it.
+        let mut objs: Vec<TrackedObject> = vec![];
+        f.classify(&frame(1, 1, 1_000_000), &mut objs);
+
+        assert_eq!(
+            f.anchors().len(),
+            1,
+            "legacy anchor (last_seen = None) must survive the first classify"
+        );
+        assert_eq!(
+            f.anchors()[0].last_seen_unix_ms,
+            Some(1_000_000),
+            "bootstrap must stamp the current frame_ms onto the legacy anchor"
         );
     }
 }

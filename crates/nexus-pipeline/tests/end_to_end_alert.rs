@@ -99,10 +99,12 @@ async fn cel_rule_emits_alert_for_virtual_person() {
         },
         detector: nexus_config::CameraDetector {
             prompts: vec!["person".into()],
+            visual_prompts: vec![],
             model_override: None,
         },
         behavior: nexus_config::CameraBehavior {
             parking_lot_mode: false,
+            anchor_ttl_secs: None,
         },
         zones: vec![],
     };
@@ -129,6 +131,8 @@ async fn cel_rule_emits_alert_for_virtual_person() {
         recorder,
         bus.clone(),
         cache_arc(),
+        std::sync::Arc::new(nexus_pipeline::FrameStatsRegistry::new()),
+        nexus_pipeline::StaticAnchorClearRegistry::new(),
     );
 
     // 4. Wait for the first AlertEvent. 5s budget covers the gate warmup

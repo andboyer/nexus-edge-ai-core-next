@@ -37,13 +37,15 @@ use image::ImageEncoder;
 use nexus_bus::{topic, Bus, BusExt};
 use nexus_config::{CameraConfig, RuleConfig};
 use nexus_inference::{BackendStatus, DetectorPool};
-use nexus_pipeline::LatestFrameCache;
+use nexus_pipeline::{LatestFrameCache, StaticAnchorClearRegistry};
 use nexus_rules::{CelEngine, RuleEngine, RuleEvaluator, RulesError};
 use nexus_store::Store;
-use nexus_types::{AlertEvent, CameraId, FrameMetadata, PixelFormat, RuleId};
+use nexus_types::{
+    AlertEvent, CameraId, FrameMetadata, PixelFormat, RuleId, StaticAnchor, StaticAnchorsResponse,
+};
 use tower_http::compression::CompressionLayer;
 use tower_http::cors::CorsLayer;
-use tower_http::services::ServeDir;
+use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
 
 use crate::admin_auth::{self, AdminAuthState};
@@ -54,6 +56,13 @@ use crate::discovery::{self, DiscoverySessions};
 pub struct ApiState {
     pub store: Arc<Store>,
     pub bus: Arc<dyn Bus>,
+    /// The `host:port` the HTTP server is *currently* bound to
+    /// (after the boot-time precedence sweep — see
+    /// `crate::admin_runtime::resolve_persisted_bind`). Used by
+    /// `GET /v1/admin/server/bind` to surface the active value
+    /// alongside any pending override that hasn't been picked
+    /// up yet because the operator hasn't restarted.
+    pub current_bind: String,
     /// Shared with every per-camera supervisor. The admin
     /// `PUT /api/rules/:id` + `DELETE /api/rules/:id` handlers
     /// call `reload()` on this after the DB write so rule edits
@@ -63,6 +72,12 @@ pub struct ApiState {
     /// the operator made through the UI.
     pub evaluator: Arc<RuleEvaluator>,
     pub cache: Arc<LatestFrameCache>,
+    /// M-Admin Phase 0 closeout — per-camera frame statistics
+    /// (fps EMA, last-frame timestamp, source dims). Shared with
+    /// every supervisor task; updated on every received frame.
+    /// Read by `GET /v1/cameras/:id/stats` and surfaced on the
+    /// merged camera list response.
+    pub frame_stats: Arc<nexus_pipeline::FrameStatsRegistry>,
     pub pool: Option<Arc<DetectorPool>>,
     pub ui_root: PathBuf,
     /// Shared with the per-camera supervisors + the storage_safety
@@ -174,6 +189,47 @@ pub struct ApiState {
     /// SPA must NOT render the OIDC button — discovery
     /// failed, no `[auth.oidc]` block, or mode disallows OIDC.
     pub oidc_display_name: Option<String>,
+    /// M3.1 Phase H — visual-prompts admin runtime state
+    /// (upload dir, encoder ONNX path, encoder lazy-init
+    /// handle). Built at boot from `cfg.runtime` +
+    /// `cfg.inference`; see
+    /// [`crate::visual_prompts_admin::VisualPromptsAdminState`].
+    pub visual_prompts: crate::visual_prompts_admin::VisualPromptsAdminState,
+    /// M-Admin Phase 0 follow-up — boot-time effective
+    /// inference model configuration (after any
+    /// `engine_runtime_settings.inference_model_json`
+    /// override has been merged onto `nexus.toml`). Returned
+    /// by `GET /v1/admin/server/inference` so the admin UI
+    /// can render the active values + diff against any
+    /// pending override the operator has saved since.
+    /// Restart-required: this value never changes for the
+    /// lifetime of the process.
+    pub current_inference_model: Arc<nexus_config::ModelConfig>,
+    /// `cfg.runtime.state_dir` snapshot — root directory the
+    /// engine writes per-camera anchor registries
+    /// (`static_objects/cam-<id>.json`) and other long-lived
+    /// state under. Read by
+    /// `GET /api/v1/cameras/:id/static-anchors` so the viewer
+    /// can overlay the persisted static-object map on top of
+    /// the live JPEG without round-tripping through the
+    /// supervisor.
+    pub state_dir: PathBuf,
+    /// Operator-initiated static-anchor wipe signal shared with
+    /// every camera supervisor. Bumped by
+    /// `DELETE /api/cameras/:id/static-anchors`; the supervisor
+    /// polls per-frame and invokes
+    /// `StaticObjectFilter::clear` (in-memory + on-disk) on the
+    /// next iteration after a delta. See
+    /// `nexus_pipeline::static_clear` for the rationale.
+    pub static_clear: Arc<StaticAnchorClearRegistry>,
+    /// Boot-time snapshot of
+    /// `cfg.tracker.static_object.anchor_ttl_secs` — the engine-wide
+    /// fallback used when a camera has
+    /// `behavior.anchor_ttl_secs = None`. Surfaced verbatim by
+    /// `GET /api/v1/system/static-object-defaults` so the camera
+    /// settings form can render "Engine default: Ns" next to the
+    /// per-camera override input.
+    pub default_anchor_ttl_secs: u32,
 }
 
 pub fn router(state: ApiState) -> Router {
@@ -248,6 +304,10 @@ pub fn router(state: ApiState) -> Router {
             "/v1/admin/discovery/sessions/{session_id}/probe-rtsp",
             axum::routing::post(discovery::post_probe_rtsp),
         )
+        .route(
+            "/v1/admin/discovery/sessions/{session_id}/onvif-streams",
+            axum::routing::post(discovery::post_probe_onvif),
+        )
         // M6 Phase 2 Step 2.8 — local-user roster admin. Lives
         // behind both the admin_auth gate AND the per-handler
         // `AdminContext` extractor: a valid HS256 JWT signed
@@ -290,6 +350,90 @@ pub fn router(state: ApiState) -> Router {
             "/v1/admin/audit/resource/{kind}/{id}",
             get(crate::auth::audit_admin::get_resource_audit),
         )
+        // M3.1 Phase H — visual-prompts CRUD + per-camera
+        // attach/detach. All gated by the same admin middleware
+        // below. The upload route uses multipart/form-data; the
+        // others are pure JSON.
+        .route(
+            "/v1/admin/visual-prompts",
+            get(crate::visual_prompts_admin::list_visual_prompts)
+                .post(crate::visual_prompts_admin::post_visual_prompt),
+        )
+        .route(
+            "/v1/admin/visual-prompts/{id}",
+            get(crate::visual_prompts_admin::get_visual_prompt)
+                .delete(crate::visual_prompts_admin::delete_visual_prompt),
+        )
+        .route(
+            "/v1/admin/cameras/{camera_id}/visual-prompts",
+            get(crate::visual_prompts_admin::list_camera_visual_prompts),
+        )
+        .route(
+            "/v1/admin/cameras/{camera_id}/visual-prompts/{visual_prompt_id}",
+            axum::routing::post(crate::visual_prompts_admin::attach_camera_visual_prompt)
+                .delete(crate::visual_prompts_admin::detach_camera_visual_prompt),
+        )
+        // ----- M-Admin Phase 0 — runtime knobs that today require
+        // an engine restart to take effect.
+        //
+        // All three follow the same shape: validate the change
+        // up-front (probe-bind a TCP socket; run an OIDC
+        // discovery dry-run; etc.), persist the requested value
+        // to `engine_runtime_settings`, audit-log, and return
+        // `{ restart_required: true }`. The engine consults
+        // these settings at boot (see
+        // `crate::admin_runtime::resolve_persisted_*`) so the
+        // operator's choice survives the bounce.
+        .route(
+            "/v1/admin/server/bind",
+            get(crate::admin_runtime::get_server_bind).put(crate::admin_runtime::put_server_bind),
+        )
+        .route(
+            "/v1/admin/auth/config",
+            get(crate::admin_runtime::get_auth_config).put(crate::admin_runtime::put_auth_config),
+        )
+        .route(
+            "/v1/admin/auth/oidc/test-discovery",
+            axum::routing::post(crate::admin_runtime::post_test_discovery),
+        )
+        // Streaming gzipped-tar diagnostics export. Generates the
+        // tar entries inside a `spawn_blocking` worker that writes
+        // through a `GzEncoder` wrapping a bounded mpsc; axum
+        // streams the receiver half. Memory stays O(buffer size)
+        // regardless of bundle size.
+        .route(
+            "/v1/admin/diagnostics/export",
+            get(crate::admin_runtime::get_diagnostics_export),
+        )
+        // M-Admin Phase 0 cleanup — storage watermark editor.
+        // Persists to `engine_runtime_settings.low_watermark_pct`
+        // and `panic_watermark_pct`; restart required (the
+        // `storage_safety` FSM reads the snapshot from
+        // `ApiState` at boot).
+        .route(
+            "/v1/admin/server/watermarks",
+            get(crate::admin_runtime::get_watermarks).put(crate::admin_runtime::put_watermarks),
+        )
+        // M-Admin Phase 0 follow-up — default inference model
+        // editor (kind / preset / input dims / score threshold
+        // / pack_path). Persists the merged ModelConfig as JSON
+        // in `engine_runtime_settings.inference_model_json`;
+        // restart required because the `InferenceRouter` is
+        // built once at boot and not rebuilt per-frame.
+        .route(
+            "/v1/admin/server/inference",
+            get(crate::admin_runtime::get_inference_model)
+                .put(crate::admin_runtime::put_inference_model),
+        )
+        // M-Admin Phase 0 follow-up — graceful self-restart.
+        // Returns 202 immediately, then `execv()`s a fresh
+        // copy of the same binary (preserving PID + argv) so
+        // every persisted `engine_runtime_settings` row takes
+        // effect without a separate supervisor bounce.
+        .route(
+            "/v1/admin/server/restart",
+            axum::routing::post(crate::admin_runtime::post_restart),
+        )
         .route_layer(axum::middleware::from_fn_with_state(
             state.admin_auth.clone(),
             admin_auth::admin_auth_layer,
@@ -297,18 +441,47 @@ pub fn router(state: ApiState) -> Router {
 
     let api = Router::new()
         .route("/health", get(health))
-        .route("/cameras", get(list_cameras))
+        .route("/cameras", get(list_cameras).post(create_camera))
         .route("/cameras/{id}", put(upsert_camera).delete(delete_camera))
         .route("/cameras/{id}/frames/latest", get(get_latest_frame_jpeg))
         .route(
             "/cameras/{id}/frames/latest.json",
             get(get_latest_frame_meta),
         )
-        .route("/rules", get(list_rules))
+        // M-Admin Phase 0 closeout — per-camera frame stats
+        // (fps EMA, last_frame_age_ms, frames_emitted/dropped,
+        // source dims). Used by the dashboard health column.
+        .route("/cameras/{id}/stats", get(get_camera_stats))
+        // Static-object map for the live viewer overlay. Reads
+        // the on-disk per-camera anchor registry written by the
+        // `StaticObjectFilter` running inside each supervisor.
+        // `DELETE` signals the supervisor to wipe both in-memory
+        // anchors and the on-disk file — used by the viewer's
+        // "Clear anchors" button when an operator notices stale
+        // entries (e.g. a vehicle drove off occluded).
+        .route(
+            "/cameras/{id}/static-anchors",
+            get(get_static_anchors).delete(delete_static_anchors),
+        )
+        // Engine-wide defaults for tracker.static_object. Read by
+        // the camera-settings form so the per-camera TTL input can
+        // display the fallback value the engine will use when the
+        // override is left blank.
+        .route(
+            "/v1/system/static-object-defaults",
+            get(get_static_object_defaults),
+        )
+        .route("/rules", get(list_rules).post(create_rule))
         .route("/rules/{id}", put(upsert_rule))
         .route("/rules/{id}", delete(delete_rule))
         .route("/rules/validate", axum::routing::post(validate_rule))
         .route("/rules/preview", axum::routing::post(preview_rule))
+        // CEL editor schema — labels emittable by the loaded detector
+        // kinds plus the canonical attribute keys the annotator stamps.
+        // The UI's CodeMirror completion source merges this with its
+        // static fallback so newly-added annotator attributes show up
+        // without a UI rebuild.
+        .route("/v1/rules/schema", get(get_rules_schema))
         .route("/events", get(list_events))
         .route("/stream/metadata", get(stream_metadata))
         .route("/stream/events", get(stream_events))
@@ -346,6 +519,14 @@ pub fn router(state: ApiState) -> Router {
         // Lets the UI render kind-appropriate label pickers in
         // the camera + rules forms.
         .route("/v1/models/prompts", get(get_model_prompts))
+        // M-Dashboard Phase 2 — host metrics snapshot for the
+        // operator dashboard. Any authenticated viewer can read
+        // it; cached for 1s server-side. See
+        // [`crate::system_metrics`] for the response shape.
+        .route(
+            "/v1/system/metrics",
+            get(crate::system_metrics::get_system_metrics),
+        )
         // M2.2 closeout: OAuth callback for the auth-code dance.
         // Registered OUTSIDE the admin gate (provider redirects a
         // browser here; authentication is via the unguessable
@@ -383,9 +564,9 @@ pub fn router(state: ApiState) -> Router {
     // ONLY when an `OidcLoginState` is wired in. The handlers
     // extract that state via `FromRef::expect`, so registering
     // the routes here when it's `None` would panic on first
-    // hit; gating on the Option keeps `auth.mode = none /
-    // dev_token / local` deployments from accidentally
-    // exposing a 500'ing OIDC endpoint.
+    // hit; gating on the Option keeps `auth.mode = local`
+    // deployments from accidentally exposing a 500'ing OIDC
+    // endpoint.
     let api = if state.oidc_login.is_some() {
         api.route(
             "/v1/auth/oidc/start",
@@ -401,15 +582,22 @@ pub fn router(state: ApiState) -> Router {
 
     // M7 Step 6F2 — dev-only event-injection endpoint. Lives
     // OUTSIDE the admin gate by design (the e2e fixture runs
-    // under `auth.mode = "none"` on loopback). Compiled out
-    // entirely unless the `test-injection` cargo feature is on.
+    // on loopback). Compiled out entirely unless the
+    // `test-injection` cargo feature is on.
     #[cfg(feature = "test-injection")]
     let api = api.route(
         "/v1/_test/inject_event",
         axum::routing::post(crate::test_inject::post_inject_event),
     );
 
-    let static_dir = ServeDir::new(state.ui_root.clone()).append_index_html_on_directories(true);
+    // SPA hosting: ServeDir returns 404 for unknown paths like /dashboard
+    // or /admin/users (TanStack Router uses history-mode paths). Configure
+    // index.html as the not-found fallback so a hard refresh on any SPA
+    // route still loads the app, which then runs its own client router.
+    let index_html = state.ui_root.join("index.html");
+    let static_dir = ServeDir::new(state.ui_root.clone())
+        .append_index_html_on_directories(true)
+        .not_found_service(ServeFile::new(index_html));
 
     Router::new()
         .nest("/api", api)
@@ -459,7 +647,7 @@ async fn health() -> Json<serde_json::Value> {
 ///
 /// ```json
 /// {
-///   "mode": "none" | "dev_token" | "local" | "oidc" | "hybrid",
+///   "mode": "local" | "oidc" | "hybrid",
 ///   "allows_local": bool,
 ///   "allows_oidc": bool
 /// }
@@ -472,9 +660,6 @@ async fn health() -> Json<serde_json::Value> {
 async fn get_auth_info(State(s): State<ApiState>) -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "mode": match s.auth_mode {
-            nexus_config::AuthMode::None => "none",
-            #[cfg(not(feature = "prod-auth"))]
-            nexus_config::AuthMode::DevToken => "dev_token",
             nexus_config::AuthMode::Local => "local",
             nexus_config::AuthMode::Oidc => "oidc",
             nexus_config::AuthMode::Hybrid => "hybrid",
@@ -570,6 +755,84 @@ async fn upsert_camera(
         .publish(
             topic::CONFIG_CHANGED,
             &serde_json::json!({ "kind": "camera", "action": "upsert", "camera_id": id }),
+        )
+        .await;
+    Ok(Json(cam))
+}
+
+/// `POST /cameras` — create a new camera with a server-assigned
+/// `id`. The engine `CameraId` is `i64`, so the UI has no way to
+/// pick a stable id at create time (a derived string like
+/// `cam-<ip>` won't deserialise as i64 and the path extractor
+/// rejects it with 400 before we ever reach the handler). This
+/// endpoint accepts the camera body verbatim, ignores any `id`
+/// the caller passed, lets SQLite's `INTEGER PRIMARY KEY` rowid
+/// alias assign one, and returns the populated config so the UI
+/// can update its local state with the new id.
+async fn create_camera(
+    State(s): State<ApiState>,
+    headers: HeaderMap,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    session: Option<crate::auth::require_role::SessionContext>,
+    Json(mut cam): Json<CameraConfig>,
+) -> Result<Json<CameraConfig>, ApiError> {
+    // Force the id to zero so a careless body field can't trick
+    // us into update-via-create — the store helper binds NULL
+    // regardless, but zeroing here keeps the placeholder JSON
+    // honest before the post-insert rewrite.
+    cam.id = 0;
+    let tx_res: Result<(), nexus_store::StoreError> = async {
+        let mut tx = s.store.begin_tx().await?;
+        s.store.create_camera_tx(&mut tx, &mut cam).await?;
+        let after_str = serde_json::to_string(&cam).ok();
+        let resource_id = cam.id.to_string();
+        crate::auth::admin_audit::audit_admin_action_in_tx(
+            &s.store,
+            &mut tx,
+            session.as_ref(),
+            &headers,
+            peer.ip(),
+            "camera.create",
+            "camera",
+            Some(resource_id.as_str()),
+            None,
+            after_str.as_deref(),
+        )
+        .await?;
+        nexus_store::Store::commit_tx(tx).await?;
+        Ok(())
+    }
+    .await;
+    if let Err(e) = tx_res {
+        // Failure-path audit (standalone tx) — see upsert_camera
+        // for the same pattern. `before` is unconditionally
+        // `None` on a create, so we just record the attempted
+        // payload as the failed "after".
+        let attempted_str = serde_json::to_string(&cam).ok();
+        crate::auth::admin_audit::audit_admin_action(
+            &s.store,
+            session.as_ref(),
+            &headers,
+            peer.ip(),
+            "camera.create",
+            "camera",
+            None,
+            nexus_store::audit::AuditOutcome::Failure,
+            None,
+            attempted_str.as_deref(),
+        )
+        .await;
+        return Err(e.into());
+    }
+    let _ = s
+        .bus
+        .publish(
+            topic::CONFIG_CHANGED,
+            &serde_json::json!({
+                "kind": "camera",
+                "action": "create",
+                "camera_id": cam.id,
+            }),
         )
         .await;
     Ok(Json(cam))
@@ -734,6 +997,94 @@ async fn upsert_rule(
     Ok(Json(rule))
 }
 
+/// `POST /rules` — create a new rule with a server-assigned id.
+/// Mirrors `POST /cameras`: any `id` the caller passed in the body
+/// is discarded and replaced with the next available `rule-<N>`
+/// sequence (allocated inside the same tx that performs the
+/// INSERT so concurrent creates can't collide). Returns the
+/// populated [`RuleConfig`] so the UI can refresh its local state
+/// with the new id without a second `list_rules` roundtrip.
+async fn create_rule(
+    State(s): State<ApiState>,
+    headers: HeaderMap,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    session: Option<crate::auth::require_role::SessionContext>,
+    Json(mut rule): Json<RuleConfig>,
+) -> Result<Json<RuleConfig>, ApiError> {
+    // Same defence-in-depth as `create_camera` — zero the id field
+    // before the tx so a careless body field can't trick us into
+    // update-via-create. The tx will overwrite it with the freshly
+    // allocated `rule-<N>` id before INSERT.
+    rule.id.clear();
+    // Compile the CEL up-front so a bad `when` produces a 400 with
+    // the precise parser error, not a transactional INSERT-then-
+    // rollback-without-context. Mirrors the upsert path.
+    if let Err(msg) = compile_cel_safely(&rule) {
+        crate::auth::admin_audit::audit_admin_action(
+            &s.store,
+            session.as_ref(),
+            &headers,
+            peer.ip(),
+            "rule.create",
+            "rule",
+            None,
+            nexus_store::audit::AuditOutcome::Failure,
+            None,
+            None,
+        )
+        .await;
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            format!("invalid CEL in `when`: {msg}"),
+        ));
+    }
+    let tx_res: Result<(), nexus_store::StoreError> = async {
+        let mut tx = s.store.begin_tx().await?;
+        // Allocate the id INSIDE the tx so two concurrent
+        // `POST /rules` calls can't both pick the same suffix.
+        rule.id = s.store.next_rule_id_tx(&mut tx).await?;
+        s.store.upsert_rule_tx(&mut tx, &rule).await?;
+        let after_str = serde_json::to_string(&rule).ok();
+        let resource_id = rule.id.clone();
+        crate::auth::admin_audit::audit_admin_action_in_tx(
+            &s.store,
+            &mut tx,
+            session.as_ref(),
+            &headers,
+            peer.ip(),
+            "rule.create",
+            "rule",
+            Some(resource_id.as_str()),
+            None,
+            after_str.as_deref(),
+        )
+        .await?;
+        nexus_store::Store::commit_tx(tx).await?;
+        Ok(())
+    }
+    .await;
+    if let Err(e) = tx_res {
+        // Failure-path audit — `before` is always None on create.
+        let attempted_str = serde_json::to_string(&rule).ok();
+        crate::auth::admin_audit::audit_admin_action(
+            &s.store,
+            session.as_ref(),
+            &headers,
+            peer.ip(),
+            "rule.create",
+            "rule",
+            None,
+            nexus_store::audit::AuditOutcome::Failure,
+            None,
+            attempted_str.as_deref(),
+        )
+        .await;
+        return Err(e.into());
+    }
+    reload_rules_into_evaluator(&s, "create", &rule.id).await;
+    Ok(Json(rule))
+}
+
 async fn delete_rule(
     State(s): State<ApiState>,
     Path(id): Path<RuleId>,
@@ -890,6 +1241,50 @@ async fn validate_rule(Json(req): Json<ValidateRuleReq>) -> Json<ValidateRuleRes
             error: Some(msg),
         }),
     }
+}
+
+/// `GET /api/v1/rules/schema` — what the CEL editor's completion source
+/// can suggest from a live engine instance.
+///
+/// Two slices:
+///
+/// * `labels` — every detector label the currently-loaded model kinds
+///   are known to emit. Sourced from the prompt catalog the camera
+///   form already consumes.
+/// * `attribute_keys` — every `object.attributes['...']` key the
+///   annotator stamps. Hardcoded for now (this matches the static
+///   list in `crates/nexus-tracker/src/annotator.rs`); future
+///   annotators can extend this without a UI rebuild.
+///
+/// Both are advisory: the UI keeps its own static fallback so the
+/// editor still completes when the engine is unreachable.
+#[derive(serde::Serialize)]
+struct RulesSchemaResp {
+    labels: Vec<String>,
+    attribute_keys: Vec<&'static str>,
+}
+
+async fn get_rules_schema(State(s): State<ApiState>) -> Json<RulesSchemaResp> {
+    let mut labels: Vec<String> = s
+        .model_prompts
+        .kinds
+        .iter()
+        .flat_map(|k| k.prompts.iter().cloned())
+        .collect();
+    labels.sort();
+    labels.dedup();
+    Json(RulesSchemaResp {
+        labels,
+        attribute_keys: vec![
+            "motion.speed_class",
+            "motion.direction",
+            "motion.parked_vehicle",
+            "motion.dwell_seconds",
+            "motion.zone_state",
+            "motion.zone_ids",
+            "group.size",
+        ],
+    })
 }
 
 /// Wrap [`CelEngine::compile`] in `catch_unwind` so a user-supplied
@@ -1411,6 +1806,144 @@ async fn get_latest_frame_meta(
     }))
 }
 
+/// M-Admin Phase 0 closeout — per-camera frame stats response.
+/// Returned by `GET /v1/cameras/:id/stats`. `last_frame_age_ms`
+/// is computed at request time so the UI doesn't have to maintain
+/// its own wall-clock offset; `null` means no frame has ever been
+/// observed for this camera (supervisor hasn't started or source
+/// hasn't yet produced a frame).
+#[derive(serde::Serialize)]
+struct CameraFrameStatsView {
+    camera_id: CameraId,
+    last_frame_at: Option<chrono::DateTime<chrono::Utc>>,
+    last_frame_age_ms: Option<i64>,
+    fps_ema: f64,
+    frames_emitted: u64,
+    frames_dropped: u64,
+    source_width: u32,
+    source_height: u32,
+}
+
+async fn get_camera_stats(
+    State(s): State<ApiState>,
+    Path(id): Path<CameraId>,
+) -> Result<Json<CameraFrameStatsView>, ApiError> {
+    let snap = s
+        .frame_stats
+        .snapshot(id)
+        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "no stats for camera".into()))?;
+    let now = chrono::Utc::now();
+    Ok(Json(CameraFrameStatsView {
+        camera_id: id,
+        last_frame_at: snap.last_frame_at,
+        last_frame_age_ms: snap.last_frame_age_ms(now),
+        fps_ema: snap.fps_ema,
+        frames_emitted: snap.frames_emitted,
+        frames_dropped: snap.frames_dropped,
+        source_width: snap.source_width,
+        source_height: snap.source_height,
+    }))
+}
+
+/// On-disk shape of `<state_dir>/static_objects/cam-<id>.json` —
+/// mirrors `nexus_tracker::static_object::RegistryFile` without
+/// pulling that crate (private struct) into the engine. The
+/// `version` field is read-and-ignored for forward compatibility;
+/// only `anchors` is surfaced on the wire.
+#[derive(serde::Deserialize)]
+struct StaticAnchorsFile {
+    #[serde(default)]
+    anchors: Vec<StaticAnchor>,
+}
+
+/// `GET /api/cameras/:id/static-anchors` — returns the persisted
+/// static-object map for the camera. Missing file, empty list, or
+/// a parse error all collapse to `{ camera_id, anchors: [] }` (no
+/// 404 / 500) so the UI overlay can poll without bothering the
+/// operator about a registry that simply hasn't been written yet
+/// (e.g. camera has `behavior.parking_lot_mode = false`, or the
+/// supervisor hasn't promoted any vehicle to "static" yet).
+async fn get_static_anchors(
+    State(s): State<ApiState>,
+    Path(id): Path<CameraId>,
+) -> Result<Json<StaticAnchorsResponse>, ApiError> {
+    let path = s
+        .state_dir
+        .join("static_objects")
+        .join(format!("cam-{id}.json"));
+    let anchors = match std::fs::read(&path) {
+        Ok(bytes) => match serde_json::from_slice::<StaticAnchorsFile>(&bytes) {
+            Ok(doc) => doc.anchors,
+            Err(e) => {
+                tracing::warn!(
+                    camera_id = id,
+                    path = %path.display(),
+                    "static-anchors registry parse failed (returning empty): {e}"
+                );
+                Vec::new()
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => {
+            tracing::warn!(
+                camera_id = id,
+                path = %path.display(),
+                "static-anchors registry read failed (returning empty): {e}"
+            );
+            Vec::new()
+        }
+    };
+    Ok(Json(StaticAnchorsResponse {
+        camera_id: id,
+        anchors,
+    }))
+}
+
+/// `DELETE /api/cameras/:id/static-anchors` — operator-initiated
+/// wipe of the persisted + in-memory static-object map for one
+/// camera. Bumps the per-camera entry in the shared
+/// [`StaticAnchorClearRegistry`]; the camera's supervisor task
+/// notices the delta on its next frame and calls
+/// `StaticObjectFilter::clear`, which empties the in-memory anchor
+/// vector + per-track state and removes
+/// `<state_dir>/static_objects/cam-<id>.json` from disk.
+///
+/// Idempotent — calling it on a camera with no anchors (or on a
+/// camera with `behavior.parking_lot_mode = false` where no
+/// filter is even running) is a no-op that still returns
+/// `204 No Content`. The actual disk file removal happens
+/// asynchronously inside the supervisor; callers that immediately
+/// re-`GET` may briefly see the pre-clear state on a quiet camera.
+async fn delete_static_anchors(
+    State(s): State<ApiState>,
+    Path(id): Path<CameraId>,
+) -> Result<StatusCode, ApiError> {
+    let seq = s.static_clear.request_clear(id);
+    tracing::info!(
+        camera_id = id,
+        seq,
+        "operator requested static-anchor clear",
+    );
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Wire shape for `GET /api/v1/system/static-object-defaults`.
+/// Engine-wide fallback values used by every camera that hasn't
+/// set its own override. Restart-required \u2014 the snapshot is taken
+/// at boot.
+#[derive(serde::Serialize)]
+struct StaticObjectDefaultsView {
+    anchor_ttl_secs: u32,
+}
+
+async fn get_static_object_defaults(
+    State(s): State<ApiState>,
+) -> Json<StaticObjectDefaultsView> {
+    Json(StaticObjectDefaultsView {
+        anchor_ttl_secs: s.default_anchor_ttl_secs,
+    })
+}
+
 async fn get_latest_frame_jpeg(
     State(s): State<ApiState>,
     Path(id): Path<CameraId>,
@@ -1929,6 +2462,40 @@ async fn get_clip(
         return Ok((StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response());
     }
 
+    // Reject header-only stub clips up-front. When `mp4mux` opens
+    // the file it immediately writes a `ftyp + moov` header (~800
+    // bytes) and only adds sample tables on EOS. If the source
+    // stalled or every sample was dropped (e.g. missing PTS — see
+    // memory note on mp4mux/qtmux PTS handling), the closed clip
+    // ends up at ~1 KiB on disk while `duration_ms` is still set
+    // from wall-clock (started → ended), so size_bytes — not
+    // duration_ms — is the only trustworthy signal. Serving such
+    // a file makes Chrome's MP4 demuxer raise `FFmpegDemuxer:
+    // demuxer seek failed`. Returning 503 + a structured body
+    // lets the UI render a clear "no playable data" affordance
+    // instead of a generic broken-video icon.
+    //
+    // 4 KiB threshold: a 720p H.264 keyframe alone is ≥ 20 KiB;
+    // any closed clip with real samples will be many times
+    // larger. We only enforce the guard once the clip is closed
+    // (`ended_at IS NOT NULL`) so an in-progress recording that
+    // legitimately hasn't grown past the header yet still gets a
+    // chance to serve once it finishes.
+    const STUB_CLIP_BYTE_THRESHOLD: i64 = 4096;
+    if clip.ended_at.is_some() && clip.size_bytes > 0 && clip.size_bytes < STUB_CLIP_BYTE_THRESHOLD {
+        let body = serde_json::json!({
+            "error": "playback unavailable",
+            "reason": "no_samples",
+            "clip_id": clip.id,
+            "camera_id": clip.camera_id,
+            "started_at": clip.started_at,
+            "ended_at": clip.ended_at,
+            "size_bytes": clip.size_bytes,
+            "duration_ms": clip.duration_ms,
+        });
+        return Ok((StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response());
+    }
+
     // M2.2 Phase 4 — soft-evicted (cold-only) playback. When the
     // hot pointer is NULL but a cold pointer exists, stream the
     // requested byte range straight from the cold backend AND
@@ -2060,10 +2627,21 @@ async fn get_clip(
 }
 
 /// Parse a single-range `bytes=START-END` value, clamped to the
-/// file size. Returns `(start, end_inclusive)`. Multi-range and
-/// suffix-range (`bytes=-N`) are intentionally unsupported — browsers
-/// only need single-byte-range for `<video>` element seeking.
+/// file size. Returns `(start, end_inclusive)`. Multi-range is
+/// intentionally unsupported (we honour only the first range).
+///
+/// Supports:
+/// * `bytes=START-END` — explicit, inclusive both ends
+/// * `bytes=START-` — open-ended, clamped to EOF
+/// * `bytes=-N` — suffix form, last N bytes (clamped to whole file
+///   when `N >= file_size`). Chrome's MP4 demuxer issues these to
+///   probe trailing index boxes (`mfra`/`sidx`); refusing them with
+///   a 200 full-body response triggers `FFmpegDemuxer: demuxer seek
+///   failed` on clip playback.
 fn parse_byte_range(raw: &str, file_size: u64) -> Option<(u64, u64)> {
+    if file_size == 0 {
+        return None;
+    }
     let raw = raw.trim();
     let rest = raw.strip_prefix("bytes=")?;
     // First range only.
@@ -2072,8 +2650,14 @@ fn parse_byte_range(raw: &str, file_size: u64) -> Option<(u64, u64)> {
     let start_str = start_str.trim();
     let end_str = end_str.trim();
     if start_str.is_empty() {
-        // Suffix form `bytes=-N` — not implemented.
-        return None;
+        // Suffix form `bytes=-N`: return the last N bytes.
+        // RFC 7233 §2.1: a suffix length of zero is invalid.
+        let suffix: u64 = end_str.parse().ok()?;
+        if suffix == 0 {
+            return None;
+        }
+        let start = file_size.saturating_sub(suffix);
+        return Some((start, file_size - 1));
     }
     let start: u64 = start_str.parse().ok()?;
     if start >= file_size {
@@ -4142,8 +4726,30 @@ mod tests {
     }
 
     #[test]
-    fn parse_rejects_suffix_range() {
-        assert!(parse_byte_range("bytes=-500", 1000).is_none());
+    fn parse_suffix_range_returns_last_n_bytes() {
+        // Chrome's MP4 demuxer issues these to find trailing index
+        // boxes. Refusing them breaks clip playback in the SPA.
+        assert_eq!(parse_byte_range("bytes=-500", 1000), Some((500, 999)));
+        assert_eq!(parse_byte_range("bytes=-1", 1000), Some((999, 999)));
+    }
+
+    #[test]
+    fn parse_suffix_range_larger_than_file_returns_whole_file() {
+        // RFC 7233: when suffix-length exceeds file size, return
+        // the entire representation.
+        assert_eq!(parse_byte_range("bytes=-5000", 1000), Some((0, 999)));
+    }
+
+    #[test]
+    fn parse_rejects_zero_suffix() {
+        // `bytes=-0` is invalid per RFC 7233 §2.1.
+        assert!(parse_byte_range("bytes=-0", 1000).is_none());
+    }
+
+    #[test]
+    fn parse_rejects_any_range_on_empty_file() {
+        assert!(parse_byte_range("bytes=0-0", 0).is_none());
+        assert!(parse_byte_range("bytes=-100", 0).is_none());
     }
 
     #[test]
@@ -4239,10 +4845,12 @@ mod tests {
                 },
                 detector: nexus_config::CameraDetector {
                     prompts: vec![],
+                    visual_prompts: vec![],
                     model_override: None,
                 },
                 behavior: nexus_config::CameraBehavior {
                     parking_lot_mode: false,
+                    anchor_ttl_secs: None,
                 },
                 zones: vec![],
             })
@@ -4497,10 +5105,12 @@ mod tests {
                 },
                 detector: nexus_config::CameraDetector {
                     prompts: vec![],
+                    visual_prompts: vec![],
                     model_override: None,
                 },
                 behavior: nexus_config::CameraBehavior {
                     parking_lot_mode: false,
+                    anchor_ttl_secs: None,
                 },
                 zones: vec![],
             })
@@ -4751,8 +5361,10 @@ mod tests {
         let state = super::ApiState {
             store: store.clone(),
             bus,
+            current_bind: "127.0.0.1:0".into(),
             evaluator,
             cache,
+            frame_stats: Arc::new(nexus_pipeline::FrameStatsRegistry::new()),
             pool: None,
             ui_root: dir.path().join("ui-unused"),
             recorder,
@@ -4772,6 +5384,7 @@ mod tests {
             model_prompts: Arc::new(crate::models_catalog::ModelPromptsCatalog {
                 default_kind: "mock".into(),
                 kinds: vec![],
+                by_kind: std::collections::BTreeMap::new(),
             }),
             // M7 Step 6 — empty sink registry by default; the
             // delivery-policy tests below populate it when they
@@ -4782,27 +5395,47 @@ mod tests {
             // override via a per-test mutation of `state` before
             // building the app.
             lockout: nexus_config::LockoutConfig::default(),
-            // M6 Phase 2 Step 2.9 — tests live under the
-            // `DevToken` mode by default. The handful of tests
-            // that exercise the local-auth code paths override
-            // this on the constructed state before building the
-            // app.
-            //
-            // M6 Phase 4 Step 4.5 — with `prod-auth` the
-            // `DevToken` variant is compile-gated away; tests
-            // fall back to `None` (which is the only other mode
-            // that doesn't require external state like an OIDC
-            // issuer or seeded local users). The auth-mode-tagged
-            // tests are gated alongside the variant they exercise.
-            #[cfg(not(feature = "prod-auth"))]
-            auth_mode: nexus_config::AuthMode::DevToken,
-            #[cfg(feature = "prod-auth")]
-            auth_mode: nexus_config::AuthMode::None,
+            // M-Admin Phase 0 closeout — the legacy `None` and
+            // `DevToken` variants were retired. Tests that need
+            // a "no external state" mode now sit on `Local`;
+            // tests that exercise OIDC override this on the
+            // constructed state before building the app.
+            auth_mode: nexus_config::AuthMode::Local,
             // M6 Phase 3 Step 3.3 — no OIDC backend in unit
             // tests; the dedicated oidc_login tests live in
             // their own module against a wiremock IdP.
             oidc_login: None,
             oidc_display_name: None,
+            // M3.1 Phase H — tests don't exercise the
+            // visual-prompts upload path; default state with no
+            // encoder model path means `POST /visual-prompts`
+            // would 503 if a test ever hit it.
+            visual_prompts: crate::visual_prompts_admin::VisualPromptsAdminState {
+                visual_prompts_dir: dir.path().join("visual_prompts"),
+                encoder_model_path: None,
+                encoder_model_id: "test-encoder".to_string(),
+                encoder_embedding_dim: 4,
+                encoder_ep_priority: vec![],
+                #[cfg(feature = "ort")]
+                encoder: std::sync::Arc::new(tokio::sync::OnceCell::new()),
+            },
+            // M-Admin Phase 0 follow-up — tests don't exercise
+            // the `GET /v1/admin/server/inference` endpoint;
+            // default ModelConfig is fine.
+            current_inference_model: std::sync::Arc::new(nexus_config::ModelConfig::default()),
+            // Static-anchors handler reads `<state_dir>/static_objects/cam-<id>.json`;
+            // tests don't write that file so the endpoint returns
+            // an empty anchor list, which is the documented behaviour
+            // for "no persisted map yet".
+            state_dir: dir.path().to_path_buf(),
+            // No supervisors running under the unit-test app, so
+            // the clear registry is just a satisfied dependency —
+            // bumping it is a no-op without a polling consumer.
+            static_clear: nexus_pipeline::StaticAnchorClearRegistry::new(),
+            // Engine-wide default surfaced by
+            // `GET /api/v1/system/static-object-defaults`. Matches
+            // `nexus_config::default_static_object_anchor_ttl_secs`.
+            default_anchor_ttl_secs: 3600,
         };
         let app = super::router(state);
         (app, store, dir)
@@ -5368,10 +6001,12 @@ mod tests {
                 },
                 detector: nexus_config::CameraDetector {
                     prompts: vec![],
+                    visual_prompts: vec![],
                     model_override: None,
                 },
                 behavior: nexus_config::CameraBehavior {
                     parking_lot_mode: false,
+                    anchor_ttl_secs: None,
                 },
                 zones: vec![],
             })
@@ -5443,13 +6078,7 @@ mod tests {
     /// M6 Phase 2 Step 2.9 — public auth-mode probe is reachable
     /// WITHOUT a bearer (anonymous visitors need to know how to
     /// log in) and returns the mode plus the two derived flags.
-    /// `build_test_router` defaults to `DevToken`.
-    ///
-    /// M6 Phase 4 Step 4.5 — gated off when `prod-auth` strips the
-    /// `DevToken` variant; the equivalent assertion under prod-auth
-    /// would just be "the test router falls back to None mode"
-    /// which is covered by the auth_info_under_prod_auth test below.
-    #[cfg(not(feature = "prod-auth"))]
+    /// `build_test_router` defaults to `Local`.
     #[tokio::test]
     async fn auth_info_is_public_and_returns_mode() {
         use axum::body::to_bytes;
@@ -5463,37 +6092,12 @@ mod tests {
         assert_eq!(res.status(), StatusCode::OK);
         let body = to_bytes(res.into_body(), 4 * 1024).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(v["mode"], "dev_token");
-        assert_eq!(v["allows_local"], false);
+        assert_eq!(v["mode"], "local");
+        assert_eq!(v["allows_local"], true);
         assert_eq!(v["allows_oidc"], false);
         // M6 Phase 3 Step 3.3 UI — when OIDC isn't wired the
         // field is JSON null, NOT missing, so the SPA can rely
         // on `"oidc_display_name" in info` everywhere.
-        assert!(v["oidc_display_name"].is_null());
-    }
-
-    /// M6 Phase 4 Step 4.5 — release-build equivalent. With
-    /// `prod-auth` the `DevToken` variant is gone; `build_test_router`
-    /// constructs the test app under `AuthMode::None`. The probe
-    /// still works and reports the absence of any login surface,
-    /// which is the contract the SPA's `<Login>` page relies on.
-    #[cfg(feature = "prod-auth")]
-    #[tokio::test]
-    async fn auth_info_under_prod_auth_reports_none_mode() {
-        use axum::body::to_bytes;
-        let (app, _store, _dir) = build_test_router(None).await;
-        let req = Request::builder()
-            .method(Method::GET)
-            .uri("/api/v1/auth/info")
-            .body(Body::empty())
-            .unwrap();
-        let res = app.oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
-        let body = to_bytes(res.into_body(), 4 * 1024).await.unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(v["mode"], "none");
-        assert_eq!(v["allows_local"], false);
-        assert_eq!(v["allows_oidc"], false);
         assert!(v["oidc_display_name"].is_null());
     }
 
@@ -5651,5 +6255,148 @@ mod tests {
         req.extensions_mut().insert(ConnectInfo(loopback_peer()));
         let res = app.oneshot(req).await.unwrap();
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // ===============================================================
+    // M3.1 Phase H — visual prompts admin REST API
+    // ===============================================================
+
+    /// Smoke test: `GET /v1/admin/visual-prompts` requires the
+    /// admin bearer (loopback bypass does NOT apply once an admin
+    /// secret is configured). Confirms the route is reachable
+    /// under the admin layer.
+    #[tokio::test]
+    async fn visual_prompts_list_requires_admin_auth() {
+        const SECRET: &[u8] = b"m3-1-visual-prompts-auth";
+        let (app, _store, _dir) = build_test_router(Some(SECRET)).await;
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/admin/visual-prompts")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            res.status(),
+            StatusCode::UNAUTHORIZED,
+            "no bearer → 401 (loopback bypass disabled when secret configured)"
+        );
+    }
+
+    /// `GET /v1/admin/visual-prompts` returns an empty JSON array
+    /// when no prompts have been uploaded yet. Catches route-
+    /// registration regressions where the path resolves but the
+    /// handler isn't wired.
+    #[tokio::test]
+    async fn visual_prompts_list_empty_returns_empty_array() {
+        const SECRET: &[u8] = b"m3-1-visual-prompts-list-empty";
+        let (app, _store, _dir) = build_test_router(Some(SECRET)).await;
+        let token = sign_admin_jwt(SECRET);
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/admin/visual-prompts")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = to_bytes(res.into_body(), 64 * 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(v.is_array(), "response must be a JSON array");
+        assert_eq!(v.as_array().unwrap().len(), 0);
+    }
+
+    /// `POST /v1/admin/visual-prompts` returns 503 with
+    /// `encoder_not_configured` when no encoder model path is
+    /// resolvable from `inference.model.pack_path`. The test
+    /// harness builds the state with `encoder_model_path = None`,
+    /// so this is the default no-encoder path.
+    ///
+    /// The handler validates required multipart fields (name,
+    /// image) BEFORE checking the encoder path, so the test
+    /// posts a real (tiny) PNG to make sure the 503 surfaces
+    /// rather than a 400 "missing field" error.
+    #[tokio::test]
+    async fn visual_prompts_post_returns_503_when_encoder_unconfigured() {
+        const SECRET: &[u8] = b"m3-1-visual-prompts-no-encoder";
+        let (app, _store, _dir) = build_test_router(Some(SECRET)).await;
+        let token = sign_admin_jwt(SECRET);
+        // Smallest valid PNG: 1×1 transparent pixel. We don't
+        // need the encoder to actually run — the handler must
+        // return 503 BEFORE it touches the encoder session, but
+        // AFTER it validates the multipart fields.
+        let png_1x1: &[u8] = &[
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, // PNG signature
+            0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52, // IHDR chunk
+            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F,
+            0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x44, 0x41, // IDAT chunk
+            0x54, 0x78, 0x9C, 0x62, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D,
+            0xB4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, // IEND chunk
+            0x42, 0x60, 0x82,
+        ];
+        let boundary = "------------------------testboundary";
+        let mut body: Vec<u8> = Vec::new();
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"name\"\r\n\r\ntest-prompt\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"image\"; filename=\"a.png\"\r\nContent-Type: image/png\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(png_1x1);
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/admin/visual-prompts")
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from(body))
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            res.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no encoder configured → 503",
+        );
+        let body = to_bytes(res.into_body(), 4096).await.unwrap();
+        let s = String::from_utf8_lossy(&body);
+        assert!(
+            s.contains("encoder_not_configured"),
+            "503 body must mention encoder_not_configured, got: {s}",
+        );
+    }
+
+    /// `GET /v1/admin/cameras/{cid}/visual-prompts` against a
+    /// camera that has no attachments returns an empty array
+    /// (NOT 404 — the camera might not even exist in the test
+    /// DB; the join-table query just returns no rows).
+    #[tokio::test]
+    async fn visual_prompts_list_for_unknown_camera_returns_empty() {
+        const SECRET: &[u8] = b"m3-1-visual-prompts-unknown-cam";
+        let (app, _store, _dir) = build_test_router(Some(SECRET)).await;
+        let token = sign_admin_jwt(SECRET);
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/admin/cameras/999/visual-prompts")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = to_bytes(res.into_body(), 64 * 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v.as_array().expect("array").len(), 0);
     }
 }
