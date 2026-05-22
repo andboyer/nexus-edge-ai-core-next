@@ -6,7 +6,9 @@ use clap::{Parser, ValueEnum};
 use nexus_bus::build_bus;
 use nexus_config::{CameraConfig, Config, InferenceConfig, RecorderKind};
 use nexus_inference::InferenceRouter;
-use nexus_pipeline::{spawn_camera, FrameStatsRegistry, LatestFrameCache, StaticAnchorClearRegistry};
+use nexus_pipeline::{
+    spawn_camera, FrameStatsRegistry, LatestFrameCache, StaticAnchorClearRegistry,
+};
 use nexus_rules::RuleEvaluator;
 use nexus_store::Store;
 use nexus_tracker::build_tracker;
@@ -511,8 +513,7 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
         let detector = router.detector_for_camera(&cam);
         // Fresh per-camera tracker — see the comment on `cfg.tracker`
         // above for why sharing one Arc across cameras is wrong.
-        let tracker: Arc<dyn nexus_tracker::Tracker> =
-            Arc::from(build_tracker(&cfg.tracker));
+        let tracker: Arc<dyn nexus_tracker::Tracker> = Arc::from(build_tracker(&cfg.tracker));
         let h = spawn_camera(
             cam,
             detector,

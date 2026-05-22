@@ -118,9 +118,9 @@ RUN cargo build --release -p nexus-engine --features "${FEATURES}" --bin nexus-e
 # add the symlink explicitly.
 FROM rust-build AS ort-openvino
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        python3 python3-pip \
+    python3 python3-pip \
     && pip3 install --break-system-packages --no-cache-dir \
-        --target=/tmp/ovwheel "onnxruntime-openvino==${ORT_VERSION}" \
+    --target=/tmp/ovwheel "onnxruntime-openvino==${ORT_VERSION}" \
     && rm -rf /var/lib/apt/lists/*
 RUN set -eux; \
     SRC=/tmp/ovwheel/onnxruntime/capi; \
@@ -130,7 +130,7 @@ RUN set -eux; \
     cp -aP "$SRC"/*.so* "$DST"/; \
     # Ensure the unversioned soname exists for ort's load-dynamic dlopen.
     if [ ! -e "$DST/libonnxruntime.so" ]; then \
-        ln -s "libonnxruntime.so.${ORT_VERSION}" "$DST/libonnxruntime.so"; \
+    ln -s "libonnxruntime.so.${ORT_VERSION}" "$DST/libonnxruntime.so"; \
     fi; \
     echo "--- /opt/onnxruntime/lib after OpenVINO overlay ---"; \
     ls -la "$DST" | head -60; \

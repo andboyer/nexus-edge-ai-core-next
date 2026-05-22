@@ -18,9 +18,9 @@
 
 pub mod backends;
 pub mod detectors;
-pub mod ensemble;
 #[cfg(feature = "ort")]
 pub mod encoder;
+pub mod ensemble;
 #[cfg(feature = "ort")]
 pub mod execution_providers;
 pub mod pool;
@@ -47,9 +47,7 @@ pub use detectors::{
 };
 pub use pool::{BackendStatus, DetectorPool};
 pub use router::InferenceRouter;
-pub use visual_prompts::{
-    InMemoryVisualPromptStore, VisualPromptBinding, VisualPromptStore,
-};
+pub use visual_prompts::{InMemoryVisualPromptStore, VisualPromptBinding, VisualPromptStore};
 pub use visual_store_sqlite::StoreBackedVisualPromptStore;
 #[cfg(feature = "ort")]
 pub use yolo::YoloOrtDetector;

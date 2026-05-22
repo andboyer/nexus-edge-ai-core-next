@@ -1936,9 +1936,7 @@ struct StaticObjectDefaultsView {
     anchor_ttl_secs: u32,
 }
 
-async fn get_static_object_defaults(
-    State(s): State<ApiState>,
-) -> Json<StaticObjectDefaultsView> {
+async fn get_static_object_defaults(State(s): State<ApiState>) -> Json<StaticObjectDefaultsView> {
     Json(StaticObjectDefaultsView {
         anchor_ttl_secs: s.default_anchor_ttl_secs,
     })
@@ -2482,7 +2480,8 @@ async fn get_clip(
     // legitimately hasn't grown past the header yet still gets a
     // chance to serve once it finishes.
     const STUB_CLIP_BYTE_THRESHOLD: i64 = 4096;
-    if clip.ended_at.is_some() && clip.size_bytes > 0 && clip.size_bytes < STUB_CLIP_BYTE_THRESHOLD {
+    if clip.ended_at.is_some() && clip.size_bytes > 0 && clip.size_bytes < STUB_CLIP_BYTE_THRESHOLD
+    {
         let body = serde_json::json!({
             "error": "playback unavailable",
             "reason": "no_samples",
