@@ -5,6 +5,14 @@
 worker_threads = 12
 blocking_threads = 12
 
+[runtime.clips]
+# Real H.264-passthrough mp4 via the shared RTSP session (detector +
+# recorder share one connection per camera via a `tee`). REQUIRES the
+# engine to be built with `--features gstreamer`. Without this line
+# the runtime default is `recorder = "stub"`, which writes 0-byte
+# placeholder files — a common source of "clips don't play" reports.
+recorder = "gstreamer"
+
 [auth]
 # Customer-facing default since M6 (see docs/ARCHITECTURE.md §11).
 # First boot creates a single `admin` user with a one-time password

@@ -605,11 +605,23 @@ sudo dmesg | grep -i 'intel_vpu\|intel_vpu0'
 ```
 
 The tier config [config/tiers/t36s.toml](../config/tiers/t36s.toml)
-lists `npu` second in `ep_priority`. If the NPU stack is missing the
-engine **falls through to OpenVINO on the iGPU automatically** —
-that's the whole point of the EP priority list — so you can bring
-the box up on the iGPU first, install the NPU later, and restart
-the engine to pick it up.
+lists `npu` first in `ep_priority`, then `cpu`. If the NPU stack
+is missing the engine **falls through to CPU automatically** — that's
+the whole point of the EP priority list — so you can bring the box
+up on the iGPU first, install the NPU later, and restart the engine
+to pick it up.
+
+> **Why isn't `openvino` listed alongside `npu` for the iGPU?** ORT's
+> `RegisterExecutionProviderLibrary` is one-shot per session: the
+> OpenVINO EP library can only be registered once. Listing both
+> `openvino` and `npu` trips the duplicate-registration guard, the
+> yolo loader silently catches the error, and the camera falls back
+> to the mock detector — `/api/backends` still reports
+> `state: "ready"` so the failure is invisible from the UI. The
+> single `npu` entry already dispatches through the OpenVINO EP with
+> `device_type=NPU`, which covers both accelerators. See the inline
+> comments in [config/tiers/t36s.toml](../config/tiers/t36s.toml#L43)
+> for the full reasoning.
 
 ### 5.4 T64 — NVIDIA RTX 4060
 
@@ -825,6 +837,31 @@ sudo install -o nexus -g nexus -m 0644 \
     /opt/nexus/config/tiers/t24.toml \
     /etc/nexus/nexus.toml            # ← swap t24.toml for your tier
 ```
+
+> **Verify the recorder is in `gstreamer` mode (not `stub`).** Every
+> tier config in `config/tiers/*.toml` now ships with
+>
+> ```toml
+> [runtime.clips]
+> recorder = "gstreamer"
+> ```
+>
+> baked in. **If you're customising a config or porting an older one
+> forward**, double-check the line is present — the runtime default
+> when the key is missing is `recorder = "stub"`, which writes a
+> 0-byte placeholder file per motion event and looks like a broken
+> recorder to the operator. Verify after first boot with
+>
+> ```bash
+> curl -fsS http://localhost:8089/api/v1/storage/local \
+>     | jq -r .recorder_kind        # expect: "gstreamer"
+> ```
+>
+> The `gstreamer` recorder shares the camera's single RTSP session
+> with the detector via an internal `tee` (one connection per camera,
+> not two), which is also what makes the engine compatible with the
+> IP-camera firmwares that enforce a one-session-per-stream limit
+> (e.g. InSight CS-series — see §8.1).
 
 > **Optional once you're on the dogfooding kit.** Engine ≥ 0.1
 > understands `--tier auto` (or `NEXUS_TIER=auto`), which calls
@@ -1392,6 +1429,22 @@ kind = "inclusion"
 > quotes after running `set +H`. The `!` triggers history expansion
 > otherwise.
 
+> **One-session-per-path IP cameras.** Some firmwares — confirmed on
+> the InSight CS-series, also reported on a handful of low-end
+> ONVIF-only re-badges — accept exactly **one** active RTSP session
+> per stream URL. The second connection either gets a `503 Service
+> Unavailable` or quietly starves the first. The engine sidesteps
+> this by sharing the single RTSP session between detector and
+> recorder through an internal `tee` (the `recorder = "gstreamer"`
+> path; see §6.3). If you're configuring an external probe / VMS
+> against the same camera stream URL while the engine is running,
+> expect one of the two to lose the session. Workarounds:
+> (a) point the external tool at the camera's `stream2` (most
+> firmwares expose a separate sub-stream URL with its own session
+> slot), or (b) stop the engine briefly. **Do not run two cameras
+> in the engine with the same `url`** — they'll fight for the slot
+> and one will silently stay at 0 fps after the first reconnect.
+
 After editing, restart the engine to pick up the seed:
 
 - Container: `docker compose restart engine`
@@ -1606,6 +1659,19 @@ curl -fsS "http://localhost:8089/api/v1/cameras/1/motion?from=$(date -u -d '5 mi
 # Expect: > 0
 ```
 
+> **If the motion block appears but clicking it shows "no playable
+> data" (or the file size is 0 bytes on disk in `clips_dir`):** the
+> recorder booted in `stub` mode. Run
+>
+> ```bash
+> curl -fsS http://localhost:8089/api/v1/storage/local | jq -r .recorder_kind
+> ```
+>
+> If it returns `"stub"`, add `[runtime.clips] recorder = "gstreamer"`
+> to `/etc/nexus/nexus.toml` (see §6.3 callout) and restart the
+> engine. If it returns `"gstreamer"` but clips still look broken,
+> see §11 (recorder writes ~864-byte mp4 files).
+
 ### 9.8 Alert end-to-end
 
 The example config seeds a `person_in_zone` CEL rule. Stand in
@@ -1797,7 +1863,10 @@ This guide will grow §6.7 / §10 sections for both once they ship.
 | `vainfo` succeeds for `nexus-admin` but engine logs say "no VAAPI device" | `nexus` user not in `render` group. | `sudo usermod -aG render nexus` then restart the engine + reload the systemd-cgroup view (`systemctl daemon-reload && systemctl restart nexus-engine`). |
 | `/dev/accel/accel0` missing on T36-S | Kernel < 6.10, NPU disabled in BIOS, or driver trio not installed. | `uname -r` must be ≥ 6.10 (§3.6); §2 BIOS section; §5.3 driver install. |
 | `nvidia-smi` works on the host but engine reports CPU EP only | NVIDIA Container Toolkit not installed, or compose doesn't have the `runtime: nvidia` block. | §5.4 step 5; §6.6 T64 snippet. |
-| Recorder writes 864-byte mp4 files | mp4mux silently dropping buffers without PTS. The shipping recorder synthesises PTS, so this should not happen on `main`; it indicates a regression. | Capture logs with `GST_DEBUG=qtmux:5` and file an issue (§14). |
+| `/api/backends` shows all slots `state: "ready"` but every camera returns generic / mock-looking detection labels | `ep_priority` lists both `openvino` and `npu`. ORT's `RegisterExecutionProviderLibrary` is one-shot per session — the duplicate trips a "Provider OpenVINOExecutionProvider has already been registered" error that the yolo loader catches and silently falls back to the mock detector. | Set `ep_priority = ["npu", "cpu"]` (T36-S) or `ep_priority = ["openvino", "cpu"]` (T10/T24/T36) — never both. See [config/tiers/t36s.toml](../config/tiers/t36s.toml#L43) for the inline rationale. |
+| Camera reaches `streaming` once then stays at 0 fps after every subsequent reconnect, but VLC against the same URL works fine | IP-camera firmware (e.g. InSight CS-series) enforces one RTSP session per stream path; some other client — or a stale engine session lingering after a crash — is holding the slot. | Power-cycle the camera (clears any stuck server-side session), confirm no other VMS / external probe is hitting the same `url`, and verify the engine is on `recorder = "gstreamer"` so detector + recorder share a single session via the internal `tee` (§6.3, §8.1). |
+| Recorder writes 0-byte mp4 files | `recorder = "stub"` (the runtime default when `[runtime.clips]` is missing). | Add `[runtime.clips] recorder = "gstreamer"` to `/etc/nexus/nexus.toml` (§6.3 callout) and `sudo systemctl restart nexus-engine`. Confirm with `curl /api/v1/storage/local \| jq -r .recorder_kind`. |
+| Recorder writes ~864-byte mp4 files (`recorder_kind = "gstreamer"`) | mp4mux silently dropping buffers without PTS. The shipping recorder synthesises PTS, coalesces same-PTS NAL pairs, and forces `h264parse config-interval=0`, so this should not happen on `main`; it indicates a regression. | Capture logs with `GST_DEBUG=qtmux:5,h264parse:4` and file an issue (§14). |
 | Recorder refuses to open new clips ("storage panic") | Free space on `/var/lib/nexus/clips` ≤ `panic_watermark_pct` (default 5 %). | `df -h /var/lib/nexus/clips`; either grow the disk or lower `motion_clips_retention_days` and wait for the eviction round (default 30 s sample interval). |
 | Engine fails to load model at boot with "sha256 mismatch" | The .onnx file on disk doesn't match `models-manifest.json`. Common after regenerating with custom prompts but forgetting to refresh the manifest. | Re-run `python tools/models/gen_yolo_world.py …` (Appendix A) — the script re-stamps the manifest. |
 | `command not found: cargo` after a fresh ssh login | Rust toolchain is installed, but `~/.cargo/env` not sourced for non-interactive shells. | Confirm with `[ -d ~/.rustup ] || ls ~/.cargo/bin/rustup`. Add `source $HOME/.cargo/env` to `~/.profile` (§7.1). |

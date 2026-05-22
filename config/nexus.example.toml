@@ -22,6 +22,18 @@ blocking_threads = 8
 # visual_prompts_dir = "/var/lib/nexus/visual_prompts"
 
 [runtime.clips]
+# Which recorder backend writes the mp4 files.
+#   "gstreamer" — real H.264-passthrough fragmented mp4 via the shared
+#                 RTSP session (detector + recorder share one connection
+#                 per camera via a `tee`). REQUIRES the engine to be
+#                 built with `--features gstreamer`. This is what every
+#                 production deployment wants.
+#   "stub"      — writes empty placeholder files. Default fallback so
+#                 the engine can boot in CI / on a dev box without
+#                 GStreamer. If you see 0-byte clip files in
+#                 `clips_dir` after a motion event, the recorder is
+#                 stub-mode — flip this to "gstreamer" and restart.
+recorder = "gstreamer"
 # Where the recorder writes mp4 files. Created on demand.
 clips_dir = "/var/lib/nexus/clips"
 # Daily retention sweeper deletes clips older than this. The watermark
