@@ -1,7 +1,9 @@
 //! Frame sources — RTSP and a virtual generator for tests / dev boots.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(feature = "gstreamer")]
+use std::time::Instant;
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -36,6 +38,7 @@ pub const RTSP_SOURCE_FRAME_HEIGHT: u32 = 540;
 /// reports PLAYING but no sample ever arrives in 15s the source
 /// is almost certainly negotiating endlessly against a dead
 /// publisher.
+#[cfg(feature = "gstreamer")]
 const RTSP_STALL_TIMEOUT_SECS: u64 = 15;
 
 #[derive(Debug, Error)]

@@ -105,11 +105,8 @@ pub fn build_catalog(
     router: &InferenceRouter,
 ) -> ModelPromptsCatalog {
     let default_kind = inference_cfg.model.kind.clone();
-    let loaded: std::collections::HashSet<String> = router
-        .detectors()
-        .into_iter()
-        .map(|(k, _)| k)
-        .collect();
+    let loaded: std::collections::HashSet<String> =
+        router.detectors().into_iter().map(|(k, _)| k).collect();
     let kinds: Vec<DetectorPromptInfo> = KNOWN_KINDS
         .iter()
         .map(|k| {
@@ -280,10 +277,7 @@ fn yoloe_promptfree_info(kind: &str, cfg: &nexus_config::InferenceConfig) -> Det
     // prompt subsets and caps results at model.top_k. Surface the
     // identical baked vocabulary so the UI can show what *could*
     // come out before top_k truncation.
-    let prompts = match read_manifest_prompts(cfg, "yoloe26_s") {
-        Ok(p) => p,
-        Err(_) => Vec::new(),
-    };
+    let prompts = read_manifest_prompts(cfg, "yoloe26_s").unwrap_or_default();
     DetectorPromptInfo {
         kind: kind.into(),
         open_vocab: true,

@@ -79,9 +79,7 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::preroll::{NalRingBuffer, NalSample};
-use crate::source::{
-    gst_init, RTSP_SOURCE_FRAME_HEIGHT, RTSP_SOURCE_FRAME_WIDTH,
-};
+use crate::source::{gst_init, RTSP_SOURCE_FRAME_HEIGHT, RTSP_SOURCE_FRAME_WIDTH};
 
 /// How many in-flight live samples the broadcast channel buffers
 /// per subscriber. Tokio's broadcast drops the OLDEST sample when
@@ -549,8 +547,7 @@ async fn run_session(
                     }
 
                     let plane = frame_ref.plane_data(0).map_err(|_| gst::FlowError::Error)?;
-                    let stride =
-                        frame_ref.plane_stride().first().copied().unwrap_or(0) as usize;
+                    let stride = frame_ref.plane_stride().first().copied().unwrap_or(0) as usize;
                     let width = info.width() as usize;
                     let height = info.height() as usize;
                     let row_bytes = width * 3;

@@ -28,8 +28,8 @@ use crate::post_roll::{PostRoll, PostRollAction};
 use crate::recorder::{
     ClipFinal, ClipHandle, ClipRecorder, OpenClip, RecorderError, MAX_CLIP_DURATION_MS,
 };
-use crate::static_clear::StaticAnchorClearRegistry;
 use crate::source::{FrameSource, VirtualSource};
+use crate::static_clear::StaticAnchorClearRegistry;
 use crate::stats::FrameStatsRegistry;
 
 pub struct CameraHandle {

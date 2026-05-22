@@ -428,8 +428,8 @@ impl ClipRecorder for GstClipRecorder {
             out
         };
         let appsrc_for_blocking = appsrc.clone();
-        let (preroll_count, preroll_last_written_pts_ns) = match tokio::task::spawn_blocking(
-            move || {
+        let (preroll_count, preroll_last_written_pts_ns) =
+            match tokio::task::spawn_blocking(move || {
                 let mut n = 0usize;
                 let mut last_written: Option<u64> = None;
                 for sample in &snapshot_for_blocking {
@@ -449,22 +449,21 @@ impl ClipRecorder for GstClipRecorder {
                     n += 1;
                 }
                 Ok::<(usize, Option<u64>), RecorderError>((n, last_written))
-            },
-        )
-        .await
-        {
-            Ok(Ok((n, last))) => (n, last),
-            Ok(Err(e)) => {
-                let _ = pipeline.set_state(gst::State::Null);
-                return Err(e);
-            }
-            Err(join_err) => {
-                let _ = pipeline.set_state(gst::State::Null);
-                return Err(RecorderError::Io(std::io::Error::other(format!(
-                    "preroll spawn_blocking: {join_err}"
-                ))));
-            }
-        };
+            })
+            .await
+            {
+                Ok(Ok((n, last))) => (n, last),
+                Ok(Err(e)) => {
+                    let _ = pipeline.set_state(gst::State::Null);
+                    return Err(e);
+                }
+                Err(join_err) => {
+                    let _ = pipeline.set_state(gst::State::Null);
+                    return Err(RecorderError::Io(std::io::Error::other(format!(
+                        "preroll spawn_blocking: {join_err}"
+                    ))));
+                }
+            };
         let last_pushed_pts: Option<Duration> = snapshot_tail_pts;
 
         let rel = crate::recorder::clip_rel_path(&self.clips_dir, &path);
@@ -900,10 +899,7 @@ async fn hash_file_sha256(path: &Path) -> std::io::Result<String> {
 /// samples are coming (end of snapshot, stop signal, inactivity
 /// timer). Returning `None` does **not** mean "drop this sample";
 /// it means "still buffering".
-fn coalesce_same_pts(
-    pending: &mut Option<NalSample>,
-    incoming: NalSample,
-) -> Option<NalSample> {
+fn coalesce_same_pts(pending: &mut Option<NalSample>, incoming: NalSample) -> Option<NalSample> {
     match pending.take() {
         None => {
             *pending = Some(incoming);
@@ -1200,7 +1196,9 @@ mod tests {
         assert!(pending.is_some());
         // Second arrival with the same pts: merges into pending, still
         // nothing to flush.
-        assert!(coalesce_same_pts(&mut pending, sample(Some(66), &[5, 0, 0, 0, 0], true)).is_none());
+        assert!(
+            coalesce_same_pts(&mut pending, sample(Some(66), &[5, 0, 0, 0, 0], true)).is_none()
+        );
         let merged = pending.as_ref().unwrap();
         assert_eq!(merged.pts, Some(Duration::from_millis(66)));
         assert_eq!(merged.data, vec![9, 0, 6, 25, 5, 0, 0, 0, 0]);
@@ -1246,7 +1244,10 @@ mod tests {
         b.dts = Some(Duration::from_millis(70));
         coalesce_same_pts(&mut pending, a);
         coalesce_same_pts(&mut pending, b);
-        assert_eq!(pending.as_ref().unwrap().dts, Some(Duration::from_millis(60)));
+        assert_eq!(
+            pending.as_ref().unwrap().dts,
+            Some(Duration::from_millis(60))
+        );
     }
 
     async fn fixture() -> (Arc<Store>, tempfile::TempDir, PathBuf) {

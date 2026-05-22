@@ -33,12 +33,12 @@ use std::sync::Arc;
 
 use futures::StreamExt;
 use nexus_bus::{topic, Bus, BusExt};
+use nexus_config::TrackerConfig;
 use nexus_config::{AnnotatorConfig, CameraConfig, ClipsConfig, StaticObjectConfig};
 use nexus_inference::InferenceRouter;
 use nexus_pipeline::{
     spawn_camera, ClipRecorder, FrameStatsRegistry, LatestFrameCache, StaticAnchorClearRegistry,
 };
-use nexus_config::TrackerConfig;
 use nexus_rules::RuleEvaluator;
 use nexus_store::Store;
 use nexus_tracker::Tracker;

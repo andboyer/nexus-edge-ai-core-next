@@ -19,8 +19,8 @@ pub mod post_roll;
 pub mod preroll;
 pub mod recorder;
 pub mod source;
-pub mod stats;
 pub mod static_clear;
+pub mod stats;
 pub mod supervisor;
 
 #[cfg(feature = "gstreamer")]
@@ -40,8 +40,8 @@ pub use recorder::{
 };
 pub use source::{FailingSource, FrameSource, FrameSourceError, VirtualSource};
 pub use source::{RTSP_SOURCE_FRAME_HEIGHT, RTSP_SOURCE_FRAME_WIDTH};
-pub use stats::{CameraFrameStats, FrameStatsRegistry};
 pub use static_clear::StaticAnchorClearRegistry;
+pub use stats::{CameraFrameStats, FrameStatsRegistry};
 pub use supervisor::{spawn_camera, CameraHandle};
 
 #[cfg(feature = "gstreamer")]
