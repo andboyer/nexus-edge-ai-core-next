@@ -240,10 +240,9 @@ fn build_detector_with_context(
         "yoloe_visual" => {
             #[cfg(feature = "ort")]
             {
-                if let (Some(store), Some(dim)) = (
-                    _ctx.visual_prompt_store.clone(),
-                    _ctx.visual_embedding_dim,
-                ) {
+                if let (Some(store), Some(dim)) =
+                    (_ctx.visual_prompt_store.clone(), _ctx.visual_embedding_dim)
+                {
                     match crate::yoloe_visual::YoloeVisualDetector::from_config(cfg, dim, store) {
                         Ok(d) => return Ok(Arc::new(d)),
                         Err(e) => {
@@ -298,8 +297,7 @@ fn build_detector_with_context(
         // into — matches the "ensemble member skips nested ensemble"
         // acceptance test and the worker's identical guard.
         "ensemble" => {
-            let mut members: Vec<Arc<dyn Detector>> =
-                Vec::with_capacity(cfg.model.members.len());
+            let mut members: Vec<Arc<dyn Detector>> = Vec::with_capacity(cfg.model.members.len());
             for member_cfg in &cfg.model.members {
                 if member_cfg.kind == "ensemble" {
                     warn!(
