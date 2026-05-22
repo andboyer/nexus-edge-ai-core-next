@@ -356,7 +356,7 @@ export function DashboardPage() {
                         {
                           promptsQuery.data.by_kind[
                             promptsQuery.data.default_kind
-                          ].prompts.length
+                          ]?.prompts.length
                         }
                       </span>
                     </div>
@@ -521,7 +521,7 @@ function CameraTile({ camera }: { camera: CameraConfig }) {
   });
 
   const stale = ageMs(metaQuery.data?.captured_at) > STALE_FRAME_MS;
-  const src = `${latestFrameJpegUrl(camera.id)}?t=${bust}`;
+  const src = `${latestFrameJpegUrl(String(camera.id))}?t=${bust}`;
   const fps = statsQuery.data?.fps_ema ?? 0;
   const dropped = statsQuery.data?.frames_dropped ?? 0;
   // Engine-side detector frame dims (after videoscale). The playback

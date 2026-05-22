@@ -1787,7 +1787,7 @@ function ZonesEditor({
     if (!p) return;
     // Snap-to-close when the click lands on the starting vertex.
     if (mode.points.length >= 3) {
-      const first = mode.points[0];
+      const first = mode.points[0]!;
       if (Math.hypot(p[0] - first[0], p[1] - first[1]) < VERTEX_SNAP) {
         commitDrawing(mode.points);
         return;
@@ -1806,8 +1806,8 @@ function ZonesEditor({
     e.preventDefault();
     let points = mode.points;
     if (points.length >= 2) {
-      const last = points[points.length - 1];
-      const prev = points[points.length - 2];
+      const last = points[points.length - 1]!;
+      const prev = points[points.length - 2]!;
       if (Math.hypot(last[0] - prev[0], last[1] - prev[1]) < 0.02) {
         points = points.slice(0, -1);
       }
@@ -2011,7 +2011,7 @@ function ZonesEditor({
                   const next =
                     selectedZone.polygon[
                       (i + 1) % selectedZone.polygon.length
-                    ];
+                    ]!;
                   return (
                     <line
                       key={`edge-${selectedZone.id}-${i}`}
@@ -2055,10 +2055,10 @@ function ZonesEditor({
                 vertices". */}
             {mode.type === "drawing" && mode.points.length >= 3 ? (
               <line
-                x1={mode.points[mode.points.length - 1][0]}
-                y1={mode.points[mode.points.length - 1][1]}
-                x2={mode.points[0][0]}
-                y2={mode.points[0][1]}
+                x1={mode.points[mode.points.length - 1]![0]}
+                y1={mode.points[mode.points.length - 1]![1]}
+                x2={mode.points[0]![0]}
+                y2={mode.points[0]![1]}
                 stroke="#38bdf8"
                 strokeWidth={1}
                 strokeDasharray="2 3"
@@ -2102,7 +2102,7 @@ function ZonesEditor({
                 const next =
                   selectedZone.polygon[
                     (i + 1) % selectedZone.polygon.length
-                  ];
+                  ]!;
                 const mx = (x + next[0]) / 2;
                 const my = (y + next[1]) / 2;
                 return (
@@ -2292,15 +2292,15 @@ function polygonHasSelfIntersection(
   const n = points.length;
   if (n < 4) return false;
   for (let i = 0; i < n; i += 1) {
-    const a1 = points[i];
-    const a2 = points[(i + 1) % n];
+    const a1 = points[i]!;
+    const a2 = points[(i + 1) % n]!;
     for (let j = i + 1; j < n; j += 1) {
       // Skip adjacent edges (they share an endpoint by construction).
       if (j === i) continue;
       if ((j + 1) % n === i) continue;
       if (j === (i + 1) % n) continue;
-      const b1 = points[j];
-      const b2 = points[(j + 1) % n];
+      const b1 = points[j]!;
+      const b2 = points[(j + 1) % n]!;
       if (segmentsIntersect(a1, a2, b1, b2)) return true;
     }
   }
