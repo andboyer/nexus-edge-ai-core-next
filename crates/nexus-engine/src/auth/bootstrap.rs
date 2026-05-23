@@ -16,6 +16,9 @@
 //! that includes restore; pre-2.8 the operator must edit SQLite
 //! directly). We do not auto-re-bootstrap.
 
+use std::io;
+use std::path::{Path, PathBuf};
+
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use nexus_config::AuthMode;
@@ -23,6 +26,21 @@ use nexus_store::{NewUser, Store, StoreError, UserId, UsersError};
 use nexus_types::Role;
 
 use super::passwords::{hash_password, PasswordError};
+
+/// Filename of the bootstrap-password sentinel inside the
+/// engine's `state_dir`. The first-boot flow writes the
+/// generated one-time admin password here so `install.sh`
+/// (or any other operator-side tool) can surface it once and
+/// then encourage rotation. Deleted by
+/// [`clear_bootstrap_sentinel`] the instant the admin
+/// successfully completes `POST /v1/auth/change-password`.
+///
+/// Sentinel-file pattern instead of "operator greps journalctl
+/// for a WARN line" is what every shipping appliance does
+/// (GitLab Omnibus, Vaultwarden, Sentry self-host, etc.) and
+/// what M-Install Checkpoint 3c specifies for the installer's
+/// final banner.
+pub const BOOTSTRAP_SENTINEL_FILE: &str = "bootstrap-password.txt";
 
 /// Username allocated to the bootstrap admin. The operator can
 /// rename / disable / soft-delete this user after first login,
@@ -140,6 +158,90 @@ pub fn generate_one_time_password() -> Result<String, getrandom::Error> {
     let mut bytes = [0u8; BOOTSTRAP_PASSWORD_BYTES];
     getrandom::fill(&mut bytes)?;
     Ok(URL_SAFE_NO_PAD.encode(bytes))
+}
+
+/// Resolve the on-disk path of the bootstrap-password
+/// sentinel relative to the engine's `state_dir`. Pure
+/// path arithmetic — does not touch the filesystem.
+pub fn bootstrap_sentinel_path(state_dir: &Path) -> PathBuf {
+    state_dir.join(BOOTSTRAP_SENTINEL_FILE)
+}
+
+/// Write the freshly-minted one-time password to
+/// `<state_dir>/bootstrap-password.txt` with mode `0600`. The
+/// installer's final banner reads this file via `sudo cat`
+/// and prints it to the operator's terminal exactly once.
+///
+/// Best-effort by design: a write failure here only means the
+/// installer's nice-banner UX degrades to "grep journalctl";
+/// the engine has already created the admin user. Callers
+/// should `tracing::warn!` on `Err` but never abort boot.
+///
+/// File format is intentionally trivial — `username\tpassword\n`
+/// — so install scripts can `awk -F'\t' '{print $2}'` it
+/// without pulling in a TOML/JSON parser. Today the username
+/// is always [`BOOTSTRAP_USERNAME`] but the column lets a
+/// future "regenerate admin password" CLI reuse the same file.
+pub fn write_bootstrap_sentinel(state_dir: &Path, otp: &str) -> io::Result<PathBuf> {
+    use std::io::Write;
+
+    let path = bootstrap_sentinel_path(state_dir);
+
+    // Use a tmp + rename dance so the file is never
+    // half-written even if the process crashes mid-write.
+    let tmp = path.with_extension("txt.tmp");
+
+    // Mode 0600 on Unix; on Windows the standard ACL applies.
+    // The engine runs as the `nexus` system user; the installer
+    // banner uses `sudo cat` to read it from root.
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).write(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    {
+        let mut f = opts.open(&tmp)?;
+        writeln!(f, "{}\t{}", BOOTSTRAP_USERNAME, otp)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, &path)?;
+    Ok(path)
+}
+
+/// Best-effort delete the bootstrap-password sentinel file.
+/// Called by the change-password handler the moment the
+/// operator rotates the bootstrap OTP out: there is no longer
+/// any reason for the plaintext to sit on disk.
+///
+/// Never fails the caller: a missing file is success; any
+/// other I/O failure is logged at `warn!` and swallowed.
+/// Keeping the file around after a successful change-password
+/// is a soft security regression (the OTP no longer works,
+/// but leaving it on disk is still untidy); blocking the
+/// password change because we can't `unlink` would be a hard
+/// regression.
+pub fn clear_bootstrap_sentinel(state_dir: &Path) {
+    let path = bootstrap_sentinel_path(state_dir);
+    match std::fs::remove_file(&path) {
+        Ok(()) => {
+            tracing::info!(path = %path.display(), "bootstrap-password sentinel removed");
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            // Already cleared (e.g. a prior change-password
+            // call, or this is a fresh deploy where the
+            // operator pre-rotated the password before the
+            // sentinel was ever written). Not a problem.
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                path = %path.display(),
+                "failed to remove bootstrap-password sentinel; rotate the OTP file manually",
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -370,5 +472,61 @@ mod tests {
             &one_time_password,
             &phc
         ));
+    }
+
+    // ----- bootstrap sentinel file ---------------------------------------
+
+    #[test]
+    fn write_bootstrap_sentinel_creates_file_with_expected_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_bootstrap_sentinel(dir.path(), "secret-abc").unwrap();
+        assert_eq!(path, dir.path().join(BOOTSTRAP_SENTINEL_FILE));
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(body, format!("{}\tsecret-abc\n", BOOTSTRAP_USERNAME));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_bootstrap_sentinel_sets_mode_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_bootstrap_sentinel(dir.path(), "pw").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "expected 0600, got {mode:o}");
+    }
+
+    #[test]
+    fn write_bootstrap_sentinel_overwrites_atomically() {
+        // Second write must replace the first — operators who
+        // run multiple `bootstrap_if_needed` calls (e.g. during
+        // dev) should not see a stale OTP from a previous boot
+        // sitting next to a fresh one.
+        let dir = tempfile::tempdir().unwrap();
+        write_bootstrap_sentinel(dir.path(), "first").unwrap();
+        write_bootstrap_sentinel(dir.path(), "second").unwrap();
+        let body = std::fs::read_to_string(dir.path().join(BOOTSTRAP_SENTINEL_FILE)).unwrap();
+        assert!(body.contains("second"), "{body:?}");
+        assert!(!body.contains("first"), "{body:?}");
+        // tmp file must not linger.
+        assert!(!dir.path().join("bootstrap-password.txt.tmp").exists());
+    }
+
+    #[test]
+    fn clear_bootstrap_sentinel_is_idempotent_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        // No file exists yet — must not panic, must not log
+        // at warn (we can't easily assert log level here, but
+        // the implementation special-cases NotFound).
+        clear_bootstrap_sentinel(dir.path());
+        clear_bootstrap_sentinel(dir.path());
+    }
+
+    #[test]
+    fn clear_bootstrap_sentinel_removes_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_bootstrap_sentinel(dir.path(), "pw").unwrap();
+        assert!(path.exists());
+        clear_bootstrap_sentinel(dir.path());
+        assert!(!path.exists());
     }
 }

@@ -296,6 +296,13 @@ pub struct LoginState {
     pub store: Arc<Store>,
     pub admin_auth: Arc<AdminAuthState>,
     pub lockout: LockoutConfig,
+    /// Snapshot of `cfg.runtime.state_dir`. Needed by
+    /// [`post_change_password`] so it can remove the
+    /// first-boot bootstrap-password sentinel file
+    /// (`<state_dir>/bootstrap-password.txt`) once the
+    /// operator rotates the generated OTP. See
+    /// [`crate::auth::bootstrap::clear_bootstrap_sentinel`].
+    pub state_dir: std::path::PathBuf,
 }
 
 // ---------------------------------------------------------------------------
@@ -783,6 +790,11 @@ pub async fn post_change_password(
         ua,
     )
     .await;
+    // M-Install Checkpoint 3c — the first-boot OTP is now
+    // dead. Wipe the on-disk sentinel that the installer
+    // banner reads. Best-effort: never fails the request, the
+    // helper logs at warn! if the unlink can't happen.
+    crate::auth::bootstrap::clear_bootstrap_sentinel(&state.state_dir);
     tracing::info!(
         user_id = id,
         "password changed; {} chain(s) revoked",
@@ -801,6 +813,7 @@ impl axum::extract::FromRef<crate::api::ApiState> for LoginState {
             store: input.store.clone(),
             admin_auth: input.admin_auth.clone(),
             lockout: input.lockout.clone(),
+            state_dir: input.state_dir.clone(),
         }
     }
 }
@@ -863,6 +876,7 @@ mod tests {
             store: store.clone(),
             admin_auth,
             lockout,
+            state_dir: dir.path().to_path_buf(),
         };
         // Seed an admin user with a known password.
         let phc = hash_password(ADMIN_PW).unwrap();

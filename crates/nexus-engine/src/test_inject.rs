@@ -88,3 +88,27 @@ pub(crate) async fn post_inject_event(
         }),
     ))
 }
+
+/// `POST /api/v1/_test/setup_reset`
+///
+/// Test-only knob that clears the `engine_runtime_settings.setup_complete`
+/// latch so the next `GET /v1/setup/status` reports
+/// `setup_complete: false` and the SPA router redirects logged-in
+/// users to `/setup`. Used by the wizard e2e spec to exercise
+/// the empty-DB redirect path without spawning a second engine.
+///
+/// Same security posture as `inject_event`: behind the
+/// `test-injection` cargo feature, no auth gate, never compiled
+/// into a production binary.
+pub(crate) async fn post_setup_reset(State(s): State<ApiState>) -> Result<StatusCode, ApiError> {
+    s.store
+        .write_runtime_setting(crate::setup::KEY_SETUP_COMPLETE, None)
+        .await
+        .map_err(|e| {
+            ApiError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("setup_reset: {e}"),
+            )
+        })?;
+    Ok(StatusCode::NO_CONTENT)
+}

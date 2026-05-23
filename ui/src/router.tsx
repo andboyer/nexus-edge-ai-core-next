@@ -29,6 +29,7 @@ import { DeliveryPage } from "@/pages/delivery";
 import { EventsPage } from "@/pages/events";
 import { LoginPage } from "@/pages/login";
 import { RulesPage } from "@/pages/rules";
+import { SetupPage } from "@/pages/setup";
 import { StoragePage } from "@/pages/storage";
 import { SystemPage } from "@/pages/system";
 import { TimelinePage } from "@/pages/timeline";
@@ -55,6 +56,31 @@ const loginRoute = createRoute({
 });
 
 // ---------------------------------------------------------------------------
+// Setup wizard \u2014 authenticated but outside the AppShell chrome and
+// outside the `setup_complete` gate (otherwise it would redirect to
+// itself). Once the operator clicks Finish, the engine flips the
+// `engine_runtime_settings.setup_complete` latch and subsequent loads
+// of /setup bounce to /dashboard.
+// ---------------------------------------------------------------------------
+
+const setupRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/setup",
+  beforeLoad: async () => {
+    const raw = localStorage.getItem("nexus_session");
+    if (!raw) {
+      throw redirect({ to: "/login" });
+    }
+    // If setup was already completed, send the operator to the dashboard.
+    const done = await fetchSetupComplete();
+    if (done === true) {
+      throw redirect({ to: "/dashboard" });
+    }
+  },
+  component: SetupPage,
+});
+
+// ---------------------------------------------------------------------------
 // Authenticated app shell. beforeLoad reads localStorage directly so the
 // gate doesn't depend on React state \u2014 router resolves before the
 // component tree mounts.
@@ -63,7 +89,7 @@ const loginRoute = createRoute({
 const appRoute = createRoute({
   getParentRoute: () => rootRoute,
   id: "_app",
-  beforeLoad: ({ location }) => {
+  beforeLoad: async ({ location }) => {
     const raw = localStorage.getItem("nexus_session");
     if (!raw) {
       throw redirect({
@@ -71,10 +97,43 @@ const appRoute = createRoute({
         search: { from: location.pathname },
       });
     }
+    // First-boot gate. If the engine hasn't been marked
+    // `setup_complete`, bounce the operator into the wizard. We
+    // treat "could not reach the engine" as "let the page mount
+    // and show its own error UI" \u2014 don't trap the user in a
+    // redirect loop when the API is down.
+    const done = await fetchSetupComplete();
+    if (done === false) {
+      throw redirect({ to: "/setup" });
+    }
   },
   component: AppShell,
   errorComponent: RouteErrorBoundary,
 });
+
+// Reads /api/v1/setup/status with the bearer from localStorage. Returns
+// `true` (complete), `false` (incomplete), or `null` (unknown \u2014 transient
+// failure, missing token, etc). Callers MUST distinguish null from false
+// to avoid a redirect loop when the engine is briefly unreachable.
+async function fetchSetupComplete(): Promise<boolean | null> {
+  try {
+    const raw = localStorage.getItem("nexus_session");
+    if (!raw) return null;
+    const sess = JSON.parse(raw) as { access_token?: string };
+    if (!sess.access_token) return null;
+    const r = await fetch("/api/v1/setup/status", {
+      headers: {
+        Accept: "application/json",
+        Authorization: `Bearer ${sess.access_token}`,
+      },
+    });
+    if (!r.ok) return null;
+    const body = (await r.json()) as { setup_complete?: boolean };
+    return body.setup_complete === true;
+  } catch {
+    return null;
+  }
+}
 
 // Root "/" \u2192 dashboard.
 const indexRoute = createRoute({
@@ -211,6 +270,7 @@ const adminDiagnosticsRoute = createRoute({
 
 const routeTree = rootRoute.addChildren([
   loginRoute,
+  setupRoute,
   appRoute.addChildren([
     indexRoute,
     dashboardRoute,

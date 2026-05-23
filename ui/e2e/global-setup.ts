@@ -227,6 +227,42 @@ export default async function globalSetup() {
     );
   }
 
+  // M-Install Checkpoint 3c — the engine now ships a first-boot
+  // setup wizard at /setup; the router redirects logged-in users
+  // there until `engine_runtime_settings.setup_complete = "true"`.
+  // For every spec OTHER than the wizard spec we want the gate
+  // disabled so navigation to /dashboard / /cameras / etc.
+  // continues to work unchanged. The wizard spec itself flips
+  // the latch back off via the test-injection-only
+  // `POST /v1/_test/setup_reset` endpoint in its own beforeAll.
+  try {
+    const loginRes = await fetch(`${baseUrl}/api/v1/auth/login`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ username: "admin", password: adminOtp }),
+    });
+    if (!loginRes.ok) {
+      throw new Error(`login failed: HTTP ${loginRes.status} ${await loginRes.text()}`);
+    }
+    const tokens = (await loginRes.json()) as { access_token: string };
+    const completeRes = await fetch(`${baseUrl}/api/v1/setup/complete`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${tokens.access_token}` },
+    });
+    if (!completeRes.ok) {
+      throw new Error(
+        `setup/complete failed: HTTP ${completeRes.status} ${await completeRes.text()}`,
+      );
+    }
+  } catch (err) {
+    try {
+      child.kill("SIGTERM");
+    } catch {
+      // ignore
+    }
+    throw new Error(`could not mark setup complete: ${(err as Error).message}`);
+  }
+
   writeFileSync(
     SIDECAR,
     JSON.stringify({

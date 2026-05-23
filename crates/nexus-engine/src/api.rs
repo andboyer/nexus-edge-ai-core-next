@@ -606,6 +606,18 @@ pub fn router(state: ApiState) -> Router {
         // to render (paste-a-dev-token vs. username+password
         // vs. OIDC redirect). Unauthenticated by design.
         .route("/v1/auth/info", get(get_auth_info))
+        // M-Install Checkpoint 3c — first-boot setup wizard.
+        // `status` is read by every authenticated request the
+        // SPA router makes (it gates the `/setup` redirect);
+        // `complete` is the one-shot Finish button. Both live
+        // OUTSIDE the admin-gate sub-router because they
+        // authenticate via `SessionContext` / `AdminContext`
+        // extractors instead of the admin-bearer middleware.
+        .route("/v1/setup/status", get(crate::setup::get_status))
+        .route(
+            "/v1/setup/complete",
+            axum::routing::post(crate::setup::post_complete),
+        )
         // Admin writes (gated) merged in last so they share state.
         .merge(admin);
 
@@ -637,6 +649,16 @@ pub fn router(state: ApiState) -> Router {
     let api = api.route(
         "/v1/_test/inject_event",
         axum::routing::post(crate::test_inject::post_inject_event),
+    );
+
+    // M-Install Checkpoint 3c — dev-only setup-latch reset.
+    // Used by the wizard e2e spec to exercise the empty-state
+    // redirect path without spawning a second engine. Same
+    // gate as inject_event.
+    #[cfg(feature = "test-injection")]
+    let api = api.route(
+        "/v1/_test/setup_reset",
+        axum::routing::post(crate::test_inject::post_setup_reset),
     );
 
     // SPA hosting: ServeDir returns 404 for unknown paths like /dashboard

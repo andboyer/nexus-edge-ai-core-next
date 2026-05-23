@@ -33,6 +33,7 @@ mod network;
 mod oauth_sessions;
 mod reconciler;
 mod retention;
+mod setup;
 mod storage_safety;
 mod system_metrics;
 // M7 Step 6F2 — only compiled when the `test-injection` feature
@@ -265,6 +266,25 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
                 one_time_password = %one_time_password,
                 "FIRST-BOOT ADMIN PROVISIONED — log in once, change password, then redact this log line",
             );
+            // M-Install Checkpoint 3c — also drop the OTP into
+            // `<state_dir>/bootstrap-password.txt` (mode 0600)
+            // so `install.sh` can `cat` it for the closing
+            // banner without scraping journalctl. The file is
+            // best-effort: a failure here only degrades the
+            // installer's UX, the admin user still exists.
+            match auth::bootstrap::write_bootstrap_sentinel(
+                &cfg.runtime.state_dir,
+                &one_time_password,
+            ) {
+                Ok(path) => tracing::warn!(
+                    sentinel = %path.display(),
+                    "bootstrap-password sentinel written; remove after first password change",
+                ),
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "could not write bootstrap-password sentinel; capture the WARN above instead",
+                ),
+            }
         }
         Ok(auth::bootstrap::BootstrapOutcome::SkippedAlreadyBootstrapped) => {
             tracing::debug!("bootstrap skipped: users table already populated");
