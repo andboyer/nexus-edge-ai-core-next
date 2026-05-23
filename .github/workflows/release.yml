@@ -136,8 +136,13 @@ jobs:
       - name: install build deps
         run: |
           sudo apt-get update
+          # libunwind-dev: required for libgstreamer1.0-dev on
+          # ubuntu-22.04 (24.04 resolves it transitively, 22.04 does
+          # not). We pin to 22.04 here for older-glibc compat so the
+          # binary tarball runs on the broadest set of target distros.
           sudo apt-get install -y --no-install-recommends \
             pkg-config build-essential cmake \
+            libunwind-dev \
             libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
             gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
             gstreamer1.0-libav gstreamer1.0-tools \
