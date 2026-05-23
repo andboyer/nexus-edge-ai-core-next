@@ -198,6 +198,17 @@ md-5 = "0.10"
 # stays in lockstep across any other crates that grow tests later.
 wiremock = "0.6"
 
+# M-Admin "Network" — physical NIC enumeration + netplan-based
+# OS-level network configuration writer (Phase A enumeration is
+# cross-platform via `if-addrs`; Phase B mutation is Ubuntu-only
+# via netplan YAML which we (de)serialize through `serde_yaml`).
+# `if-addrs` is the smallest cross-platform NIC iterator (works
+# on macOS dev boxes + Linux prod). `serde_yaml` is unmaintained
+# upstream but still the de-facto choice for round-tripping YAML
+# through serde; the netplan schema we write is small and stable.
+if-addrs = "0.13"
+serde_yaml = "0.9"
+
 # Internal
 nexus-types = { path = "crates/nexus-types" }
 nexus-config = { path = "crates/nexus-config" }

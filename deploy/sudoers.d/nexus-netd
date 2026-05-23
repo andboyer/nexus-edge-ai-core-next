@@ -1,0 +1,27 @@
+# nexus-netd sudoers entry — installed to /etc/sudoers.d/nexus-netd
+#
+# Grants the `nexus` service user the right to run the
+# nexus-netd privileged helper (and ONLY that one binary) as
+# root without a password. The helper itself owns the
+# /etc/netplan/* rewrite logic; without it the engine has no
+# way to apply OS-level network changes.
+#
+# The path must match the runtime install location used in
+# `crates/nexus-engine/src/network/apply.rs` (constant
+# `DEFAULT_NETD_BIN`). Override at runtime via the
+# `NEXUS_NETD_PATH` env var only in test/dev rigs.
+#
+# Hardening notes:
+#   - NOPASSWD is required because the engine runs unattended;
+#     however the helper validates its YAML input against the
+#     same `NetplanPlan::validate` the engine uses pre-PUT, so
+#     compromising the engine still can't push arbitrary
+#     netplan keys.
+#   - The single-binary scope means a compromised engine can't
+#     pivot to `sudo systemctl`, `sudo apt`, etc.
+#
+# Install:
+#   sudo install -m 0440 -o root -g root deploy/sudoers.d/nexus-netd \
+#       /etc/sudoers.d/nexus-netd
+#   sudo visudo -cf /etc/sudoers.d/nexus-netd   # validate
+nexus ALL=(root) NOPASSWD: /usr/local/lib/nexus/nexus-netd

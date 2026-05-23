@@ -241,6 +241,13 @@ pub struct ApiState {
     /// settings form can render "Engine default: Ns" next to the
     /// per-camera override input.
     pub default_anchor_ttl_secs: u32,
+    /// M-Admin Network — in-flight `netplan try`-style apply
+    /// session registry. Holds at most one pending apply at any
+    /// time; the rollback timer auto-reverts after
+    /// [`crate::network::apply::ROLLBACK_TIMEOUT`] unless the
+    /// operator calls `POST /v1/admin/network/plan/confirm`.
+    /// Cheap to clone (`Arc<Mutex<...>>` internally).
+    pub network_apply: crate::network::apply::ApplyRegistry,
 }
 
 pub fn router(state: ApiState) -> Router {
@@ -444,6 +451,37 @@ pub fn router(state: ApiState) -> Router {
         .route(
             "/v1/admin/server/restart",
             axum::routing::post(crate::admin_runtime::post_restart),
+        )
+        // M-Admin Network — physical NIC enumeration + netplan
+        // YAML editor + lockout-safe apply. Read endpoints are
+        // cross-platform; write endpoints surface 501 on
+        // non-Linux dev boxes (the UI hides the apply controls
+        // when the OS reports unsupported). Apply runs
+        // `netplan try` semantics behind the scenes — see
+        // [`crate::admin_network`] module docs.
+        .route(
+            "/v1/admin/network/interfaces",
+            get(crate::admin_network::get_interfaces),
+        )
+        .route(
+            "/v1/admin/network/plan",
+            get(crate::admin_network::get_plan).put(crate::admin_network::put_plan),
+        )
+        .route(
+            "/v1/admin/network/plan/apply",
+            axum::routing::post(crate::admin_network::post_apply),
+        )
+        .route(
+            "/v1/admin/network/plan/confirm",
+            axum::routing::post(crate::admin_network::post_confirm),
+        )
+        .route(
+            "/v1/admin/network/plan/rollback",
+            axum::routing::post(crate::admin_network::post_rollback),
+        )
+        .route(
+            "/v1/admin/network/apply/status",
+            get(crate::admin_network::get_apply_status),
         )
         .route_layer(axum::middleware::from_fn_with_state(
             state.admin_auth.clone(),
@@ -5451,6 +5489,10 @@ mod tests {
             // `GET /api/v1/system/static-object-defaults`. Matches
             // `nexus_config::default_static_object_anchor_ttl_secs`.
             default_anchor_ttl_secs: 3600,
+            // M-Admin Network — unit tests don't drive the
+            // network plan/apply endpoints; an empty registry is
+            // the documented "no apply in flight" state.
+            network_apply: crate::network::apply::ApplyRegistry::new(),
         };
         let app = super::router(state);
         (app, store, dir)

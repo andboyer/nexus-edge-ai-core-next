@@ -15,6 +15,7 @@ use nexus_tracker::build_tracker;
 use tracing::{info, warn};
 
 mod admin_auth;
+mod admin_network;
 mod admin_runtime;
 mod api;
 mod audit_retention;
@@ -28,6 +29,7 @@ mod discovery;
 mod fd_limit;
 mod gpu;
 mod models_catalog;
+mod network;
 mod oauth_sessions;
 mod reconciler;
 mod retention;
@@ -869,6 +871,11 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
         // `GET /api/v1/system/static-object-defaults` so the camera
         // settings form can hint the inherited value.
         default_anchor_ttl_secs: cfg.tracker.static_object.anchor_ttl_secs,
+        // M-Admin Network — single-slot registry holding any
+        // in-flight `netplan try` session + its rollback timer.
+        // Cheap to clone; the API state and any future
+        // background revert task share the same Arc.
+        network_apply: network::apply::ApplyRegistry::new(),
     };
 
     // M-Admin Phase 1B — start the registry eviction sweep. Holds

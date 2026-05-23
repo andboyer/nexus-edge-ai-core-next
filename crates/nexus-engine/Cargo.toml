@@ -44,6 +44,21 @@ path = "src/main.rs"
 name = "nexus-doctor"
 path = "src/bin/doctor.rs"
 
+# `nexus-netd` is the small, narrowly-scoped helper the engine
+# shells out to via `sudo -n` to mutate OS-level network config.
+# Three subcommands: `apply <plan.yaml>` (rewrite
+# /etc/netplan/90-nexus.yaml + `netplan try --timeout 120`),
+# `confirm` (accept the in-flight `netplan try`), and `rollback`
+# (revert to the prior config). Linux-only at runtime — the macOS
+# build still compiles it but every subcommand prints
+# "platform_unsupported" and exits non-zero so the engine's
+# integration shim can detect it cleanly. Sudoers entry lives in
+# `deploy/sudoers.d/nexus-netd` (installed by the Dockerfile +
+# bare-metal install script).
+[[bin]]
+name = "nexus-netd"
+path = "src/bin/nexus_netd.rs"
+
 [dependencies]
 nexus-types = { workspace = true }
 nexus-config = { workspace = true }
@@ -153,6 +168,13 @@ md-5 = { workspace = true }
 # for `PasswordDigest`; no negotiation, no upgrade path. Pinned
 # to the same RustCrypto family already in the workspace.
 sha1 = "0.10"
+
+# M-Admin Network — physical NIC enumeration (cross-platform via
+# if-addrs) + netplan YAML round-trip (Ubuntu-only mutation path).
+# See `network::enumerate` and `network::plan`. Both shared across
+# the engine binary and the `nexus-netd` helper.
+if-addrs = { workspace = true }
+serde_yaml = { workspace = true }
 
 # statvfs for the watermark sampler. Unix-only — non-unix builds
 # fall back to a never-panic probe (see storage_safety.rs).

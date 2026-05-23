@@ -326,3 +326,134 @@ export function restartEngine(delay_ms?: number) {
     delay_ms === undefined ? {} : { delay_ms },
   );
 }
+
+
+// --- OS-level network (M-Admin Phase 0 NIC manager) ----------------------
+//
+// Three concerns the existing /server/bind handler does NOT cover, all
+// served by this group:
+//
+//   - Enumerate the OS's NICs (so the bind dropdown can pick from real
+//     interfaces instead of asking the operator to type a host:port).
+//   - Edit the persisted netplan plan (ethernets + VLANs) so the engine
+//     can run on a secure VLAN while the admin UI alias runs on an open
+//     one.
+//   - Apply the plan with a 120s "netplan try"-style auto-rollback so a
+//     bad plan can't lock the operator out.
+//
+// All endpoints require admin role. The mutation endpoints (`put`,
+// `apply`, `confirm`, `rollback`) are audited server-side.
+
+export type InterfaceKind =
+  | "physical"
+  | "vlan"
+  | "bridge"
+  | "bond"
+  | "wireless"
+  | "loopback"
+  | "other";
+
+export interface InterfaceAddr {
+  addr: string;
+  prefix_len: number;
+  family: "ipv4" | "ipv6";
+}
+
+export interface NetworkInterface {
+  name: string;
+  mac?: string;
+  addrs: InterfaceAddr[];
+  is_loopback: boolean;
+  operstate?: string;
+  carrier?: boolean;
+  mtu?: number;
+  kind: InterfaceKind;
+  parent?: string;
+  vlan_id?: number;
+}
+
+export interface NameserversWire {
+  addresses?: string[];
+  search?: string[];
+}
+
+export interface EthernetConfigWire {
+  dhcp4?: boolean;
+  addresses?: string[];
+  gateway?: string;
+  nameservers?: NameserversWire;
+  mtu?: number;
+  macaddress?: string;
+}
+
+export interface VlanConfigWire {
+  id: number;
+  link: string;
+  dhcp4?: boolean;
+  addresses?: string[];
+  gateway?: string;
+  nameservers?: NameserversWire;
+  mtu?: number;
+}
+
+/**
+ * Operator-facing netplan plan. Matches the engine's curated
+ * subset — anything fancier than per-NIC static/dhcp + VLAN
+ * sub-interfaces lives in an operator-managed
+ * `/etc/netplan/99-operator.yaml` and is out of UI scope.
+ */
+export interface NetplanPlan {
+  ethernets?: Record<string, EthernetConfigWire>;
+  vlans?: Record<string, VlanConfigWire>;
+}
+
+export interface ApplySession {
+  apply_token: string;
+  started_at: string;
+  rollback_at: string;
+}
+
+export interface InterfacesOut {
+  interfaces: NetworkInterface[];
+}
+
+export interface PlanOut {
+  plan: NetplanPlan;
+  apply_pending?: ApplySession;
+}
+
+export interface ApplyOut {
+  session: ApplySession;
+}
+
+export interface ApplyStatusOut {
+  session?: ApplySession;
+}
+
+export function listNetworkInterfaces() {
+  return api.get<InterfacesOut>("/v1/admin/network/interfaces");
+}
+
+export function getNetworkPlan() {
+  return api.get<PlanOut>("/v1/admin/network/plan");
+}
+
+export function putNetworkPlan(plan: NetplanPlan) {
+  return api.put<PlanOut>("/v1/admin/network/plan", plan);
+}
+
+export function applyNetworkPlan() {
+  return api.post<ApplyOut>("/v1/admin/network/plan/apply", {});
+}
+
+export function confirmNetworkApply(apply_token: string) {
+  return api.post<void>("/v1/admin/network/plan/confirm", { apply_token });
+}
+
+export function rollbackNetworkApply() {
+  return api.post<void>("/v1/admin/network/plan/rollback", {});
+}
+
+export function getNetworkApplyStatus() {
+  return api.get<ApplyStatusOut>("/v1/admin/network/apply/status");
+}

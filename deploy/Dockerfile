@@ -98,6 +98,7 @@ COPY crates crates
 # Two separate `cargo build` calls because `--features` at workspace
 # root requires `-p` or a single-package selection.
 RUN cargo build --release -p nexus-engine --features "${FEATURES}" --bin nexus-engine \
+    && cargo build --release -p nexus-engine --features "${FEATURES}" --bin nexus-netd \
     && cargo build --release -p nexus-probe --bin nexus-probe
 
 # ----------------------- stage 2b: OpenVINO overlay ----------------
@@ -145,6 +146,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
     gstreamer1.0-libav gstreamer1.0-tools \
     libssl3 \
+    # OS-level NIC management (M-Admin Network) needs netplan +
+    # sudo for the nexus-netd helper. `netplan.io` pulls in
+    # systemd-networkd and the YAML generator; `sudo` enforces
+    # the single-binary privilege boundary defined by the
+    # /etc/sudoers.d/nexus-netd entry.
+    netplan.io sudo \
     # OpenVINO iGPU needs an OpenCL ICD loader to talk to the
     # Intel compute-runtime kernel driver (`i915` / `xe`) via
     # /dev/dri/renderD12x. The Intel userspace itself is bundled
@@ -164,6 +171,18 @@ ENV LD_LIBRARY_PATH=/opt/onnxruntime/lib:${LD_LIBRARY_PATH}
 # Engine + probe binaries.
 COPY --from=rust-build /work/target/release/nexus-engine /usr/local/bin/nexus-engine
 COPY --from=rust-build /work/target/release/nexus-probe  /usr/local/bin/nexus-probe
+
+# Privileged netplan helper. Lives under /usr/local/lib/nexus/ (not
+# /usr/local/bin/) because operators are NOT expected to invoke it
+# directly; the engine shells out via `sudo -n` per the entry in
+# /etc/sudoers.d/nexus-netd. Path is hard-coded in
+# `crates/nexus-engine/src/network/apply.rs::DEFAULT_NETD_BIN` and
+# in the sudoers file — keep all three in sync.
+RUN mkdir -p /usr/local/lib/nexus
+COPY --from=rust-build /work/target/release/nexus-netd /usr/local/lib/nexus/nexus-netd
+RUN chmod 0755 /usr/local/lib/nexus/nexus-netd
+COPY deploy/sudoers.d/nexus-netd /etc/sudoers.d/nexus-netd
+RUN chmod 0440 /etc/sudoers.d/nexus-netd && visudo -cf /etc/sudoers.d/nexus-netd
 
 # UI assets — served at `/` by the engine.
 COPY --from=ui-build /work/ui/dist /usr/share/nexus/ui

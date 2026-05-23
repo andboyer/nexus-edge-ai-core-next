@@ -19,6 +19,7 @@ import { RouteErrorBoundary } from "@/components/RouteErrorBoundary";
 import { AdminAuditPage } from "@/pages/admin-audit";
 import { AdminAuthPage } from "@/pages/admin-auth";
 import { AdminDiagnosticsPage } from "@/pages/admin-diagnostics";
+import { AdminNetworkPage } from "@/pages/admin-network";
 import { AdminServerPage } from "@/pages/admin-server";
 import { AdminUsersPage } from "@/pages/admin-users";
 import { BackendsPage } from "@/pages/backends";
@@ -186,6 +187,12 @@ const adminServerRoute = createRoute({
   component: AdminServerPage,
 });
 
+const adminNetworkRoute = createRoute({
+  getParentRoute: () => appRoute,
+  path: "/admin/network",
+  component: AdminNetworkPage,
+});
+
 const adminAuthRoute = createRoute({
   getParentRoute: () => appRoute,
   path: "/admin/auth",
@@ -222,6 +229,7 @@ const routeTree = rootRoute.addChildren([
     adminUsersRoute,
     adminAuditRoute,
     adminServerRoute,
+    adminNetworkRoute,
     adminAuthRoute,
     adminDiagnosticsRoute,
   ]),

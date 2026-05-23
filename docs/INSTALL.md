@@ -1568,6 +1568,53 @@ difference between the build-from-source layout and the §7.0
 tarball layout — everything else (config path, state dir, hardening
 stanza, `CAP_NET_BIND_SERVICE` for the :80 UI alias) is identical.
 
+### 7.8 OS-level network manager (nexus-netd)
+
+The admin UI's **Network** page (Admin → Network) needs a privileged
+helper to write `/etc/netplan/*.yaml` and run `netplan apply`. The
+engine itself runs unprivileged as `nexus`; only the tiny
+`nexus-netd` binary is allowed `sudo`, and only against itself. Skip
+this step if you don't intend to manage NICs / VLANs through the
+admin UI — the page degrades to read-only and `POST /apply`
+returns `501 platform_unsupported`.
+
+The §7.0 release tarball stages the helper at
+`/opt/nexus/current/lib/nexus/nexus-netd`. For the build-from-source
+path:
+
+```bash
+# Install the helper out of /usr/local/bin so operators don't
+# accidentally type `nexus-netd` and expect it to work standalone —
+# it's invoked exclusively via `sudo -n` from the engine.
+sudo mkdir -p /usr/local/lib/nexus
+sudo install -o root -g root -m 0755 \
+    target/release/nexus-netd /usr/local/lib/nexus/nexus-netd
+
+# Sudoers entry — narrow, single-binary scope.
+sudo install -o root -g root -m 0440 \
+    deploy/sudoers.d/nexus-netd /etc/sudoers.d/nexus-netd
+sudo visudo -cf /etc/sudoers.d/nexus-netd   # validate
+
+# netplan + sudo (Ubuntu Server has both by default; Debian-minimal
+# variants may not).
+sudo apt-get install -y netplan.io sudo
+
+# Smoke-test: should print 'platform: linux' and exit 1 (usage).
+sudo -u nexus sudo -n /usr/local/lib/nexus/nexus-netd
+```
+
+The helper writes to `/etc/netplan/90-nexus.yaml` (and a sibling
+`.90-nexus.yaml.bak` for rollback) — it deliberately does **not**
+touch other files under `/etc/netplan/*.yaml`, so any
+operator-managed `99-operator.yaml` co-exists with engine output via
+netplan's standard file-merging rules.
+
+Per-apply safety: after `POST /v1/admin/network/plan/apply` the
+helper spawns a 120-second timer; if `POST .../confirm` doesn't
+arrive (e.g. you locked yourself out of the new bind), the helper
+restores the `.bak` and re-applies. This mirrors `netplan try`'s UX
+without depending on its TTY-based confirm prompt.
+
 ---
 
 ## 8. Configure cameras + first boot
