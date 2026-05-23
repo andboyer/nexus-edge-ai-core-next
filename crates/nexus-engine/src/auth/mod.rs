@@ -47,17 +47,8 @@ pub mod audit_admin;
 pub mod bootstrap;
 pub mod lockout;
 pub mod login;
-// `oidc` lands ahead of its in-tree consumers (Step 3.3 wires
-// the auth-code handler + Step 3.2 the role mapper). Allow the
-// dead code so the parallel rollout doesn't fail clippy; this
-// allow disappears the moment Step 3.3 imports `OidcClient`.
-#[allow(dead_code)]
 pub mod oidc;
 pub mod oidc_login;
-// Same parking pattern as `oidc` — `map_role` is exercised by
-// its own unit tests; the Step 3.3 callback handler will be the
-// in-tree consumer. Drop the allow when that handler lands.
-#[allow(dead_code)]
 pub mod oidc_role_map;
 pub mod passwords;
 pub mod require_role;

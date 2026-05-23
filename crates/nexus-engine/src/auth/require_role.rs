@@ -19,11 +19,11 @@
 //! }
 //! ```
 //!
-//! Three newtype wrappers — [`AdminContext`], [`OperatorContext`],
-//! [`ViewerContext`] — let a handler declare its requirement in
-//! its signature instead of via a `.require()` call. The
-//! difference is purely cosmetic; both shapes return the same
-//! 403 body.
+//! The [`AdminContext`] newtype wrapper lets a handler declare
+//! its admin requirement in its signature instead of via a
+//! `.require()` call. Operator + viewer handlers use
+//! `ctx.require(Role::Operator)` / `Role::Viewer` directly
+//! against [`SessionContext`].
 //!
 //! ## Backwards-compatibility bridge
 //!
@@ -138,25 +138,13 @@ impl SessionContext {
 /// is still available via `.0` for audit-log writes.
 //
 // AdminContext is consumed by `auth::users_admin` (Step 2.8).
-// OperatorContext / ViewerContext are reserved for the
-// state-mutating + read-only handlers that Phase 4 audits will
-// move under; we keep them defined now so the role-newtype
-// shape is stable.
+// Operator + viewer handlers call `ctx.require(Role::Operator)`
+// / `Role::Viewer` against `SessionContext` directly — if those
+// patterns prove repetitive enough to warrant their own newtype
+// extractors, re-introduce `OperatorContext` / `ViewerContext`
+// here in the same shape as `AdminContext`.
 #[derive(Debug, Clone)]
 pub struct AdminContext(pub SessionContext);
-
-/// Like [`AdminContext`] but for `Role::Operator`. Admin tokens
-/// also satisfy (admin > operator).
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-pub struct OperatorContext(pub SessionContext);
-
-/// Like [`AdminContext`] but for `Role::Viewer` — i.e. any
-/// authenticated caller. Used by read-only routes that should
-/// still 401 anonymous traffic.
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-pub struct ViewerContext(pub SessionContext);
 
 // ---------------------------------------------------------------------------
 // Rejection type.
@@ -388,8 +376,6 @@ macro_rules! impl_role_extractor {
 }
 
 impl_role_extractor!(AdminContext, Role::Admin);
-impl_role_extractor!(OperatorContext, Role::Operator);
-impl_role_extractor!(ViewerContext, Role::Viewer);
 
 // ---------------------------------------------------------------------------
 // FromRef bridge for `ApiState`.

@@ -443,7 +443,7 @@ mod tests {
     use nexus_bus::BroadcastBus;
     use nexus_config::{CameraConfig, StoreConfig};
     use nexus_storage::{ColdBackend, PutReceipt, VolumeInfo};
-    use nexus_store::{ClipClose, NewClip, StoreError};
+    use nexus_store::{ClipClose, NewClip};
     use parking_lot::Mutex;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -818,9 +818,4 @@ mod tests {
             "fast-path must NOT call put when exists() returns true"
         );
     }
-
-    // Quiet the unused `StoreError` import warning when only some
-    // tests use it.
-    #[allow(dead_code)]
-    fn _silence_unused(_: StoreError) {}
 }

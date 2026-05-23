@@ -81,10 +81,7 @@ pub enum ApplyError {
     #[error("helper binary spawn failed: {0}")]
     Spawn(std::io::Error),
     #[error("helper binary exited {code:?}: {stderr}")]
-    Helper {
-        code: Option<i32>,
-        stderr: String,
-    },
+    Helper { code: Option<i32>, stderr: String },
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
     #[error("plan: {0}")]
@@ -176,12 +173,12 @@ impl ApplyRegistry {
 
             invoke_helper(&[
                 "apply",
-                staged_path
-                    .to_str()
-                    .ok_or_else(|| ApplyError::Io(std::io::Error::new(
+                staged_path.to_str().ok_or_else(|| {
+                    ApplyError::Io(std::io::Error::new(
                         std::io::ErrorKind::Other,
                         "non-utf8 staged path",
-                    )))?,
+                    ))
+                })?,
             ])
             .await?;
 
@@ -222,7 +219,7 @@ impl ApplyRegistry {
 
     /// Accept the in-flight apply. Cancels the rollback timer
     /// + calls `nexus-netd confirm` so the helper can drop its
-    /// `.bak`.
+    ///   `.bak`.
     pub async fn confirm(&self, token: &str) -> Result<(), ApplyError> {
         let in_flight = self
             .inner
@@ -292,10 +289,7 @@ async fn invoke_helper(args: &[&str]) -> Result<(), ApplyError> {
     };
     cmd.args(args);
 
-    let output = cmd
-        .output()
-        .await
-        .map_err(ApplyError::Spawn)?;
+    let output = cmd.output().await.map_err(ApplyError::Spawn)?;
     if output.status.success() {
         return Ok(());
     }

@@ -34,7 +34,9 @@
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use chrono::{DateTime, Duration, Utc};
-use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation};
+use jsonwebtoken::{Algorithm, EncodingKey, Header};
+#[cfg(test)]
+use jsonwebtoken::{DecodingKey, Validation};
 use nexus_store::UserId;
 use nexus_types::Role;
 use serde::{Deserialize, Serialize};
@@ -132,14 +134,11 @@ pub fn issue_access_token(
 /// without touching the system clock. jsonwebtoken's built-in
 /// `Validation` would otherwise insist on wall-clock comparison.
 //
-// dead_code: production handlers all decode via
-// `require_role::SessionContext`, which has its own decoder
-// (it accepts the legacy admin-token shape too). This
-// stand-alone verifier is kept because it round-trips the
-// new-shape JWT against the same code path the issuer uses —
-// invaluable for the `sessions::tests::*` symmetry tests.
-#[allow(dead_code)]
-pub fn verify_access_token(
+// Only used by `sessions::tests::*` symmetry tests — production
+// handlers decode via `require_role::SessionContext`, which has
+// its own decoder (it accepts the legacy admin-token shape too).
+#[cfg(test)]
+fn verify_access_token(
     token: &str,
     secret: &[u8],
     now: DateTime<Utc>,

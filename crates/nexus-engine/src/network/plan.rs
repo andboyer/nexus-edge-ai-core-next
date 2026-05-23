@@ -299,7 +299,11 @@ fn validate_cidr(scope: &str, addr: &str) -> Result<(), PlanError> {
 
 fn validate_mac(scope: &str, mac: &str) -> Result<(), PlanError> {
     let parts: Vec<&str> = mac.split(':').collect();
-    if parts.len() != 6 || !parts.iter().all(|p| p.len() == 2 && p.chars().all(|c| c.is_ascii_hexdigit())) {
+    if parts.len() != 6
+        || !parts
+            .iter()
+            .all(|p| p.len() == 2 && p.chars().all(|c| c.is_ascii_hexdigit()))
+    {
         return Err(PlanError::Invalid(format!(
             "{scope}.macaddress: `{mac}` must be `aa:bb:cc:dd:ee:ff`"
         )));
@@ -307,11 +311,7 @@ fn validate_mac(scope: &str, mac: &str) -> Result<(), PlanError> {
     Ok(())
 }
 
-fn ensure_gateway_in_subnet(
-    scope: &str,
-    gw: IpAddr,
-    addrs: &[String],
-) -> Result<(), PlanError> {
+fn ensure_gateway_in_subnet(scope: &str, gw: IpAddr, addrs: &[String]) -> Result<(), PlanError> {
     if addrs.is_empty() {
         // DHCP case — defer to the DHCP server, no constraint here.
         return Ok(());
@@ -344,9 +344,7 @@ fn v4_in_subnet(ip: Ipv4Addr, net: Ipv4Addr, prefix: u8) -> bool {
     if prefix == 0 {
         return true;
     }
-    let mask: u32 = u32::MAX
-        .checked_shl(32 - prefix as u32)
-        .unwrap_or(0);
+    let mask: u32 = u32::MAX.checked_shl(32 - prefix as u32).unwrap_or(0);
     (u32::from(ip) & mask) == (u32::from(net) & mask)
 }
 
@@ -364,7 +362,10 @@ fn ethernet_to_yaml(eth: &EthernetConfig) -> Result<serde_yaml::Value, PlanError
         let mut route = Mapping::new();
         route.insert("to".into(), "default".into());
         route.insert("via".into(), gw.to_string().into());
-        m.insert("routes".into(), Value::Sequence(vec![Value::Mapping(route)]));
+        m.insert(
+            "routes".into(),
+            Value::Sequence(vec![Value::Mapping(route)]),
+        );
     }
     if let Some(ns) = &eth.nameservers {
         m.insert("nameservers".into(), nameservers_to_yaml(ns));
@@ -394,7 +395,10 @@ fn vlan_to_yaml(v: &VlanConfig) -> Result<serde_yaml::Value, PlanError> {
         let mut route = Mapping::new();
         route.insert("to".into(), "default".into());
         route.insert("via".into(), gw.to_string().into());
-        m.insert("routes".into(), Value::Sequence(vec![Value::Mapping(route)]));
+        m.insert(
+            "routes".into(),
+            Value::Sequence(vec![Value::Mapping(route)]),
+        );
     }
     if let Some(ns) = &v.nameservers {
         m.insert("nameservers".into(), nameservers_to_yaml(ns));
@@ -441,7 +445,10 @@ mod tests {
         );
         let yaml = plan.to_yaml().unwrap();
         assert!(yaml.contains("eno1:"), "missing eno1 key:\n{yaml}");
-        assert!(yaml.contains("to: default"), "missing default route:\n{yaml}");
+        assert!(
+            yaml.contains("to: default"),
+            "missing default route:\n{yaml}"
+        );
         // Deprecated keys must NOT appear.
         assert!(!yaml.contains("gateway4"));
     }
@@ -449,7 +456,8 @@ mod tests {
     #[test]
     fn vlan_must_match_parent_dot_id_name() {
         let mut plan = NetplanPlan::default();
-        plan.ethernets.insert("eno1".into(), EthernetConfig::default());
+        plan.ethernets
+            .insert("eno1".into(), EthernetConfig::default());
         plan.vlans.insert(
             "secure_vlan".into(),
             VlanConfig {
@@ -519,7 +527,8 @@ mod tests {
     #[test]
     fn rejects_unknown_physical_interface() {
         let mut plan = NetplanPlan::default();
-        plan.ethernets.insert("eno9".into(), EthernetConfig::default());
+        plan.ethernets
+            .insert("eno9".into(), EthernetConfig::default());
         let err = plan.validate(&host_nics()).unwrap_err();
         assert!(format!("{err}").contains("no such physical interface"));
     }

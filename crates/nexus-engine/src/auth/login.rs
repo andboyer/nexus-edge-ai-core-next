@@ -62,8 +62,8 @@ use axum::Json;
 use chrono::{Duration, Utc};
 use nexus_config::LockoutConfig;
 use nexus_store::{
-    AuditActorKind, AuditOutcome, NewAuditEntry, NewRefreshToken, RefreshToken, RefreshTokenId,
-    SessionsError, Store, StoreError, UserId, UsersError,
+    AuditActorKind, AuditOutcome, NewAuditEntry, NewRefreshToken, RefreshTokenId, SessionsError,
+    Store, StoreError, UserId, UsersError,
 };
 use nexus_types::Role;
 use serde::{Deserialize, Serialize};
@@ -75,7 +75,7 @@ use crate::admin_auth::AdminAuthState;
 use super::passwords::{hash_password, verify_password, PasswordError, PasswordPolicyError};
 use super::require_role::SessionContext;
 use super::sessions::{
-    self, hash_refresh_secret, issue_access_token, new_refresh_secret, RefreshSecret, SessionError,
+    hash_refresh_secret, issue_access_token, new_refresh_secret, RefreshSecret, SessionError,
 };
 
 // ---------------------------------------------------------------------------
@@ -820,13 +820,6 @@ impl axum::extract::FromRef<LoginState> for std::sync::Arc<crate::admin_auth::Ad
         input.admin_auth.clone()
     }
 }
-
-// Silence the unused-import warning until 2.8 lands an admin
-// reset-password handler that actually constructs a fresh row
-// from a server-generated password (the only other consumer of
-// these types).
-#[allow(dead_code)]
-fn _force_uses(_: RefreshToken, _: NewRefreshToken<'_>, _: sessions::AccessClaims) {}
 
 // ---------------------------------------------------------------------------
 // Tests (integration: spin up an axum Router against a tempdir store).

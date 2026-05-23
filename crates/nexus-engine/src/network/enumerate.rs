@@ -139,8 +139,13 @@ pub fn list_interfaces() -> Result<Vec<NetworkInterface>, NicError> {
     // Sort each NIC's addr list IPv4-first so the UI dropdown's
     // "primary" is the v4 address.
     for nic in by_name.values_mut() {
-        nic.addrs
-            .sort_by_key(|a| if matches!(a.addr, IpAddr::V4(_)) { 0 } else { 1 });
+        nic.addrs.sort_by_key(|a| {
+            if matches!(a.addr, IpAddr::V4(_)) {
+                0
+            } else {
+                1
+            }
+        });
     }
 
     // On Linux, augment from /sys/class/net/<name>/*. Cheap reads,
@@ -239,10 +244,6 @@ fn augment_from_sysfs(nic: &mut NetworkInterface) {
         }
     }
 }
-
-#[cfg(not(target_os = "linux"))]
-#[allow(dead_code)]
-fn augment_from_sysfs(_nic: &mut NetworkInterface) {}
 
 fn prefix_from_v4_mask(octets: [u8; 4]) -> u8 {
     let bits = u32::from_be_bytes(octets);

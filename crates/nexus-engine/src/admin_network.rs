@@ -62,7 +62,7 @@ use crate::api::{ApiError, ApiState};
 use crate::auth::admin_audit::audit_admin_action;
 use crate::auth::require_role::AdminContext;
 use crate::network::apply::{ApplyError, ApplySession};
-use crate::network::{list_interfaces, NetworkInterface, NetplanPlan};
+use crate::network::{list_interfaces, NetplanPlan, NetworkInterface};
 
 const KEY_NETWORK_PLAN: &str = "network_plan_json";
 

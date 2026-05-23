@@ -31,7 +31,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Semaphore;
 use tokio::time::timeout;
-use tracing::{debug, warn};
+use tracing::debug;
 use uuid::Uuid;
 
 use super::{
@@ -334,13 +334,6 @@ fn parse_vendor_from_server(server: &str) -> Option<String> {
     // Fallback: take the first whitespace-delimited token of the
     // raw Server: banner. Better than nothing for unknown vendors.
     server.split_whitespace().next().map(|t| t.to_string())
-}
-
-#[allow(dead_code)]
-fn _unused_warn() {
-    // Silence dead_code on `warn!` import in case future revisions
-    // remove the only call site without touching this file.
-    warn!("");
 }
 
 #[cfg(test)]

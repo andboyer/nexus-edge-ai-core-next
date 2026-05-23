@@ -59,7 +59,7 @@ fn main() -> ExitCode {
         eprintln!("platform_unsupported: nexus-netd only runs on Linux");
         let _ = sub;
         let _ = rest;
-        return ExitCode::from(3);
+        ExitCode::from(3)
     }
 
     #[cfg(target_os = "linux")]
