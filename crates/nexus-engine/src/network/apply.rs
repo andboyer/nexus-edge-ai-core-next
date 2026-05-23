@@ -42,7 +42,7 @@
 //! of the page erroring.
 
 #[cfg(target_os = "linux")]
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 #[cfg(target_os = "linux")]
 use std::time::Duration;

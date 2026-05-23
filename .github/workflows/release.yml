@@ -89,12 +89,6 @@ jobs:
       TAG: ${{ github.event.release.tag_name || github.event.inputs.tag }}
       ORT_VERSION: "1.22.0"
       FEATURES: "gstreamer,ort,ep-cpu,ep-openvino,ep-cuda,ep-tensorrt"
-      # Bump when the gen-script export semantics change in a way that
-      # invalidates cached .onnx files (e.g. an opset bump, an axis-name
-      # change, or a new model-pack member). Independent of the
-      # script-content hash already in the cache key — useful for
-      # forcing a regeneration without editing a script.
-      MODEL_PACK_VERSION: "v1"
     permissions:
       contents: write   # required to `gh release upload`
     steps:
@@ -103,75 +97,38 @@ jobs:
           ref: ${{ github.event.inputs.tag || github.ref }}
 
       # ----------------------------------------------------------------
-      # Auto-generate the model pack (no operator-uploaded assets).
-      # Cached by gen-script + requirements + prompt-file content hash
-      # plus MODEL_PACK_VERSION. Cold run pip-installs torch +
-      # ultralytics and downloads YOLO checkpoints (~5-10 min); warm
-      # runs restore the four files in <30s.
+      # Stage the model pack from the release assets. The operator
+      # uploads the four files to the release BEFORE triggering this
+      # workflow (or via `workflow_dispatch` after `gh release upload
+      # $TAG models/...`). Auto-generation from `tools/models/gen_*.py`
+      # was tried earlier but `YOLO("yolov26n.pt")` is not a public
+      # ultralytics checkpoint — the gen scripts only work on hosts
+      # where the operator has pre-staged the source weights, which
+      # is not the case on GitHub-hosted runners. Pre-uploaded assets
+      # is the simpler contract and matches what every release
+      # through v0.1.9 actually did.
       # ----------------------------------------------------------------
-      - name: cache generated model pack
-        id: models-cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            models/yolo26n_dynamic.onnx
-            models/yolo_world_v2_s.onnx
-            models/yoloe26_s.onnx
-            models/models-manifest.json
-          key: model-pack-${{ env.MODEL_PACK_VERSION }}-${{ hashFiles('tools/models/gen_*.py', 'tools/models/requirements.txt', 'tools/models/*default_prompts.txt') }}
-
-      - name: set up python (model-gen)
-        if: steps.models-cache.outputs.cache-hit != 'true'
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          cache: pip
-          cache-dependency-path: tools/models/requirements.txt
-
-      # ultralytics caches downloaded YOLO checkpoints under
-      # `~/.config/Ultralytics/` (Linux). Persist across runs so a
-      # script-only edit doesn't pay the redownload cost.
-      - name: cache ultralytics weights
-        if: steps.models-cache.outputs.cache-hit != 'true'
-        uses: actions/cache@v4
-        with:
-          path: ~/.config/Ultralytics
-          key: ultralytics-weights-${{ env.MODEL_PACK_VERSION }}-${{ hashFiles('tools/models/gen_*.py') }}
-          restore-keys: |
-            ultralytics-weights-${{ env.MODEL_PACK_VERSION }}-
-
-      - name: install model-gen deps
-        if: steps.models-cache.outputs.cache-hit != 'true'
-        run: |
-          set -euo pipefail
-          python -m pip install --upgrade pip
-          pip install -r tools/models/requirements.txt
-
-      - name: generate model pack
-        if: steps.models-cache.outputs.cache-hit != 'true'
+      - name: stage model pack from release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           mkdir -p models
-          # Each script writes to models/<name>.onnx and patches the
-          # matching sha entry in models/models-manifest.json in place.
-          python tools/models/gen_yolo26n.py
-          python tools/models/gen_yolo_world.py \
-            --prompts tools/models/yolo_world_default_prompts.txt
-          python tools/models/gen_yoloe.py \
-            --prompts tools/models/yoloe_default_prompts.txt
-
-      - name: verify model pack present
-        run: |
-          set -euo pipefail
+          gh release download "$TAG" \
+            --repo "${{ github.repository }}" \
+            --pattern 'yolo26n_dynamic.onnx' \
+            --pattern 'yolo_world_v2_s.onnx' \
+            --pattern 'yoloe26_s.onnx' \
+            --pattern 'models-manifest.json' \
+            --dir models/
+          echo "Staged model pack:"
+          ls -la models/
           for f in yolo26n_dynamic.onnx yolo_world_v2_s.onnx yoloe26_s.onnx models-manifest.json; do
             if [ ! -s "models/$f" ]; then
-              echo "::error::models/$f is missing or empty after generation."
+              echo "::error::Required model asset 'models/$f' missing from release $TAG. Upload via 'gh release upload $TAG models/$f' then re-run this workflow."
               exit 1
             fi
           done
-          echo "Model pack ready:"
-          ls -la models/yolo26n_dynamic.onnx models/yolo_world_v2_s.onnx \
-                 models/yoloe26_s.onnx models/models-manifest.json
 
       # ----------------------------------------------------------------
       # Engine build deps (mirrors ci.yml `system-libs` job).
