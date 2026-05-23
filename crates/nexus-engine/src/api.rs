@@ -2886,10 +2886,7 @@ async fn get_clip_tracks(
         .await?
         .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("clip {clip_id} not found")))?;
 
-    let events = s
-        .store
-        .list_motion_events_for_clip(clip_id)
-        .await?;
+    let events = s.store.list_motion_events_for_clip(clip_id).await?;
 
     let trigger_track_ids = s
         .store

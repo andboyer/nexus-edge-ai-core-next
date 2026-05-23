@@ -41,6 +41,7 @@
 #![cfg(feature = "ort")]
 #![allow(unsafe_code)]
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -186,9 +187,13 @@ impl Detector for YoloeVisualDetector {
         let nms_iou = self.nms_iou_threshold;
         let embedding_dim = self.embedding_dim;
 
-        let rgb = match frame.format {
-            PixelFormat::Rgb24 => frame.data.as_ref().clone(),
-            PixelFormat::Bgr24 => bgr_to_rgb(frame.data.as_ref()),
+        // Borrow the source RGB buffer when it's already in the right
+        // pixel order; only the BGR path needs to allocate. `frame.data`
+        // is `Arc<Vec<u8>>` so the Rgb24 branch is a zero-copy borrow
+        // — saves ~1.5 MB alloc + memcpy per frame per camera.
+        let rgb: Cow<'_, [u8]> = match frame.format {
+            PixelFormat::Rgb24 => Cow::Borrowed(&frame.data[..]),
+            PixelFormat::Bgr24 => Cow::Owned(bgr_to_rgb(&frame.data)),
             other => return Err(InferenceError::UnsupportedFormat(other)),
         };
 

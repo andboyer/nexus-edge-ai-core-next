@@ -615,7 +615,15 @@ async fn insert_motion_decision(
         MotionKind::Updated => MotionEventKind::Updated,
         MotionKind::Died => MotionEventKind::Died,
     };
-    let attrs_json = serde_json::Value::Object(d.attributes.clone()).to_string();
+    // Fast-path the common empty-attributes case (avoids cloning the
+    // map + allocating a serde_json::Value::Object wrapper for every
+    // motion event in a busy scene).
+    let attrs_json = if d.attributes.is_empty() {
+        "{}".to_string()
+    } else {
+        serde_json::to_string(&d.attributes)
+            .expect("serde_json::Map<String, Value> is infallible to serialize")
+    };
     let new = NewMotionEvent {
         camera_id: d.camera_id,
         clip_id: handle.clip_id,
