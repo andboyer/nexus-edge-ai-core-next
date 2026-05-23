@@ -1,14 +1,19 @@
 # Installation guide — `nexus-edge-ai-core-next`
 
-> **Status: beta.** Cores M0–M4 + M-Install Checkpoints 1–2 + M-Admin
+> **Status: beta.** Cores M0–M4 + M-Install Checkpoints 1–3 + M-Admin
 > Phases 0–6 are complete; the engine + admin UI are usable
 > end-to-end on the reference hardware tiers. **M-Install Checkpoint
-> 3a (image scope)** is also live: every `v*` git tag now publishes
+> 3 is fully shipped:** every `v*` git tag now publishes
 > `ghcr.io/andboyer/nexus-engine:vX.Y.Z` via
 > [.github/workflows/release.yml](../.github/workflows/release.yml),
-> the default model pack is baked into the image, and per-tier
-> Compose overlays under `deploy/` ship the right device + tier-config
-> wiring out of the box (see §6). Production deployment is still
+> the default model pack is baked into the image, per-tier Compose
+> overlays under `deploy/` ship the right device + tier-config wiring
+> (§6), the tarball + signed `MANIFEST.txt` published as release
+> assets carry the install/uninstall scripts under `scripts/`, and
+> the first-boot setup wizard (Checkpoint 3c) drives an unattended
+> install from `Boot → Login → Setup → Dashboard` with the bootstrap
+> one-time password printed to `/var/lib/nexus/state/bootstrap-password.txt`
+> for the installer banner to scrape. Production deployment is still
 > blocked on M7 (alert delivery) + M8 (first customer trial) per
 > [`ROADMAP.md`](../../nexus-cloud-console/docs/product/ROADMAP.md). Follow the verification gate in §9
 > before declaring an install "done", and start with §10.0 for the
@@ -2077,8 +2082,8 @@ This guide will grow §6.7 / §10 sections for both once they ship.
 | Symptom | Likely cause | Fix |
 | ------- | ------------ | --- |
 | `curl /api/health` returns connection refused | Engine isn't up. | `systemctl status nexus-engine` or `docker compose ps`; check logs (§10.1). |
-| Engine refuses to start with `auth.mode = "none" is only allowed when server.api_bind is on loopback` | Since M-Install Checkpoint 2 the engine refuses to bind unauthenticated APIs onto a LAN. | Either change `[server].api_bind` to `127.0.0.1:8089` (LAN-only deployments), or set `[auth].mode = "dev_token"` and read the auto-generated token from `/var/lib/nexus/state/dev-token` (mode 0600). |
-| Engine logs `auth: generated new dev token` at boot | First boot under `mode = "dev_token"` (the default since M-Install Checkpoint 2). The token is the credential clients send as `Authorization: Bearer <token>`. | Copy the token from the WARN line *or* from `/var/lib/nexus/state/dev-token`. To rotate: stop the engine, delete the file, restart. The path follows `runtime.state_dir` from `nexus.toml` (default `/var/lib/nexus/state`). |
+| Engine refuses to start with `auth.mode = "none" is only allowed when server.api_bind is on loopback` | Since M-Install Checkpoint 2 the engine refuses to bind unauthenticated APIs onto a LAN. | Either change `[server].api_bind` to `127.0.0.1:8089` (LAN-only deployments), or set `[auth].mode = "local"` and let the first-boot bootstrap create an admin user (the one-time password is printed to `/var/lib/nexus/state/bootstrap-password.txt`, mode 0600 — also surfaced by the installer banner in [scripts/install.sh](../scripts/install.sh)). |
+| Engine logs `auth: bootstrap admin created` / `one_time_password=<value>` at boot | First boot under `mode = "local"` (the production default since M-Install Checkpoint 3c). The OTP is the bootstrap password for the `admin` user; the engine clears the on-disk sentinel as soon as the operator completes the change-password step in the setup wizard. | Copy the OTP from the WARN line *or* from `/var/lib/nexus/state/bootstrap-password.txt`, log in once at `https://<host>:8443/login`, and finish the wizard. To re-bootstrap: stop the engine, delete the `admin` user (`/admin/users`), restart. The sentinel path follows `runtime.state_dir` from `nexus.toml`. |
 | Engine logs `nexus.toml has no [auth] section` at boot | Pre-Checkpoint-2 config; the engine grandfathers it to `mode = "none"` for 7 days. | Add an explicit `[auth]` block (see [config/nexus.example.toml](../config/nexus.example.toml)) before the deadline printed in the WARN line. |
 | UI loads but `/` returns 404 | `ui_root` mismatch — engine pointing at a path that doesn't exist. | Container: image build incomplete; rebuild. Bare-metal: `ls /usr/share/nexus/ui` should list `index.html`. Update `[server].ui_root` in `/etc/nexus/nexus.toml` to match. |
 | Camera stuck on `connecting` for > 2 min | RTSP transport mismatch (camera serves UDP, engine asks TCP), bad credentials, blocked port. | Test with `gst-launch-1.0 -v rtspsrc location=<url> ! fakesink` from the host. If the password contains `!`, run `set +H` first and single-quote the URL (zsh history expansion). |

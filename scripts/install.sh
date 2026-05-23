@@ -273,8 +273,37 @@ log "  nexus-engine $VERSION installed and healthy."
 log "  UI:    http://$(hostname -f 2>/dev/null || hostname)/"
 log "  API:   http://$(hostname -f 2>/dev/null || hostname):8089/api/health"
 log ""
-log "  First-boot admin credentials are printed once at WARN:"
-log "    sudo journalctl -u nexus-engine | grep -i 'admin password'"
+
+# --- First-boot admin credentials --------------------------------------------
+# The engine writes a one-time bootstrap sentinel file when the admin
+# account is first created. We poll for it for up to 30 seconds (the
+# write happens just after the engine reaches healthy, but we already
+# waited 60s above so it should already exist for true first boots).
+# If the latch is absent the engine already has a permanent password
+# and we don't print anything sensitive.
+SENTINEL="${NEXUS_STATE_DIR}/bootstrap-password.txt"
+sentinel_deadline=$(( $(date +%s) + 30 ))
+while [[ ! -f "$SENTINEL" && $(date +%s) -lt $sentinel_deadline ]]; do
+    sleep 1
+done
+
+if [[ -f "$SENTINEL" ]]; then
+    bootstrap_user="$(awk -F'\t' 'NR==1{print $1}' "$SENTINEL" 2>/dev/null || echo admin)"
+    bootstrap_pw="$(awk -F'\t' 'NR==1{print $2}' "$SENTINEL" 2>/dev/null || echo '')"
+    log "  First-boot admin credentials (printed ONCE):"
+    log "    user:     $bootstrap_user"
+    log "    password: $bootstrap_pw"
+    log ""
+    log "  The setup wizard will guide you through changing this"
+    log "  password and adding your first cameras and rules. After"
+    log "  the password change the engine deletes the file at:"
+    log "    $SENTINEL"
+else
+    log "  Admin password already set (no bootstrap file present)."
+    log "  To recover access from a forgotten password, run:"
+    log "    sudo -u $NEXUS_SERVICE_USER /opt/nexus/current/bin/nexus-doctor reset-admin"
+fi
+
 log ""
 log "  Smoke-test:"
 log "    sudo -u $NEXUS_SERVICE_USER /opt/nexus/current/bin/nexus-doctor"
