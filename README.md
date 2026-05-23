@@ -7,14 +7,25 @@
 > dogfooding on the reference hardware tiers; production deployment
 > blocked on M5 (CUDA/TensorRT EPs), M7 Phase 2 (SureView), and M8
 > (bare-metal install + first customer trial) per
-> [`docs/ROADMAP.md`](docs/ROADMAP.md). Full operator CRUD UI shipped:
+> [`../nexus-cloud-console/docs/product/ROADMAP.md`](../nexus-cloud-console/docs/product/ROADMAP.md). Full operator CRUD UI shipped:
 > cameras (ONVIF + CIDR discovery), rules (visual + raw CEL),
 > polygon zones, storage backends, delivery policy, users, audit log.
 > The shell is at `http://<engine-host>:8089/` — see
 > [`docs/INSTALL.md`](docs/INSTALL.md) §10.0. New here? Read
-> [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the L0–L7 model,
-> then [`docs/PIPELINE.md`](docs/PIPELINE.md) for the full
+> [`../nexus-cloud-console/docs/edge-core/ARCHITECTURE.md`](../nexus-cloud-console/docs/edge-core/ARCHITECTURE.md) for the L0–L7 model,
+> then [`../nexus-cloud-console/docs/edge-core/PIPELINE.md`](../nexus-cloud-console/docs/edge-core/PIPELINE.md) for the full
 > end-to-end engine walk-through with mermaid diagrams.
+>
+> **Strategic docs moved (2026).** Architecture, pipeline, milestones, roadmap, and
+> business plan now live in the cloud-console repo at
+> [`../nexus-cloud-console/docs/edge-core/`](../nexus-cloud-console/docs/edge-core/) and
+> [`../nexus-cloud-console/docs/product/`](../nexus-cloud-console/docs/product/). This
+> repo retains only install + dev docs ([`docs/INSTALL.md`](docs/INSTALL.md),
+> [`docs/DEV_NOTES.md`](docs/DEV_NOTES.md),
+> [`docs/HARDWARE_TIERS.md`](docs/HARDWARE_TIERS.md)). The repo boundary + license
+> asymmetry (engine AGPL-3.0-or-later, cloud Proprietary) is documented in
+> [`AGENTS.md`](AGENTS.md) and
+> [`../nexus-cloud-console/docs/REPO_BOUNDARY.md`](../nexus-cloud-console/docs/REPO_BOUNDARY.md).
 
 A streaming-DAG edge-AI pipeline for surveillance video.
 
@@ -43,9 +54,9 @@ Every backend has the same operational surface: `slot()`, `state()`,
 fallback, hot-reload fan-out, and OPS observability **the same code** at every
 layer that needs it.
 
-See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the data flow and the
-explicit list of side-channels (`LatestFrameCache` etc.) that live alongside the
-main bus.
+See [`../nexus-cloud-console/docs/edge-core/ARCHITECTURE.md`](../nexus-cloud-console/docs/edge-core/ARCHITECTURE.md)
+for the data flow and the explicit list of side-channels (`LatestFrameCache` etc.) that
+live alongside the main bus.
 
 ## Hardware tiers
 
@@ -126,7 +137,8 @@ Beta. Cores **M0–M4** + **M-Install Checkpoints 1–2** + **M-Admin Phases 0�
 all shipped. Full workspace compile + tests pass on macOS (`brew install
 gstreamer onnxruntime node@22`) and on the Docker reference image. Production
 deployment is still blocked on **M7** (alert delivery — webhook + SureView)
-and **M8** (first customer trial). See [`docs/ROADMAP.md`](docs/ROADMAP.md)
+and **M8** (first customer trial). See
+[`../nexus-cloud-console/docs/product/ROADMAP.md`](../nexus-cloud-console/docs/product/ROADMAP.md)
 for the milestone tracker.
 
 ## License

@@ -240,7 +240,7 @@ verbatim (no vocab-index lookup), so CEL rules read e.g.
 
 ## See also
 
-- [`ARCHITECTURE.md`](ARCHITECTURE.md) — trait + pool + fail-soft pattern,
+- [`ARCHITECTURE.md`](../../nexus-cloud-console/docs/edge-core/ARCHITECTURE.md) — trait + pool + fail-soft pattern,
   L7 cache, frame-lifecycle spans, sampling.
-- [`ROADMAP.md`](ROADMAP.md) — milestones M0 → M8.
+- [`ROADMAP.md`](../../nexus-cloud-console/docs/product/ROADMAP.md) — milestones M0 → M8.
 - [`HARDWARE_TIERS.md`](HARDWARE_TIERS.md) — T10 / T24 / T36-S / T64 specs.

@@ -10,7 +10,7 @@
 > Compose overlays under `deploy/` ship the right device + tier-config
 > wiring out of the box (see §6). Production deployment is still
 > blocked on M7 (alert delivery) + M8 (first customer trial) per
-> [`ROADMAP.md`](ROADMAP.md). Follow the verification gate in §9
+> [`ROADMAP.md`](../../nexus-cloud-console/docs/product/ROADMAP.md). Follow the verification gate in §9
 > before declaring an install "done", and start with §10.0 for the
 > admin UI quickstart.
 >
@@ -870,7 +870,7 @@ sudo install -o nexus -g nexus -m 0644 \
 > `config/tiers/<tier>.toml` itself. The explicit copy above is
 > still the right move for production deployments where you want
 > to pin a version-controlled config and audit changes. See
-> [`docs/ROADMAP.md` → M-Install Checkpoint 1](ROADMAP.md#checkpoint-1--dogfooding-kit-now-2-days).
+> [`docs/ROADMAP.md` → M-Install Checkpoint 1](../../nexus-cloud-console/docs/product/ROADMAP.md#checkpoint-1--dogfooding-kit-now-2-days).
 
 ### 6.4 Stage the models
 
@@ -1235,7 +1235,7 @@ need to install custom GStreamer plugins.
   `/opt/nexus/releases/<version>/`, flips an atomic-swap symlink at
   `/opt/nexus/current`, and starts the systemd unit. The layout is
   the same one the future M-OTA updater uses to roll cohorts
-  forward (see [M_OTA.md Step 8](M_OTA.md)) — so when the cloud
+  forward (see [M_OTA.md Step 8](../../nexus-cloud-console/docs/edge-core/M_OTA.md)) — so when the cloud
   control plane lands, this install is OTA-ready without any
   migration on your part.
 - **§7.1–§7.7** — build from source. Use this if you've patched the
@@ -1711,7 +1711,7 @@ manually).
 ### 8.3 Authentication
 
 M-Install Checkpoint 2 made the engine secure-by-default. Read
-[docs/ARCHITECTURE.md §11](ARCHITECTURE.md#11-identity--authentication)
+[docs/ARCHITECTURE.md §11](../../nexus-cloud-console/docs/edge-core/ARCHITECTURE.md#11-identity--authentication)
 for the full identity model. Short version: the customer-facing
 identity path is **cloud-console-mediated** (one Entra app, one
 secret, held in the cloud-console's Azure Key Vault, minting
@@ -2011,7 +2011,7 @@ sudo systemctl start nexus-engine
 
 Restore is the inverse. There's no incremental clip backup story
 yet — that's M2.2 (cold-mirror replication, see
-[ROADMAP.md](ROADMAP.md#m22--cold-storage-replication-cold-mirror-not-tiering)).
+[ROADMAP.md](../../nexus-cloud-console/docs/product/ROADMAP.md#m22--cold-storage-replication-cold-mirror-not-tiering)).
 
 ### 10.3 Upgrades
 
@@ -2062,11 +2062,11 @@ prior commit + rebuild today).
   point clip storage at a LAN folder, Google Drive, or OneDrive.
   The watermark sweeper soft-evicts cold-replicated clips before
   cascade-deleting non-replicated ones. Design lives in
-  [M2_STORAGE.md §M2.2](M2_STORAGE.md#m22--cold-storage-replication).
+  [M2_STORAGE.md §M2.2](../../nexus-cloud-console/docs/edge-core/M2_STORAGE.md#m22--cold-storage-replication).
 - **M3.1 — Visual prompts (YOLOE).** Operators upload a JPEG, attach
   it to a camera, write a CEL rule against the operator-supplied
   label. Design lives in
-  [M3_OPEN_VOCAB_VISUAL.md](M3_OPEN_VOCAB_VISUAL.md).
+  [M3_OPEN_VOCAB_VISUAL.md](../../nexus-cloud-console/docs/edge-core/M3_OPEN_VOCAB_VISUAL.md).
 
 This guide will grow §6.7 / §10 sections for both once they ship.
 
@@ -2629,9 +2629,9 @@ camera names before posting.
 
 - [README.md](../README.md) — project overview, tier table, status banner.
 - [docs/HARDWARE_TIERS.md](HARDWARE_TIERS.md) — full tier rationale + Lunar Lake driver caveat.
-- [docs/ARCHITECTURE.md](ARCHITECTURE.md) — trait + pool pattern, frame-lifecycle spans, side-channels.
-- [docs/ROADMAP.md](ROADMAP.md) — milestones M0 → M9.
-- [docs/M2_STORAGE.md](M2_STORAGE.md) — M2.1 storage safety floor (shipped) + M2.2 cold-mirror (in progress).
-- [docs/M3_OPEN_VOCAB_VISUAL.md](M3_OPEN_VOCAB_VISUAL.md) — visual-prompt detector design.
-- [docs/M7_DELIVERY.md](M7_DELIVERY.md) — alert sinks + delivery policy.
+- [docs/ARCHITECTURE.md](../../nexus-cloud-console/docs/edge-core/ARCHITECTURE.md) — trait + pool pattern, frame-lifecycle spans, side-channels.
+- [docs/ROADMAP.md](../../nexus-cloud-console/docs/product/ROADMAP.md) — milestones M0 → M9.
+- [docs/M2_STORAGE.md](../../nexus-cloud-console/docs/edge-core/M2_STORAGE.md) — M2.1 storage safety floor (shipped) + M2.2 cold-mirror (in progress).
+- [docs/M3_OPEN_VOCAB_VISUAL.md](../../nexus-cloud-console/docs/edge-core/M3_OPEN_VOCAB_VISUAL.md) — visual-prompt detector design.
+- [docs/M7_DELIVERY.md](../../nexus-cloud-console/docs/edge-core/M7_DELIVERY.md) — alert sinks + delivery policy.
 - [docs/DEV_NOTES.md](DEV_NOTES.md) — developer setup, per-change cargo loop, model-gen smoke tests.
