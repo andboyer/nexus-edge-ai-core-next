@@ -86,6 +86,203 @@ ensure_dirs() {
     install -d -o "$NEXUS_SERVICE_USER" -g "$NEXUS_SERVICE_GROUP" -m 0750 "$NEXUS_STATE_DIR/clips"
 }
 
+# Add the service user to `render` and `video` groups so the engine can
+# open `/dev/dri/renderD128` (every iGPU/dGPU tier) and `/dev/accel/accel0`
+# (T36-S NPU). Idempotent: usermod -aG is a no-op if the user is already
+# a member. Groups that don't exist on the host are silently skipped —
+# `render` only exists once the GPU userspace from §5 is installed, but
+# the install script may run before that on a freshly-flashed box.
+ensure_accelerator_groups() {
+    local group
+    for group in render video; do
+        if getent group "$group" >/dev/null 2>&1; then
+            if id -nG "$NEXUS_SERVICE_USER" | tr ' ' '\n' | grep -qx "$group"; then
+                log "service user $NEXUS_SERVICE_USER already in $group"
+            else
+                usermod -aG "$group" "$NEXUS_SERVICE_USER"
+                log "added $NEXUS_SERVICE_USER to $group group"
+            fi
+        else
+            log "group '$group' does not exist on host yet (install GPU userspace first); skipping"
+        fi
+    done
+}
+
+# --- System preparation (idempotent OS hardening + prereq install) -----------
+#
+# Runs the boilerplate steps that every bare-metal install needs anyway:
+#
+#   * `apt update` (only if the cache is older than 24 h)
+#   * apt-installs runtime prerequisites that are NOT inside the tarball:
+#       - GStreamer runtime plugins (clip recorder needs these — without
+#         them every motion event writes a 0-byte mp4 and the UI shows
+#         "no playable data")
+#       - chrony (clip timestamps + alert correlation get ugly past 1 s
+#         drift; the install banner refuses to declare success if
+#         `timedatectl status` is `unsynchronized`)
+#       - ufw + jq + curl + python3 (script + manifest plumbing)
+#   * Adds an `nftables`-backed `ufw` rule pair for the engine's two
+#     listeners (80 + 8089) only if ufw is already enabled — we never
+#     enable ufw ourselves because doing so on an ssh-connected box
+#     without OpenSSH allow first is a fleet-bricking foot-gun.
+#   * Creates an 8 GB swap file at /swapfile (only if /proc/swaps is
+#     empty — preserves any existing LVM/partition swap).
+#
+# Each sub-step is independently togglable via a flag so an operator
+# who already has a hardened image can skip the parts they own. The
+# whole function is gated behind `--skip-system-prep` for the
+# all-or-nothing case.
+#
+# Returns 0 unconditionally — none of these prep steps are install
+# blockers. Warnings are emitted but never escalate to die().
+system_prep() {
+    local install_deps="${NEXUS_PREP_DEPS:-1}"
+    local install_swap="${NEXUS_PREP_SWAP:-1}"
+    local install_firewall="${NEXUS_PREP_FIREWALL:-1}"
+    local install_autoupdates="${NEXUS_PREP_AUTO_UPDATES:-0}"
+
+    log "preparing host (idempotent — pass --skip-system-prep to bypass)"
+
+    if (( install_deps )); then
+        _system_prep_apt
+    else
+        log "skipping apt prereqs (NEXUS_PREP_DEPS=0)"
+    fi
+
+    if (( install_swap )); then
+        _system_prep_swap
+    else
+        log "skipping swap setup (NEXUS_PREP_SWAP=0)"
+    fi
+
+    if (( install_firewall )); then
+        _system_prep_firewall
+    else
+        log "skipping firewall rules (NEXUS_PREP_FIREWALL=0)"
+    fi
+
+    if (( install_autoupdates )); then
+        _system_prep_unattended_upgrades
+    fi
+}
+
+# apt-install the runtime prereqs the tarball does NOT bundle. Skips
+# `apt update` if the package cache has been refreshed in the last 24 h
+# (avoids a 10–30 s network hit on every install.sh re-run).
+_system_prep_apt() {
+    if ! command -v apt-get >/dev/null 2>&1; then
+        warn "no apt-get on PATH; skipping apt prep (non-Debian-family distro?)"
+        return 0
+    fi
+
+    # /var/cache/apt/pkgcache.bin mtime is the canonical "last apt update"
+    # timestamp. Older than 24 h → refresh. Missing → refresh.
+    local cache=/var/cache/apt/pkgcache.bin
+    local stale=1
+    if [[ -r "$cache" ]]; then
+        local age_secs
+        age_secs=$(( $(date +%s) - $(stat -c %Y "$cache" 2>/dev/null || stat -f %m "$cache" 2>/dev/null || echo 0) ))
+        if (( age_secs < 86400 )); then
+            stale=0
+        fi
+    fi
+    if (( stale )); then
+        log "apt-get update (cache > 24 h old or missing)"
+        DEBIAN_FRONTEND=noninteractive apt-get update -qq
+    fi
+
+    # Two install groups to keep the noise grep-able in the install log.
+    log "installing GStreamer runtime + script prereqs"
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+        gstreamer1.0-tools \
+        gstreamer1.0-plugins-good \
+        gstreamer1.0-plugins-bad \
+        gstreamer1.0-libav \
+        gstreamer1.0-vaapi \
+        chrony ufw \
+        curl jq python3 ca-certificates \
+        || warn "apt-get install returned non-zero — continuing, but motion clips may not record"
+
+    if ! systemctl is-active --quiet chrony; then
+        log "enabling chrony for NTP sync"
+        systemctl enable --now chrony || warn "could not enable chrony"
+    fi
+}
+
+# Allocate an 8 GB swap file at /swapfile IF the box has no active
+# swap. Idempotent: a second invocation sees `swapon --show` non-empty
+# and does nothing.
+_system_prep_swap() {
+    if [[ -s /proc/swaps && $(awk 'NR>1' /proc/swaps | wc -l) -gt 0 ]]; then
+        log "swap already configured ($(awk 'NR>1 {print $1; exit}' /proc/swaps)); skipping"
+        return 0
+    fi
+    if [[ -e /swapfile ]]; then
+        warn "/swapfile exists but is not active; leaving it alone"
+        return 0
+    fi
+    log "allocating 8 GB swap at /swapfile"
+    if ! fallocate -l 8G /swapfile 2>/dev/null; then
+        # fallocate fails on tmpfs / some fs types; fall back to dd.
+        warn "fallocate failed; falling back to dd (slower)"
+        dd if=/dev/zero of=/swapfile bs=1M count=8192 status=none || {
+            warn "dd swap allocation failed; skipping swap"
+            rm -f /swapfile
+            return 0
+        }
+    fi
+    chmod 0600 /swapfile
+    mkswap -q /swapfile >/dev/null
+    swapon /swapfile
+    if ! grep -qE '^/swapfile[[:space:]]' /etc/fstab; then
+        printf '/swapfile none swap sw 0 0\n' >> /etc/fstab
+        log "added /swapfile to /etc/fstab"
+    fi
+}
+
+# Add ufw rules for the engine's two TCP listeners IF ufw is enabled.
+# We never enable ufw ourselves: doing so on an ssh-connected fresh
+# install without an OpenSSH allow rule first locks the operator out.
+# If ufw is inactive, log + return — the operator can run
+# `ufw enable` later and re-run install.sh to pick up the rules.
+_system_prep_firewall() {
+    if ! command -v ufw >/dev/null 2>&1; then
+        log "ufw not installed; skipping firewall rules"
+        return 0
+    fi
+    if ! ufw status 2>/dev/null | grep -q 'Status: active'; then
+        log "ufw is inactive; skipping rules (enable ufw + re-run install.sh)"
+        return 0
+    fi
+    log "adding ufw rules for engine ports (80/tcp UI alias, 8089/tcp API)"
+    ufw allow 80/tcp   comment 'nexus-engine UI alias'  >/dev/null 2>&1 || true
+    ufw allow 8089/tcp comment 'nexus-engine API + UI' >/dev/null 2>&1 || true
+}
+
+# Optional: configure unattended-upgrades for security patches. Off
+# by default because some operators centralise patch management; opt
+# in with --enable-auto-updates.
+_system_prep_unattended_upgrades() {
+    if ! command -v apt-get >/dev/null 2>&1; then
+        return 0
+    fi
+    log "installing + enabling unattended-upgrades (security patches only)"
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+        unattended-upgrades || { warn "unattended-upgrades install failed"; return 0; }
+    # Force the periodic enable (equivalent to dpkg-reconfigure -plow).
+    cat >/etc/apt/apt.conf.d/20auto-upgrades <<'EOF'
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+EOF
+    # Disable auto-reboot — losing in-flight clips on a midnight reboot
+    # is worse than carrying an extra day of patch lag.
+    if [[ -r /etc/apt/apt.conf.d/50unattended-upgrades ]]; then
+        sed -i \
+            's#^//\?\s*Unattended-Upgrade::Automatic-Reboot\s.*#Unattended-Upgrade::Automatic-Reboot "false";#' \
+            /etc/apt/apt.conf.d/50unattended-upgrades
+    fi
+}
+
 # --- Atomic-swap symlink ------------------------------------------------------
 
 # Flip /opt/nexus/current -> releases/<version> with `ln -sfn` then a

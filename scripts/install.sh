@@ -56,6 +56,13 @@ VERSION=""
 FORCE_TIER=0
 NO_START=0
 ROLLBACK=0
+SKIP_SYSTEM_PREP=0
+# Per-step prep flags. Default ON so a fresh install is a one-liner;
+# operators with hardened base images can opt out individually.
+export NEXUS_PREP_DEPS="${NEXUS_PREP_DEPS:-1}"
+export NEXUS_PREP_SWAP="${NEXUS_PREP_SWAP:-1}"
+export NEXUS_PREP_FIREWALL="${NEXUS_PREP_FIREWALL:-1}"
+export NEXUS_PREP_AUTO_UPDATES="${NEXUS_PREP_AUTO_UPDATES:-0}"
 
 usage() {
     cat <<EOF
@@ -64,7 +71,8 @@ Usage: $0 [options]
 Options:
   --tier {t10|t24|t36|t36s|t64}   Pick the tier config template (required on
                                   first install; ignored on upgrades unless
-                                  --force-tier is also passed).
+                                  --force-tier is also passed). Omit to let
+                                  nexus-probe pick on first install.
   --tarball <path>                Install from a .tar.gz on disk (defaults
                                   to assuming we're already inside an
                                   extracted release).
@@ -79,25 +87,45 @@ Options:
   --rollback                      Flip /opt/nexus/current to the
                                   previous_good_version recorded in
                                   install-state.json and restart.
+
+Host-preparation flags (all ON by default — opt out per-step):
+  --skip-system-prep              Skip ALL host prep (apt installs, swap,
+                                  ufw rules). Use when running against
+                                  a pre-hardened base image.
+  --no-deps                       Skip apt-installing GStreamer runtime +
+                                  chrony + ufw + jq.
+  --no-swap                       Don't create /swapfile if no swap exists.
+  --no-firewall                   Don't add ufw allow rules for 80 + 8089
+                                  (only relevant when ufw is already active).
+  --enable-auto-updates           Install + enable unattended-upgrades for
+                                  security patches (off by default; auto-
+                                  reboots are disabled either way).
+
   -h, --help                      This message.
 
 Environment:
   NEXUS_PREFIX     install root (default /opt/nexus)
   NEXUS_CONFIG_DIR config dir    (default /etc/nexus)
   NEXUS_STATE_DIR  state dir     (default /var/lib/nexus)
+  NEXUS_PREP_*     per-step prep toggles (same as flags above, env form)
 EOF
 }
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --tier)        TIER="$2"; shift 2 ;;
-        --tarball)     TARBALL="$2"; shift 2 ;;
-        --version)     VERSION="$2"; shift 2 ;;
-        --force-tier)  FORCE_TIER=1; shift ;;
-        --no-start)    NO_START=1; shift ;;
-        --rollback)    ROLLBACK=1; shift ;;
-        -h|--help)     usage; exit 0 ;;
-        *)             err "unknown option: $1"; usage; exit 2 ;;
+        --tier)               TIER="$2"; shift 2 ;;
+        --tarball)            TARBALL="$2"; shift 2 ;;
+        --version)            VERSION="$2"; shift 2 ;;
+        --force-tier)         FORCE_TIER=1; shift ;;
+        --no-start)           NO_START=1; shift ;;
+        --rollback)           ROLLBACK=1; shift ;;
+        --skip-system-prep)   SKIP_SYSTEM_PREP=1; shift ;;
+        --no-deps)            export NEXUS_PREP_DEPS=0; shift ;;
+        --no-swap)            export NEXUS_PREP_SWAP=0; shift ;;
+        --no-firewall)        export NEXUS_PREP_FIREWALL=0; shift ;;
+        --enable-auto-updates) export NEXUS_PREP_AUTO_UPDATES=1; shift ;;
+        -h|--help)            usage; exit 0 ;;
+        *)                    err "unknown option: $1"; usage; exit 2 ;;
     esac
 done
 
@@ -196,10 +224,19 @@ verify_manifest_files "$RELEASE_DIR"
 
 verify_signature "$RELEASE_DIR"
 
+# --- Host prep (idempotent) ---------------------------------------------------
+
+if (( SKIP_SYSTEM_PREP )); then
+    log "--skip-system-prep: leaving apt prereqs / swap / ufw rules alone"
+else
+    system_prep
+fi
+
 # --- User + dirs --------------------------------------------------------------
 
 ensure_user
 ensure_dirs
+ensure_accelerator_groups
 
 # --- Stage tier config (first install only, or --force-tier) ------------------
 
