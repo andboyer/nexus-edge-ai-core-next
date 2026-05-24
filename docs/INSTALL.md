@@ -4,7 +4,7 @@
 > Phases 0–6 are complete; the engine + admin UI are usable
 > end-to-end on the reference hardware tiers. **M-Install Checkpoint
 > 3 is fully shipped:** every `v*` git tag now publishes
-> `ghcr.io/andboyer/nexus-engine:vX.Y.Z` via
+> `ghcr.io/keystone-infrastructure-corp/nexus-engine:vX.Y.Z` via
 > [.github/workflows/release.yml](../.github/workflows/release.yml),
 > the default model pack is baked into the image, per-tier Compose
 > overlays under `deploy/` ship the right device + tier-config wiring
@@ -811,21 +811,21 @@ sudo mkdir -p /opt/nexus
 sudo chown nexus-admin:nexus-admin /opt/nexus
 cd /opt/nexus
 sudo -u nexus-admin git clone \
-    git@github.com:andboyer/nexus-edge-ai-core-next.git .
+    git@github.com:Keystone-Infrastructure-Corp/nexus-edge-ai-core-next.git .
 ```
 
 **Option B — Personal Access Token (interactive, one-off installs):**
 
 Generate a fine-grained PAT at <https://github.com/settings/tokens?type=beta>
 with **Repository access → Only select repositories →
-`andboyer/nexus-edge-ai-core-next`** and **Repository permissions →
+`Keystone-Infrastructure-Corp/nexus-edge-ai-core-next`** and **Repository permissions →
 Contents: Read-only**. Then:
 
 ```bash
 sudo mkdir -p /opt/nexus
 sudo chown nexus-admin:nexus-admin /opt/nexus
 cd /opt/nexus
-git clone https://github.com/andboyer/nexus-edge-ai-core-next.git .
+git clone https://github.com/Keystone-Infrastructure-Corp/nexus-edge-ai-core-next.git .
 # Username: andboyer (your GitHub login)
 # Password: <paste the PAT, NOT your account password>
 ```
@@ -1015,7 +1015,7 @@ tier-specific bit.
 ```yaml
 services:
   engine:
-    image: ghcr.io/andboyer/nexus-engine:latest
+    image: ghcr.io/keystone-infrastructure-corp/nexus-engine:latest
     devices:
       - /dev/dri:/dev/dri
     group_add:
@@ -1037,7 +1037,7 @@ NPU passthrough is unreliable on the kernels available today.
 ```yaml
 services:
   engine:
-    image: ghcr.io/andboyer/nexus-engine:latest
+    image: ghcr.io/keystone-infrastructure-corp/nexus-engine:latest
     runtime: nvidia
     deploy:
       resources:
@@ -1056,7 +1056,7 @@ services:
 
 ### 6.7 Pull (or build) + start
 
-> The GHCR image `ghcr.io/andboyer/nexus-engine` is **private** and
+> The GHCR image `ghcr.io/keystone-infrastructure-corp/nexus-engine` is **private** and
 > linked to this private repo. Tagged releases (`v*`) are published
 > by [.github/workflows/release.yml](../.github/workflows/release.yml)
 > with `:vX.Y.Z`, `:<sha>`, and `:latest` tags. **Pulling a release
@@ -1077,7 +1077,7 @@ credential file under the user that runs `docker compose`.
 
     > **Use a classic token.** Fine-grained PATs only expose the
     > `Packages` permission for **organization-owned** packages.
-    > `andboyer/nexus-engine` is a user-owned package, so the
+    > `Keystone-Infrastructure-Corp/nexus-engine` is a user-owned package, so the
     > Packages permission **will not appear** in the fine-grained
     > token creation screen — pulls always 401 with such a token.
     > Open issue tracking this:
@@ -1117,7 +1117,7 @@ credential file under the user that runs `docker compose`.
 
     ```bash
     cd /opt/nexus/deploy
-    docker compose pull            # fetches ghcr.io/andboyer/nexus-engine:latest
+    docker compose pull            # fetches ghcr.io/keystone-infrastructure-corp/nexus-engine:latest
     docker compose up -d
     docker compose logs -f         # Ctrl-C to detach
     ```
@@ -1137,7 +1137,7 @@ auto-rolls forward on the next `pull`.
 > | `denied` only as `root` / under `sudo` | login was under your user; root has its own `/root/.docker/config.json` | run compose without sudo (your user is in the `docker` group from §6.1), OR `sudo docker login ghcr.io -u andboyer` to give root its own creds |
 >
 > If you're not sure whether you're authenticated, run:
-> `docker pull ghcr.io/andboyer/nexus-engine:latest` — a clean pull
+> `docker pull ghcr.io/keystone-infrastructure-corp/nexus-engine:latest` — a clean pull
 > proves the credential is good independently of compose.
 
 **Option B — Build from source (for non-tagged commits / local dev):**
@@ -1294,7 +1294,7 @@ script runs `nexus-probe` from the staged release and auto-selects
 the recommended tier; pass `--tier` explicitly to override.
 
 ```bash
-curl -fsSL https://github.com/andboyer/nexus-edge-ai-core-next/releases/latest/download/install.sh \
+curl -fsSL https://github.com/Keystone-Infrastructure-Corp/nexus-edge-ai-core-next/releases/latest/download/install.sh \
   | sudo bash -s -- --tier t24      # swap t24 for your tier from §1, or omit for auto
 ```
 
@@ -1357,14 +1357,14 @@ binary directory.
 
 ```bash
 # Idempotent — same one-liner as first install.
-curl -fsSL https://github.com/andboyer/nexus-edge-ai-core-next/releases/latest/download/install.sh \
+curl -fsSL https://github.com/Keystone-Infrastructure-Corp/nexus-edge-ai-core-next/releases/latest/download/install.sh \
   | sudo bash -s --       # no --tier; existing /etc/nexus/nexus.toml is preserved
 ```
 
 Or pin a specific version:
 
 ```bash
-curl -fsSL https://github.com/andboyer/nexus-edge-ai-core-next/releases/download/v0.2.0/install.sh \
+curl -fsSL https://github.com/Keystone-Infrastructure-Corp/nexus-edge-ai-core-next/releases/download/v0.2.0/install.sh \
   | sudo bash -s -- --version v0.2.0
 ```
 
@@ -2279,7 +2279,7 @@ exec sudo -u $USER bash -i        # re-login for docker group
 # Generate the key + add it as a deploy key in the GitHub UI BEFORE
 # running this block. PAT route (Option B) works too if you have one.
 sudo mkdir -p /opt/nexus && sudo chown $USER:$USER /opt/nexus
-git clone git@github.com:andboyer/nexus-edge-ai-core-next.git /opt/nexus
+git clone git@github.com:Keystone-Infrastructure-Corp/nexus-edge-ai-core-next.git /opt/nexus
 sudo install -o nexus -g nexus -m 0600 \
     /opt/nexus/config/tiers/t24.toml /etc/nexus/nexus.toml
 cat <<'EOF' | sudo tee /opt/nexus/deploy/docker-compose.override.yml
@@ -2449,7 +2449,7 @@ ls -l /opt/onnxruntime/lib/libonnxruntime.so*
 # ---- §6.2 Clone (SSH deploy key per §6.2 Option A) ---------------
 sudo mkdir -p /opt/nexus && sudo chown nexus-admin:nexus-admin /opt/nexus
 sudo -u nexus-admin git clone \
-    git@github.com:andboyer/nexus-edge-ai-core-next.git /opt/nexus
+    git@github.com:Keystone-Infrastructure-Corp/nexus-edge-ai-core-next.git /opt/nexus
 
 # ---- §7.5 Build engine + UI -------------------------------------
 # T36-S features: gstreamer + ort + ep-cpu + ep-openvino. The NPU is
@@ -2606,7 +2606,7 @@ sqlite3 /var/lib/nexus/nexus.db "SELECT count(*) FROM events;"
 ## 15. Appendix D — Where to file bugs
 
 Open issues at
-<https://github.com/andboyer/nexus-edge-ai-core-next/issues>. Include:
+<https://github.com/Keystone-Infrastructure-Corp/nexus-edge-ai-core-next/issues>. Include:
 
 1. **Tier + box** — e.g. "T36-S, GMKtec K13 AI, BIOS V1.07".
 2. **OS + kernel** — `cat /etc/os-release; uname -r`.

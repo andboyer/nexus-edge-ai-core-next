@@ -25,7 +25,7 @@ edition = "2021"
 rust-version = "1.88"
 license = "AGPL-3.0-or-later"
 authors = ["Nexus Edge AI <opensource@nexusedge.ai>"]
-repository = "https://github.com/andboyer/nexus-edge-ai-core-next"
+repository = "https://github.com/Keystone-Infrastructure-Corp/nexus-edge-ai-core-next"
 publish = false
 
 [workspace.dependencies]

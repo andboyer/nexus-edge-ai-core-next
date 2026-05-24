@@ -6,12 +6,12 @@
 #
 # Operator-facing surface:
 #
-#     curl -fsSL https://raw.githubusercontent.com/andboyer/nexus-edge-ai-core-next/main/scripts/bootstrap.sh \
+#     curl -fsSL https://raw.githubusercontent.com/Keystone-Infrastructure-Corp/nexus-edge-ai-core-next/main/scripts/bootstrap.sh \
 #         | sudo bash -s -- --tier t24 --version v0.2.0
 #
 # Or, against a release that's already cut:
 #
-#     curl -fsSL https://github.com/andboyer/nexus-edge-ai-core-next/releases/download/v0.2.0/install.sh \
+#     curl -fsSL https://github.com/Keystone-Infrastructure-Corp/nexus-edge-ai-core-next/releases/download/v0.2.0/install.sh \
 #         | sudo bash -s -- --tier t24
 #
 # (The release workflow uploads this file as `install.sh` alongside the
@@ -24,7 +24,7 @@
 
 set -euo pipefail
 
-REPO="${NEXUS_REPO:-andboyer/nexus-edge-ai-core-next}"
+REPO="${NEXUS_REPO:-Keystone-Infrastructure-Corp/nexus-edge-ai-core-next}"
 ARCH="$(uname -m)"
 KERNEL="$(uname -s)"
 NEXUS_PREFIX="${NEXUS_PREFIX:-/opt/nexus}"
