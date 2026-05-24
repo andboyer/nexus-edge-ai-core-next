@@ -207,10 +207,9 @@ fn restore_backup() -> std::io::Result<()> {
 fn run(prog: &str, args: &[&str]) -> std::io::Result<()> {
     let status = std::process::Command::new(prog).args(args).status()?;
     if !status.success() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("{prog} {args:?} exited {status:?}"),
-        ));
+        return Err(std::io::Error::other(format!(
+            "{prog} {args:?} exited {status:?}"
+        )));
     }
     Ok(())
 }
