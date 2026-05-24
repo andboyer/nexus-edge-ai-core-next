@@ -173,9 +173,9 @@ impl ApplyRegistry {
 
             invoke_helper(&[
                 "apply",
-                staged_path.to_str().ok_or_else(|| {
-                    ApplyError::Io(std::io::Error::other("non-utf8 staged path"))
-                })?,
+                staged_path
+                    .to_str()
+                    .ok_or_else(|| ApplyError::Io(std::io::Error::other("non-utf8 staged path")))?,
             ])
             .await?;
 
