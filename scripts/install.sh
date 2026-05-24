@@ -63,6 +63,7 @@ export NEXUS_PREP_DEPS="${NEXUS_PREP_DEPS:-1}"
 export NEXUS_PREP_SWAP="${NEXUS_PREP_SWAP:-1}"
 export NEXUS_PREP_FIREWALL="${NEXUS_PREP_FIREWALL:-1}"
 export NEXUS_PREP_AUTO_UPDATES="${NEXUS_PREP_AUTO_UPDATES:-0}"
+export NEXUS_INSTALL_DRIVERS="${NEXUS_INSTALL_DRIVERS:-1}"
 
 usage() {
     cat <<EOF
@@ -100,6 +101,13 @@ Host-preparation flags (all ON by default — opt out per-step):
   --enable-auto-updates           Install + enable unattended-upgrades for
                                   security patches (off by default; auto-
                                   reboots are disabled either way).
+  --no-drivers                    Skip accelerator driver auto-install.
+                                  By default install.sh lspci-probes the
+                                  box and installs the Intel iGPU / Arc
+                                  dGPU / NPU drivers it finds. If the
+                                  NPU needs an HWE kernel upgrade,
+                                  install.sh stages the kernel and
+                                  exits asking for a reboot.
 
   -h, --help                      This message.
 
@@ -124,6 +132,7 @@ while [[ $# -gt 0 ]]; do
         --no-swap)            export NEXUS_PREP_SWAP=0; shift ;;
         --no-firewall)        export NEXUS_PREP_FIREWALL=0; shift ;;
         --enable-auto-updates) export NEXUS_PREP_AUTO_UPDATES=1; shift ;;
+        --no-drivers)         export NEXUS_INSTALL_DRIVERS=0; shift ;;
         -h|--help)            usage; exit 0 ;;
         *)                    err "unknown option: $1"; usage; exit 2 ;;
     esac
@@ -231,6 +240,13 @@ if (( SKIP_SYSTEM_PREP )); then
 else
     system_prep
 fi
+
+# --- Accelerator drivers (idempotent; lspci-probed) ---------------------------
+# Runs BEFORE ensure_user so a Lunar Lake box that needs an HWE
+# kernel reboot exits cleanly without staging the engine half-way.
+# Honours --no-drivers / NEXUS_INSTALL_DRIVERS=0.
+
+install_drivers
 
 # --- User + dirs --------------------------------------------------------------
 

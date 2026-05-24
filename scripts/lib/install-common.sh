@@ -283,6 +283,281 @@ EOF
     fi
 }
 
+# --- Hardware detection + driver install --------------------------------------
+#
+# What this provides (paired with §5 in docs/INSTALL.md):
+#
+#   intel-igpu      → kobuk-team PPA + iGPU + media + compute stack.
+#                     Covers UHD (Alder Lake-N / T10), Iris Xe (T24),
+#                     Arc 140V (Lunar Lake / T36-S iGPU side),
+#                     Arc Graphics (Meteor Lake).
+#   intel-arc-dgpu  → identical PPA + package set; same DG2 stack
+#                     works for the A380 (T36). The PPA already
+#                     handles firmware via linux-firmware updates.
+#   intel-npu       → upstream linux-npu-driver tarball v1.32.1
+#                     (4 .deb files). Preconditions: Lunar Lake or
+#                     Meteor Lake hardware AND kernel >= 6.10. If
+#                     kernel is too old we install linux-generic-
+#                     hwe-24.04 and exit asking for a reboot.
+#   nvidia-gpu      → skipped with a warning. T64 lands when M5
+#                     ships the CUDA / TensorRT EPs.
+#
+# All sub-steps are idempotent: re-running install.sh sees the
+# packages already present and short-circuits.
+#
+# The orchestrator is gated on `NEXUS_INSTALL_DRIVERS` (default 1).
+# Operators with hardened images / golden disks pass `--no-drivers`.
+install_drivers() {
+    local enable="${NEXUS_INSTALL_DRIVERS:-1}"
+    if (( ! enable )); then
+        log "skipping driver install (NEXUS_INSTALL_DRIVERS=0)"
+        return 0
+    fi
+    if ! command -v apt-get >/dev/null 2>&1; then
+        warn "no apt-get on PATH; skipping driver install (non-Debian distro?)"
+        return 0
+    fi
+
+    log "detecting accelerator hardware"
+    local tags
+    tags="$(_detect_hardware)" || {
+        warn "hardware detection failed; skipping driver install"
+        return 0
+    }
+    if [[ -z "$tags" ]]; then
+        log "no recognised accelerators detected; CPU-only fallback in effect"
+        return 0
+    fi
+    log "detected: $(echo "$tags" | tr '\n' ' ')"
+
+    local has_igpu=0 has_arc=0 has_npu=0 has_nvidia=0
+    while IFS= read -r tag; do
+        case "$tag" in
+            intel-igpu)     has_igpu=1 ;;
+            intel-arc-dgpu) has_arc=1 ;;
+            intel-npu)      has_npu=1 ;;
+            nvidia-gpu)     has_nvidia=1 ;;
+        esac
+    done <<<"$tags"
+
+    # NPU prerequisite check FIRST. If we'd need an HWE kernel
+    # upgrade, do that and exit so the operator can reboot — the
+    # NPU driver install requires the new kernel's uAPI.
+    if (( has_npu )) && ! _kernel_at_least 6 10; then
+        warn "NPU hardware detected but running kernel $(uname -r) (< 6.10)"
+        log  "installing linux-generic-hwe-24.04 (HWE kernel) for NPU support"
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            linux-generic-hwe-24.04 || {
+                warn "HWE kernel install failed; skipping NPU driver"
+                has_npu=0
+            }
+        if (( has_npu )); then
+            warn ""
+            warn "========================================================="
+            warn "REBOOT REQUIRED — HWE kernel staged for NPU support."
+            warn ""
+            warn "After reboot, re-run the same install.sh one-liner; it"
+            warn "will skip everything already installed and proceed with"
+            warn "the NPU driver + engine install."
+            warn "========================================================="
+            warn ""
+            exit 0
+        fi
+    fi
+
+    # iGPU + dGPU share the same PPA + package list — install once if
+    # either is present. The PPA provides iHD 25.x (kernel 6.11+ uAPI)
+    # and libze 25.x which the Ubuntu archive does NOT carry.
+    if (( has_igpu || has_arc )); then
+        _drivers_intel_graphics
+    fi
+
+    # NPU comes after iGPU (the Level Zero loader from the PPA is a
+    # transitive dep of the NPU runtime).
+    if (( has_npu )); then
+        _drivers_intel_npu
+    fi
+
+    if (( has_nvidia )); then
+        warn "NVIDIA GPU detected — T64 tier lands when M5 ships the CUDA / TensorRT"
+        warn "execution providers. Skipping nvidia driver install for now; engine"
+        warn "will run on the CPU EP fallback. See docs/INSTALL.md §5.4."
+    fi
+}
+
+# Detect accelerator hardware via lspci. Outputs one tag per line:
+#   intel-igpu | intel-arc-dgpu | intel-npu | nvidia-gpu
+# Empty output = nothing recognised (engine still installs CPU-only).
+_detect_hardware() {
+    if ! command -v lspci >/dev/null 2>&1; then
+        log "lspci missing; installing pciutils for hardware detection"
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq pciutils \
+            >/dev/null 2>&1 || return 1
+    fi
+
+    local pci
+    pci="$(lspci -nn 2>/dev/null)" || return 1
+
+    # Intel iGPU (display-class VGA with vendor 8086). Covers UHD,
+    # Iris Xe, Arc 140V (Lunar Lake), Arc Graphics (Meteor Lake).
+    # NB: dGPU Arc cards ALSO match this regex — we filter them out
+    # of the iGPU tag below by checking for the discrete device IDs.
+    local has_intel_vga=0 has_arc_dgpu=0
+    if echo "$pci" | grep -qE 'VGA[^[]*\[8086:'; then
+        has_intel_vga=1
+    fi
+    # Intel Arc A-series discrete (DG2 silicon): device IDs 56a0..56af.
+    if echo "$pci" | grep -qE '\[8086:56[a-f][0-9a-f]\]'; then
+        has_arc_dgpu=1
+    fi
+    if (( has_intel_vga && ! has_arc_dgpu )); then
+        echo intel-igpu
+    elif (( has_intel_vga && has_arc_dgpu )); then
+        # Box has both (e.g. Lenovo P3 Tower with iGPU + A380).
+        echo intel-igpu
+    fi
+    if (( has_arc_dgpu )); then
+        echo intel-arc-dgpu
+    fi
+
+    # Intel NPU (Versatile Processing Unit / Neural Processing Unit).
+    # Device IDs: 7d1d (Meteor Lake VPU), 643e (Arrow Lake NPU),
+    # 7e4e (Lunar Lake NPU). Also matches the "Processing
+    # accelerators" PCI class (1200) when the device-id list above
+    # misses a future SKU.
+    if echo "$pci" | grep -qE '\[8086:(7d1d|643e|7e4e)\]' \
+        || echo "$pci" | grep -qiE 'processing accelerator.*\[8086:'; then
+        echo intel-npu
+    fi
+
+    # NVIDIA discrete (vendor 10de).
+    if echo "$pci" | grep -qE '(VGA|3D controller)[^[]*\[10de:'; then
+        echo nvidia-gpu
+    fi
+}
+
+# Compare uname -r to a required major.minor pair. Returns 0 if
+# current >= required, 1 otherwise.
+_kernel_at_least() {
+    local want_major="$1" want_minor="$2"
+    local kver
+    kver="$(uname -r | grep -oE '^[0-9]+\.[0-9]+')" || return 1
+    local cur_major="${kver%.*}"
+    local cur_minor="${kver#*.}"
+    if (( cur_major > want_major )); then
+        return 0
+    fi
+    if (( cur_major == want_major && cur_minor >= want_minor )); then
+        return 0
+    fi
+    return 1
+}
+
+# Install Intel iGPU / Arc dGPU stack from the kobuk-team PPA.
+# Idempotent: rerunning checks for vainfo presence first.
+#
+# Why the PPA and not repositories.intel.com? — the Intel "client"
+# repo was retired in 2025-Q3; intel-graphics now ships only the
+# data-center channel which doesn't carry libigc1. The kobuk-team
+# PPA is Ubuntu's blessed client-class staging area for the same
+# packages (libze-intel-gpu1, iHD 25.x, etc).
+_drivers_intel_graphics() {
+    if command -v vainfo >/dev/null 2>&1 \
+        && vainfo --display drm --device /dev/dri/renderD128 2>/dev/null \
+             | grep -q 'Intel iHD'; then
+        log "Intel iGPU/dGPU stack already installed (vainfo: iHD present)"
+        return 0
+    fi
+
+    log "installing Intel iGPU/dGPU drivers (kobuk-team PPA)"
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+        software-properties-common || {
+            warn "software-properties-common install failed; skipping Intel graphics"
+            return 0
+        }
+
+    # add-apt-repository is idempotent: re-adding the same PPA is a no-op.
+    if ! grep -rq 'kobuk-team/intel-graphics' /etc/apt/sources.list.d/ 2>/dev/null; then
+        log "adding ppa:kobuk-team/intel-graphics"
+        add-apt-repository -y ppa:kobuk-team/intel-graphics || {
+            warn "PPA add failed; skipping Intel graphics"
+            return 0
+        }
+        DEBIAN_FRONTEND=noninteractive apt-get update -qq
+    fi
+
+    # The package list mirrors docs/INSTALL.md §5.1 exactly.
+    # vainfo at the end is the canonical "did it work" probe.
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+        libze-intel-gpu1 libze1 \
+        intel-metrics-discovery intel-opencl-icd intel-gsc clinfo \
+        intel-media-va-driver-non-free \
+        libmfx-gen1 libvpl2 libvpl-tools \
+        libva-glx2 va-driver-all vainfo \
+        intel-gpu-tools \
+        || {
+            warn "Intel graphics package install failed; engine will fall back to CPU EP"
+            return 0
+        }
+
+    # Sanity probe — non-fatal warn so a broken vainfo doesn't kill
+    # the rest of the install.
+    if vainfo --display drm --device /dev/dri/renderD128 2>/dev/null \
+        | grep -q 'Intel iHD'; then
+        log "Intel iHD driver active (vainfo confirmed)"
+    else
+        warn "Intel graphics installed but vainfo did not report iHD;"
+        warn "a reboot may be required. Re-run install.sh after reboot."
+    fi
+}
+
+# Install Intel NPU driver from upstream GitHub release. Pinned to
+# the latest version verified for Lunar Lake on kernel >= 6.10.
+# Updating the pin is a one-line change here.
+_drivers_intel_npu() {
+    if [[ -e /dev/accel/accel0 ]] \
+        && dpkg-query -W -f='${Status}' intel-driver-compiler-npu 2>/dev/null \
+             | grep -q 'install ok installed'; then
+        log "Intel NPU driver already installed (/dev/accel/accel0 + deb present)"
+        return 0
+    fi
+
+    local npu_ver="1.32.1"
+    local npu_release="20260422-24767473183"
+    local npu_tarball="linux-npu-driver-v${npu_ver}.${npu_release}-ubuntu2404.tar.gz"
+    local npu_url="https://github.com/intel/linux-npu-driver/releases/download/v${npu_ver}/${npu_tarball}"
+
+    log "installing Intel NPU driver v${npu_ver}"
+    local tmpdir
+    tmpdir="$(mktemp -d -t nexus-npu.XXXXXX)"
+    # shellcheck disable=SC2064
+    trap "rm -rf '$tmpdir'" RETURN
+
+    if ! curl -fsSL "$npu_url" -o "$tmpdir/${npu_tarball}"; then
+        warn "NPU tarball download failed ($npu_url); skipping NPU driver"
+        return 0
+    fi
+    if ! tar -xzf "$tmpdir/${npu_tarball}" -C "$tmpdir"; then
+        warn "NPU tarball extract failed; skipping NPU driver"
+        return 0
+    fi
+
+    # The tarball contains 4 .deb files at the top level. Install
+    # them all in a single apt invocation so dpkg resolves the
+    # intra-bundle deps in the right order.
+    local debs=( "$tmpdir"/intel-*.deb )
+    if (( ${#debs[@]} == 0 )); then
+        warn "NPU tarball did not contain any intel-*.deb files; layout changed?"
+        return 0
+    fi
+    if ! DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${debs[@]}"; then
+        warn "NPU driver install failed; engine will fall back to iGPU EP"
+        return 0
+    fi
+
+    log "NPU driver installed; /dev/accel/accel0 should appear after reboot"
+}
+
 # --- Atomic-swap symlink ------------------------------------------------------
 
 # Flip /opt/nexus/current -> releases/<version> with `ln -sfn` then a

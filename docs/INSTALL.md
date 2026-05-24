@@ -272,21 +272,30 @@ Concretely the installer:
 | Create `/etc/nexus` + `/var/lib/nexus/{clips,state}` | `install -d`                                      | on      | n/a                                |
 | Allocate 8 GB `/swapfile` if no swap exists | `fallocate -l 8G`                                      | on      | `--no-swap`                        |
 | Add ufw allow rules for `80/tcp` + `8089/tcp` (only when ufw is already active) | `ufw allow`                                      | on      | `--no-firewall`                    |
+| **Detect accelerators via `lspci`** (Intel iGPU / Arc dGPU / NPU / NVIDIA) | `pciutils`                                          | on      | `--no-drivers`                     |
+| **Install Intel iGPU + Arc dGPU stack** (kobuk-team PPA + iHD 25.x + Level Zero + media + compute — see §5.1 / §5.2) | apt + PPA                                          | on      | `--no-drivers`                     |
+| **Install Intel NPU driver v1.32.1** (Lunar Lake + Meteor Lake; requires kernel ≥ 6.10 — see §5.3) | `wget` + `apt install ./intel-*.deb`              | on†    | `--no-drivers`                     |
+| **Auto-install `linux-generic-hwe-24.04`** when NPU hardware is detected on a < 6.10 kernel, then exit asking for a reboot | apt                                          | on      | `--no-drivers`                     |
 | Stage `/etc/nexus/nexus.toml` from tier template (first install only) | `install -m 0644`                                  | on      | n/a (preserved on upgrades)         |
 | Install `/etc/systemd/system/nexus-engine.service` | from `etc-templates/systemd/`                       | on      | n/a                                |
 | Atomically flip `/opt/nexus/current` → new release | `ln -sfn`                                          | on      | n/a                                |
 | `systemctl enable --now nexus-engine`      | systemd                                                 | on      | `--no-start`                       |
 | Install + enable `unattended-upgrades` (security patches only, auto-reboot OFF) | apt                                            | OFF     | `--enable-auto-updates` to opt in |
 
+† NPU driver install only runs when both (a) Lunar Lake / Meteor Lake
+hardware is detected and (b) the running kernel is ≥ 6.10. If
+condition (a) holds but (b) doesn't, the installer stages the HWE
+kernel and exits with a `REBOOT REQUIRED` banner; re-running the
+same one-liner after reboot picks up where it left off.
+
 What the installer **does NOT** do (the bits that still need you):
 
 1. **BIOS settings** (§2) — physical access; never automated.
 2. **Ubuntu install** (§3) — must complete before §4.
-3. **GPU / NPU drivers** (§5) — distinct apt repos per tier, multiple
-   reboots, BIOS-dependent verify steps. We can't automate these
-   without baking tier knowledge into a network-fetched bootstrap
-   script, which is more dangerous than asking you to follow the
-   tier-specific recipe below once.
+3. **NVIDIA driver install** (§5.4) — T64 is post-beta; the engine
+   doesn't ship a CUDA or TensorRT execution provider yet (M5). The
+   installer detects the card, warns, and leaves the host driver
+   alone so you can manage it however you prefer.
 4. **Static IP / VLAN config** — the engine's admin UI ships a
    Network page that drives netplan via a tiny privileged helper
    (§6.5). Configure cameras with DHCP first, then convert to
@@ -301,8 +310,15 @@ in [Appendix C](#12-appendix-c--build-from-source-developer-only).
 
 ## 5. Tier-specific accelerator drivers
 
-Read **only the subsection for your tier**, then come back here and
-continue at §6. Every tier reboots at least once during this step.
+> **§5 is automated by default.** The one-liner in §6.1 detects your
+> accelerator hardware via `lspci` and installs the matching driver
+> stack as part of the same run. The recipes below are kept for
+> reference (hardened-image operators who passed `--no-drivers`,
+> troubleshooting, or operators who want to understand what's
+> happening). Read your tier's subsection, then continue at §6.
+>
+> **Exception:** NVIDIA (§5.4) is detect-only — the installer warns
+> and skips because the engine has no GPU EP yet.
 
 ### 5.1 T10 / T24 — Intel UHD / Iris Xe iGPU
 
@@ -1180,36 +1196,24 @@ sudo apt update && sudo apt full-upgrade -y
 sudo reboot
 # (reconnect)
 
-# ---- §5.1 Intel iGPU drivers (T24) -------------------------------
-sudo apt install -y software-properties-common
-sudo add-apt-repository -y ppa:kobuk-team/intel-graphics
-sudo apt update
-sudo apt install -y \
-    libze-intel-gpu1 libze1 \
-    intel-metrics-discovery intel-opencl-icd intel-gsc clinfo \
-    intel-media-va-driver-non-free \
-    libmfx-gen1 libvpl2 libvpl-tools \
-    libva-glx2 va-driver-all vainfo \
-    intel-gpu-tools
-sudo reboot
-# (reconnect)
-
-# Verify the driver came up.
-vainfo --display drm --device /dev/dri/renderD128 | head -5
-# Expect "VA-API version 1.22.x" + "Intel iHD ... 25.x".
-
-# ---- §6.1 Install engine (one-liner) -----------------------------
+# ---- §6.1 Install engine + drivers (one-liner) -----------------
 # This single command:
 #   - apt-installs GStreamer runtime + chrony + ufw + jq + python3
 #   - enables chrony
 #   - allocates 8 GB /swapfile
 #   - adds ufw allow rules for 80 + 8089 (if ufw is active)
+#   - lspci-probes the box and installs the Intel iGPU driver stack
+#     (kobuk-team PPA + iHD 25.x + Level Zero + media + compute)
 #   - creates the `nexus` system user + dirs
 #   - adds `nexus` to render + video groups
 #   - downloads + verifies the release tarball
 #   - stages tier config, installs systemd unit, starts engine
 curl -fsSL https://github.com/Keystone-Infrastructure-Corp/nexus-edge-ai-core-next/releases/latest/download/install.sh \
   | sudo bash -s -- --tier t24
+
+# (Optional) verify the iGPU stack came up cleanly.
+vainfo --display drm --device /dev/dri/renderD128 | head -5
+# Expect "VA-API version 1.22.x" + "Intel iHD ... 25.x".
 
 # ---- §6.4 First-boot login ---------------------------------------
 # Grab the bootstrap OTP printed by the installer (also persisted):
@@ -1252,51 +1256,42 @@ with NPU 4) from post-Ubuntu-install to "first alert visible in
 the UI".
 
 ```bash
-# ---- §3.6 HWE kernel (Lunar Lake NPU needs >= 6.10) --------------
+# ---- §3.5 First boot housekeeping --------------------------------
+sudo timedatectl set-timezone America/New_York
 sudo apt update && sudo apt full-upgrade -y
-sudo apt install -y linux-generic-hwe-24.04
+sudo reboot
+# (reconnect)
+
+# ---- §6.1 First pass — installer detects NPU + stages HWE kernel
+# This single command lspci-probes the box, sees Lunar Lake silicon
+# without the required >=6.10 kernel, apt-installs
+# linux-generic-hwe-24.04, and exits with a REBOOT REQUIRED banner.
+# Re-running the same one-liner after reboot does the rest.
+curl -fsSL https://github.com/Keystone-Infrastructure-Corp/nexus-edge-ai-core-next/releases/latest/download/install.sh \
+  | sudo bash -s -- --tier t36s
+
 sudo reboot
 # (reconnect)
 uname -r                       # expect 6.10.x or newer
 
-# ---- §3.5 First boot housekeeping --------------------------------
-sudo timedatectl set-timezone America/New_York
+# ---- §6.1 Second pass — drivers + engine in one shot -------------
+# After the reboot, re-run the same one-liner. It:
+#   - apt-installs GStreamer runtime + chrony + ufw + jq + python3
+#   - enables chrony, allocates /swapfile, adds ufw rules
+#   - installs the Intel iGPU stack (kobuk-team PPA)
+#   - downloads + installs the NPU driver v1.32.1 (4 .deb files)
+#   - creates the `nexus` user, dirs, group memberships
+#   - stages tier config, installs systemd unit, starts engine
+curl -fsSL https://github.com/Keystone-Infrastructure-Corp/nexus-edge-ai-core-next/releases/latest/download/install.sh \
+  | sudo bash -s -- --tier t36s
 
-# ---- §5.3 Step 2 — iGPU stack (PPA, NOT repositories.intel.com) -
-sudo apt install -y software-properties-common
-sudo add-apt-repository -y ppa:kobuk-team/intel-graphics
-sudo apt update
-sudo apt install -y \
-    libze-intel-gpu1 libze1 \
-    intel-metrics-discovery intel-opencl-icd intel-gsc clinfo \
-    intel-media-va-driver-non-free \
-    libmfx-gen1 libvpl2 libvpl-tools \
-    libva-glx2 va-driver-all vainfo \
-    intel-gpu-tools
-
-# ---- §5.3 Step 3 — NPU driver trio (upstream GitHub release) -----
-# Pinned to v1.32.1 (latest verified for Lunar Lake on kernel >=6.10).
-NPU_VER=1.32.1
-NPU_TARBALL=linux-npu-driver-v${NPU_VER}.20260422-24767473183-ubuntu2404.tar.gz
-mkdir -p /tmp/npu && cd /tmp/npu
-wget "https://github.com/intel/linux-npu-driver/releases/download/v${NPU_VER}/${NPU_TARBALL}"
-tar -xf "${NPU_TARBALL}"
-sudo apt update
-sudo apt install -y ./intel-*.deb
-sudo reboot
-# (reconnect)
-
-# Verify both accelerators came up before continuing.
+# (Optional) verify both accelerators came up.
 vainfo --display drm --device /dev/dri/renderD128 | head -25
 # Expect: VA-API 1.22.x, "Intel iHD driver ... - 25.x".
 ls -l /dev/accel/accel0
 # Expect: crw-rw---- 1 root render ... /dev/accel/accel0
 sudo dmesg | grep -i intel_vpu | head -5
 # Expect: "intel_vpu 0000:00:0b.0: Firmware: ..."
-
-# ---- §6.1 Install engine (one-liner) -----------------------------
-curl -fsSL https://github.com/Keystone-Infrastructure-Corp/nexus-edge-ai-core-next/releases/latest/download/install.sh \
-  | sudo bash -s -- --tier t36s
 
 # ---- §6.4 First-boot login ---------------------------------------
 sudo cat /var/lib/nexus/state/bootstrap-password.txt
