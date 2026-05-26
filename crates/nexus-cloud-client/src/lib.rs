@@ -40,7 +40,7 @@ pub mod jti_cache;
 pub mod sink;
 pub mod tunnel;
 
-pub use actor_token::{TrustedKey, VerifiedActor, Verifier};
-pub use dispatcher::{Handler, RpcDispatcher, SystemMethodPolicy};
-pub use error::{DispatchError, RejectReason};
+pub use actor_token::{EnvelopeContext, TrustedKey, VerifiedActor, Verifier, VerifierBuilder};
+pub use dispatcher::{AuditSink, Handler, NullAuditSink, RpcDispatcher, SystemMethodPolicy};
+pub use error::{DispatchError, InvalidReason, RejectReason};
 pub use jti_cache::JtiReplayCache;

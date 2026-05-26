@@ -7,10 +7,20 @@
 //!
 //! The cache is intentionally in-memory only — restart-time replay
 //! windows are short enough (≤ 30 s `exp` window per Phase 1.15) that
-//! we don't need persistence. Phase 1.16 may widen the key to
-//! `(jti, request_id)` for the idempotency layer; for now the JTI alone
-//! satisfies the dispatcher's needs because the cloud-console mints a
-//! fresh `jti` for every `actor_token`.
+//! we don't need persistence.
+//!
+//! ## Phase 1.16 — widened to `(jti, request_id)`
+//!
+//! The cloud-side `Idempotency-Key` middleware (Phase 1.11) propagates
+//! a UUID into `RpcCallPayload.request_id` (Phase 1.16). When set, the
+//! engine MUST key its replay window on the tuple, NOT on `jti` alone:
+//! a legitimate idempotent retry from the cloud will carry the SAME
+//! `request_id` AND a freshly-minted `actor_token` (with a fresh `jti`).
+//! The two-element key lets the engine recognise it as a retry, while
+//! still rejecting a true replay (same `(jti, request_id)`).
+//!
+//! [`JtiReplayCache::insert_keyed`] is the v1.16 API; [`Self::insert`]
+//! remains as the v1.7 shortcut for `(jti, None)`.
 
 use std::collections::{HashSet, VecDeque};
 
@@ -75,12 +85,28 @@ impl JtiReplayCache {
     /// Inserts a JTI. Returns `true` if it was newly accepted, `false`
     /// if it was already present (replay attempt). When the cache hits
     /// `capacity`, the oldest JTI is evicted.
+    ///
+    /// Phase 1.7 shorthand for `insert_keyed(jti, None)`.
     pub fn insert(&self, jti: &str) -> bool {
+        self.insert_keyed(jti, None)
+    }
+
+    /// Phase 1.16: inserts a composite `(jti, request_id)` key. When
+    /// `request_id` is `None` this behaves exactly like
+    /// [`Self::insert`] (same wire shape as v1.7).
+    ///
+    /// Returns `true` if newly accepted, `false` if the tuple was
+    /// already present (real replay). A retry that carries the same
+    /// `request_id` but a freshly-minted `jti` will be admitted by
+    /// this layer; the engine's HTTP-side idempotency layer is
+    /// responsible for replaying the cached response in that case.
+    pub fn insert_keyed(&self, jti: &str, request_id: Option<&str>) -> bool {
         if self.capacity == 0 {
             return true;
         }
+        let composite = compose_key(jti, request_id);
         let mut guard = self.inner.lock();
-        if guard.seen.contains(jti) {
+        if guard.seen.contains(&composite) {
             return false;
         }
         if guard.order.len() == self.capacity {
@@ -88,16 +114,42 @@ impl JtiReplayCache {
                 guard.seen.remove(&evicted);
             }
         }
-        guard.seen.insert(jti.to_string());
-        guard.order.push_back(jti.to_string());
+        guard.seen.insert(composite.clone());
+        guard.order.push_back(composite);
         true
     }
 
-    /// Returns `true` if `jti` is currently in the cache. Mainly useful
-    /// for tests — production code should call [`Self::insert`] which
-    /// folds the membership check and admit decision into one op.
+    /// Returns `true` if `jti` (with no `request_id` companion) is
+    /// currently in the cache. Mainly useful for tests — production
+    /// code should call [`Self::insert_keyed`] which folds the
+    /// membership check and admit decision into one op.
     pub fn contains(&self, jti: &str) -> bool {
-        self.inner.lock().seen.contains(jti)
+        self.contains_keyed(jti, None)
+    }
+
+    /// Phase 1.16 companion to [`Self::contains`] — looks up the
+    /// composite `(jti, request_id)` key.
+    pub fn contains_keyed(&self, jti: &str, request_id: Option<&str>) -> bool {
+        self.inner
+            .lock()
+            .seen
+            .contains(&compose_key(jti, request_id))
+    }
+}
+
+/// Build the composite key used by [`JtiReplayCache`].
+/// The pipe separator is illegal in UUIDs (Phase 1.16 `request_id`s are
+/// UUIDv4; `jti`s are UUIDv7) so the encoding is unambiguous.
+fn compose_key(jti: &str, request_id: Option<&str>) -> String {
+    match request_id {
+        None => jti.to_string(),
+        Some(rid) => {
+            let mut s = String::with_capacity(jti.len() + 1 + rid.len());
+            s.push_str(jti);
+            s.push('|');
+            s.push_str(rid);
+            s
+        }
     }
 }
 
@@ -143,5 +195,28 @@ mod tests {
         assert!(cache.insert("x"));
         assert!(cache.insert("x"));
         assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn request_id_is_part_of_replay_key() {
+        // Phase 1.16: same jti + different request_id => NOT a replay;
+        // same (jti, request_id) tuple => replay.
+        let cache = JtiReplayCache::new();
+        assert!(cache.insert_keyed("jti-1", Some("req-a")));
+        // Same jti, different request_id: cloud retried with a freshly
+        // signed token but the same Idempotency-Key. Must be admitted.
+        assert!(cache.insert_keyed("jti-1", Some("req-b")));
+        // Same (jti, request_id) again: real replay.
+        assert!(!cache.insert_keyed("jti-1", Some("req-a")));
+        assert_eq!(cache.len(), 2);
+    }
+
+    #[test]
+    fn jti_alone_and_jti_with_request_id_are_distinct_keys() {
+        let cache = JtiReplayCache::new();
+        assert!(cache.insert_keyed("jti-only", None));
+        assert!(cache.insert_keyed("jti-only", Some("req-x")));
+        // Each tuple counted once — two distinct keys.
+        assert_eq!(cache.len(), 2);
     }
 }

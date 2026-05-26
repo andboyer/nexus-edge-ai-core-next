@@ -2111,12 +2111,14 @@ dependencies = [
  "nexus-types",
  "parking_lot",
  "rand_core 0.6.4",
+ "reqwest",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]
@@ -2166,6 +2168,7 @@ dependencies = [
  "jsonwebtoken",
  "md-5",
  "nexus-bus",
+ "nexus-cloud-client",
  "nexus-config",
  "nexus-inference",
  "nexus-pipeline",

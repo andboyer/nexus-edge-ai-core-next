@@ -161,6 +161,25 @@ impl Verifier {
         token: &str,
         envelope: EnvelopeContext<'_>,
     ) -> Result<VerifiedActor, RejectReason> {
+        self.verify_with_request_id(token, envelope, None)
+    }
+
+    /// Phase 1.16 — verify against a `(jti, request_id)` replay key.
+    /// Pass `request_id = Some(envelope.payload.request_id)` so a
+    /// legitimate idempotent retry (same `request_id`, fresh `jti`) is
+    /// admitted while a true replay (same tuple) is rejected. The
+    /// envelope-less [`Self::verify`] keeps the v1.7 contract for
+    /// callers that don't propagate idempotency keys.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::verify`].
+    pub fn verify_with_request_id(
+        &self,
+        token: &str,
+        envelope: EnvelopeContext<'_>,
+        request_id: Option<&str>,
+    ) -> Result<VerifiedActor, RejectReason> {
         let parts: Vec<&str> = token.split('.').collect();
         if parts.len() != 3 {
             return Err(RejectReason::Invalid(InvalidReason::MalformedJws));
@@ -250,7 +269,7 @@ impl Verifier {
 
         // Replay cache — last check so that bad sig / claims rejections
         // don't pollute the cache (otherwise an attacker could flood it).
-        if !self.inner.replay.insert(&claims.jti) {
+        if !self.inner.replay.insert_keyed(&claims.jti, request_id) {
             return Err(RejectReason::Invalid(InvalidReason::Replay));
         }
 

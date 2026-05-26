@@ -88,6 +88,11 @@ nexus-storage-cloud = { workspace = true }
 # Probe library for `--tier auto` (M-Install Checkpoint 1) and the
 # `nexus-doctor` binary. Pure-Rust; pulls in serde + chrono only.
 nexus-probe = { workspace = true }
+# Phase 1.7 — edge-side cloud client. Provides the
+# `RpcDispatcher`/`Verifier`/`AuditSink` trait surface that the
+# engine wires up at boot (see `cloud_audit.rs` for the local
+# SQLite-backed sink).
+nexus-cloud-client = { workspace = true }
 
 tokio = { workspace = true }
 tokio-stream = { workspace = true }

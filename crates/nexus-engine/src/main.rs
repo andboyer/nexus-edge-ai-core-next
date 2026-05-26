@@ -21,6 +21,7 @@ mod api;
 mod audit_retention;
 mod auth;
 mod auth_bootstrap;
+mod cloud_audit;
 mod cold_read_cache;
 mod cold_replicator;
 mod delivery_reload;

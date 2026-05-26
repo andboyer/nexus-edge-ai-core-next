@@ -25,6 +25,7 @@ uuid = { workspace = true }
 chrono = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
+reqwest = { workspace = true }
 
 ed25519-dalek = { workspace = true }
 
@@ -33,3 +34,4 @@ ed25519-dalek = { workspace = true }
 rand_core = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
+wiremock = { workspace = true }

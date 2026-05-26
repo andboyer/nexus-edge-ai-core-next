@@ -9,6 +9,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use nexus_cloud_protocol::v1::{Envelope, EnvelopeBody, RpcCallPayload, RpcResponsePayload};
 
 use crate::actor_token::{EnvelopeContext, VerifiedActor, Verifier};
 use crate::error::{DispatchError, InvalidReason, RejectReason};
@@ -114,11 +115,18 @@ where
 /// method/path to its local audit log BEFORE the handler is invoked.
 /// Phase 1.7 leaves the storage backend to the engine — this trait is
 /// the only contract the dispatcher needs.
+///
+/// The trait is **async** because every realistic backend (SQLite via
+/// `sqlx`, Kafka, etc.) is async. Implementations that need no I/O
+/// (e.g. [`NullAuditSink`]) just return immediately.
+#[async_trait]
 pub trait AuditSink: Send + Sync {
-    /// Record one successful authorisation. The dispatcher calls this
+    /// Record one successful authorisation. The dispatcher awaits this
     /// after `verify` succeeds and BEFORE invoking the handler so a
-    /// crash mid-handler still leaves an audit trail.
-    fn record(&self, method: &str, envelope: EnvelopeContext<'_>, actor: &VerifiedActor);
+    /// crash mid-handler still leaves an audit trail. Failures should
+    /// be logged by the sink itself; the trait returns `()` so an audit
+    /// outage never blocks the dispatch path.
+    async fn record(&self, method: &str, envelope: EnvelopeContext<'_>, actor: &VerifiedActor);
 }
 
 /// No-op audit sink — useful for tests and the Phase 1.7 scaffold.
@@ -127,8 +135,9 @@ pub trait AuditSink: Send + Sync {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NullAuditSink;
 
+#[async_trait]
 impl AuditSink for NullAuditSink {
-    fn record(&self, _method: &str, _envelope: EnvelopeContext<'_>, _actor: &VerifiedActor) {}
+    async fn record(&self, _method: &str, _envelope: EnvelopeContext<'_>, _actor: &VerifiedActor) {}
 }
 
 /// Top-level dispatcher. Holds the verifier, the system-sub policy, the
@@ -182,8 +191,78 @@ impl<H: Handler> RpcDispatcher<H> {
         token: Option<&str>,
         body: Option<&[u8]>,
     ) -> Result<Vec<u8>, DispatchError> {
+        self.dispatch_inner(method, envelope, token, None, body)
+            .await
+    }
+
+    /// Convenience wrapper that pulls `method`, `path`, `token`,
+    /// `body`, and `request_id` straight off a wire-protocol
+    /// [`Envelope`]. Phase 1.16: the verifier's replay cache is keyed
+    /// by `(jti, request_id)` when `payload.request_id` is present so a
+    /// retry that carries the same idempotency key (per
+    /// [WIRE_PROTOCOL.md §3.9](../../../../nexus-cloud-console/docs/WIRE_PROTOCOL.md#39))
+    /// is dedup-recognised even if it also rebuilds a fresh `actor_token`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DispatchError::Reject(RejectReason::Invalid(InvalidReason::MalformedClaims))`]
+    /// if the envelope is not an `rpc_call` (defensive — the engine
+    /// should never call this on anything else; the variant rides on
+    /// the existing `actor_token_invalid` wire code so we don't widen
+    /// the public surface for an internal programming error).
+    pub async fn dispatch_envelope(
+        &self,
+        envelope: &Envelope,
+    ) -> Result<RpcResponsePayload, DispatchError> {
+        let payload = match &envelope.body {
+            EnvelopeBody::RpcCall(p) => p,
+            _ => {
+                return Err(DispatchError::Reject(RejectReason::Invalid(
+                    InvalidReason::MalformedClaims,
+                )));
+            }
+        };
+        let env = EnvelopeContext {
+            method: &payload.method,
+            path: &payload.path,
+        };
+        let body_bytes = decode_payload_body(payload)?;
+        let method_name = derive_method_name(payload);
+        let token = payload.actor_token.as_deref();
+        let request_id = payload.request_id.as_deref();
+        let result = self
+            .dispatch_inner(method_name, env, token, request_id, body_bytes.as_deref())
+            .await;
+        match result {
+            Ok(body) => {
+                let body_json = if body.is_empty() {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::from_slice(&body).unwrap_or(serde_json::Value::String(
+                        String::from_utf8_lossy(&body).into_owned(),
+                    ))
+                };
+                Ok(RpcResponsePayload {
+                    body: body_json,
+                    status: 200,
+                })
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    async fn dispatch_inner(
+        &self,
+        method: &str,
+        envelope: EnvelopeContext<'_>,
+        token: Option<&str>,
+        request_id: Option<&str>,
+        body: Option<&[u8]>,
+    ) -> Result<Vec<u8>, DispatchError> {
         let token = token.ok_or(DispatchError::Reject(RejectReason::Missing))?;
-        let actor = self.verifier.verify(token, envelope)?;
+        let actor = self
+            .verifier
+            .verify_with_request_id(token, envelope, request_id)?;
 
         // System-sub gate. We check AFTER signature verification so the
         // policy decision is bound to a cryptographically authenticated
@@ -195,11 +274,37 @@ impl<H: Handler> RpcDispatcher<H> {
         }
 
         // Audit BEFORE dispatch — Phase 1.7 acceptance bullet.
-        self.audit.record(method, envelope, &actor);
+        self.audit.record(method, envelope, &actor).await;
 
         self.handler
             .handle(method, envelope, &actor, body)
             .await
             .map_err(DispatchError::Handler)
     }
+}
+
+/// Convert `RpcCallPayload.body` (optional base64) to raw bytes.
+fn decode_payload_body(payload: &RpcCallPayload) -> Result<Option<Vec<u8>>, DispatchError> {
+    let Some(b64) = payload.body.as_deref() else {
+        return Ok(None);
+    };
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+    STANDARD
+        .decode(b64)
+        .map(Some)
+        .map_err(|_| DispatchError::Reject(RejectReason::Invalid(InvalidReason::MalformedClaims)))
+}
+
+/// Phase 1.7 derives the dispatcher method name from the HTTP path.
+/// The engine may replace this with a richer routing layer that
+/// matches against its admin-API tree; for now we use the last path
+/// segment so `POST /admin/v1/cameras` becomes `cameras` for the
+/// system-sub method whitelist.
+fn derive_method_name(payload: &RpcCallPayload) -> &str {
+    payload
+        .path
+        .rsplit('/')
+        .find(|s| !s.is_empty())
+        .unwrap_or("_root")
 }
