@@ -93,6 +93,9 @@ nexus-probe = { workspace = true }
 # engine wires up at boot (see `cloud_audit.rs` for the local
 # SQLite-backed sink).
 nexus-cloud-client = { workspace = true }
+# Phase 1.8 — wire envelope shapes for the cloud tunnel
+# heartbeat pump.
+nexus-cloud-protocol = { workspace = true }
 
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
@@ -131,6 +134,9 @@ reqwest = { workspace = true, features = ["blocking"] }
 image = { workspace = true }
 async-stream = "0.3"
 sha2 = "0.10"
+# Phase 1.8 — `nexus-engine enroll` derives a stable opaque
+# hardware fingerprint that includes the local hostname.
+hostname = "0.4"
 
 # M-Admin Phase 0 — streaming diagnostics tarball
 # (`GET /v1/admin/diagnostics/export`). Tar entries are

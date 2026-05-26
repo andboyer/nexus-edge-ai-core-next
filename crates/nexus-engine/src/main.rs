@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use clap::{Parser, ValueEnum};
+use clap::{Parser, Subcommand, ValueEnum};
 use nexus_bus::build_bus;
 use nexus_config::{CameraConfig, Config, InferenceConfig, RecorderKind};
 use nexus_inference::InferenceRouter;
@@ -22,6 +22,8 @@ mod audit_retention;
 mod auth;
 mod auth_bootstrap;
 mod cloud_audit;
+mod cloud_enroll;
+mod cloud_tunnel;
 mod cold_read_cache;
 mod cold_replicator;
 mod delivery_reload;
@@ -107,6 +109,24 @@ struct Cli {
     /// Skip starting the HTTP server. Useful for headless soak runs.
     #[arg(long)]
     no_api: bool,
+
+    /// Optional subcommand. When absent, `nexus-engine` runs the
+    /// pipeline + API + UI (the default behaviour). When present,
+    /// the subcommand runs and exits.
+    #[command(subcommand)]
+    command: Option<Cmd>,
+}
+
+/// Subcommand verbs. Currently just `enroll` (one-shot cloud
+/// onboarding); future entries will add `rotate-cert`, `factory-reset`,
+/// etc.
+#[derive(Debug, Subcommand)]
+enum Cmd {
+    /// Enroll this core against a cloud console using a one-shot code
+    /// minted from the "Add Core" flow. Writes the resulting mTLS
+    /// bundle into the local store; the next `nexus-engine` boot picks
+    /// up the row and starts the WSS tunnel.
+    Enroll(cloud_enroll::EnrollArgs),
 }
 
 impl Cli {
@@ -180,6 +200,16 @@ fn main() -> Result<()> {
     auth_bootstrap::apply(&mut cfg, &state_dir)?;
 
     let runtime = build_runtime(&cfg.runtime)?;
+
+    // Route subcommands BEFORE the serve path. Each subcommand owns
+    // its own tracing / logging story so we don't bring up the full
+    // pipeline scaffold for a one-shot operation.
+    if let Some(cmd) = cli.command.as_ref() {
+        return match cmd {
+            Cmd::Enroll(args) => runtime.block_on(cloud_enroll::run_enroll(&cfg, args)),
+        };
+    }
+
     runtime.block_on(run(cfg, cli))
 }
 
@@ -769,6 +799,14 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
         handles: running.clone(),
     });
 
+    // Phase 1.8 — cloud tunnel supervisor. If the local store has a
+    // `cloud_enrollment` row (populated by `nexus-engine enroll`),
+    // this spawns a long-running task that maintains the WSS+mTLS
+    // tunnel to `edge-gateway`, sending heartbeats every 30s. When
+    // no enrollment is present, the task logs and exits — the engine
+    // continues to serve locally (fail-open per Hard Rule 5).
+    let (cloud_tunnel_shutdown_tx, cloud_tunnel_handle) = cloud_tunnel::spawn_tunnel(store.clone());
+
     let cache_jobs = cold_read_cache::CacheJobs::new(
         store.clone(),
         registry.clone(),
@@ -1044,6 +1082,8 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), dispatcher_handle).await;
     let _ = delivery_reload_shutdown_tx.send(());
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), delivery_reload_handle).await;
+    let _ = cloud_tunnel_shutdown_tx.send(());
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), cloud_tunnel_handle).await;
     reconciler_handle.abort();
     // Abort every per-camera supervisor. `drain()` empties the map
     // under one lock acquisition; the reconciler is already aborted

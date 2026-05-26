@@ -9,6 +9,7 @@
 #![forbid(unsafe_code)]
 
 pub mod audit;
+pub mod cloud;
 pub mod motion;
 pub mod outbox;
 pub mod sessions;
@@ -98,6 +99,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
     (
         "0012_visual_prompts",
         include_str!("../migrations/0012_visual_prompts.sql"),
+    ),
+    (
+        "0013_cloud_enrollment",
+        include_str!("../migrations/0013_cloud_enrollment.sql"),
     ),
 ];
 

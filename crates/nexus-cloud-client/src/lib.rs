@@ -32,6 +32,7 @@
 #![forbid(unsafe_code)]
 
 pub mod actor_token;
+pub mod csr;
 pub mod dispatcher;
 pub mod enrollment;
 pub mod entitlements;
@@ -41,6 +42,9 @@ pub mod sink;
 pub mod tunnel;
 
 pub use actor_token::{EnvelopeContext, TrustedKey, VerifiedActor, Verifier, VerifierBuilder};
+pub use csr::{generate_keypair_and_csr, CsrBundle, CsrError};
 pub use dispatcher::{AuditSink, Handler, NullAuditSink, RpcDispatcher, SystemMethodPolicy};
+pub use enrollment::{EnrollmentClient, EnrollmentError, EnrollmentRequest, EnrollmentResponse};
 pub use error::{DispatchError, InvalidReason, RejectReason};
 pub use jti_cache::JtiReplayCache;
+pub use tunnel::{TunnelClient, TunnelError, TunnelHandle};
