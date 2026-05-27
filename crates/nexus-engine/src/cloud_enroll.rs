@@ -16,12 +16,14 @@
 //! Lives in its own module so the serve path's startup graph stays
 //! untouched.
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use nexus_cloud_client::{generate_keypair_and_csr, EnrollmentClient, EnrollmentRequest};
 use nexus_config::Config;
 use nexus_store::cloud::CloudEnrollment;
 use nexus_store::Store;
 use tracing::info;
+
+use crate::time_sync;
 
 /// CLI args for `nexus-engine enroll`.
 #[derive(Debug, Clone, clap::Args)]
@@ -45,6 +47,19 @@ pub struct EnrollArgs {
 /// Run the enrollment subcommand. Loads the store from `cfg.store`,
 /// hits enrollment-svc, persists, exits.
 pub async fn run_enroll(cfg: &Config, args: &EnrollArgs) -> Result<()> {
+    // Phase 1.15 — refuse to enroll a box whose clock isn't synced.
+    // The actor_token verifier has a ±30 s skew window; a freshly
+    // imaged appliance with a stale RTC will mint tokens the cloud
+    // rejects on every mutating RPC. Surface this NOW while a human
+    // is watching the console. `NEXUS_TIME_SYNC_OVERRIDE=allow_unsynced`
+    // bypasses for offline-lab / PTP / GPS sources.
+    let ts = time_sync::require_synchronized().map_err(|e| anyhow!(e))?;
+    info!(
+        time_sync_state = %ts.state.as_str(),
+        time_skew_ms = ?ts.skew_ms,
+        "clock sync verified — proceeding with enrollment"
+    );
+
     let label = args
         .label
         .clone()

@@ -25,6 +25,9 @@ use reqwest::blocking::Client;
 use reqwest::StatusCode;
 use serde_json::Value;
 
+#[path = "../time_sync.rs"]
+mod time_sync;
+
 const DEFAULT_BASE_URL: &str = "http://localhost:8089";
 
 #[derive(Debug, Parser)]
@@ -230,7 +233,14 @@ fn tally(outcomes: &[Outcome]) -> (usize, usize, usize, usize) {
 // ---------------------------------------------------------------------------
 
 fn run_checks(client: &Client, base: &str) -> Vec<Outcome> {
-    let mut out = Vec::with_capacity(8);
+    let mut out = Vec::with_capacity(9);
+
+    // 9.0 — local clock sync posture (Phase 1.15). Runs first so
+    // an operator sees the row even when the engine HTTP listener
+    // is down; the cloud actor_token verifier and edge-gateway
+    // both reject stale-clock traffic before any handler runs, so
+    // a desynced box is doctor-relevant before HTTP is up.
+    out.push(check_time_sync());
 
     // 9.1 — engine HTTP responds.
     let health = check_health(client, base);
@@ -274,6 +284,74 @@ fn run_checks(client: &Client, base: &str) -> Vec<Outcome> {
     out.push(check_events_recent(client, base));
 
     out
+}
+
+/// Phase 1.15 — surface `time.sync_state` and `time.skew_ms` from
+/// the local chrony / timesyncd posture. Pass = clock is locked
+/// onto an upstream source AND any reported skew is within the
+/// actor_token verifier's ±30 000 ms window. Warn covers the
+/// "locked but drifting close to the threshold" case so an
+/// operator can fix it before the cloud starts rejecting RPCs.
+fn check_time_sync() -> Outcome {
+    let ts = time_sync::probe();
+    let actual = match ts.skew_ms {
+        Some(ms) => format!(
+            "time.sync_state={} time.skew_ms={} ({})",
+            ts.state.as_str(),
+            ms,
+            ts.detail
+        ),
+        None => format!(
+            "time.sync_state={} time.skew_ms=unknown ({})",
+            ts.state.as_str(),
+            ts.detail
+        ),
+    };
+    match ts.state {
+        time_sync::SyncState::Synchronized => {
+            // Synchronized but drifting → warn before cloud rejects.
+            if let Some(ms) = ts.skew_ms {
+                if ms.unsigned_abs() > 30_000 {
+                    return Outcome::fail(
+                        "9.0",
+                        "time_sync",
+                        "synchronized AND |skew_ms| <= 30000",
+                        actual,
+                        "actor_token verifier rejects ±30 s skew; check `chronyc tracking` and the upstream NTP source's reachability",
+                    );
+                }
+                if ms.unsigned_abs() > 15_000 {
+                    return Outcome::warn(
+                        "9.0",
+                        "time_sync",
+                        "synchronized AND |skew_ms| <= 30000",
+                        actual,
+                        "approaching the ±30 s skew threshold; investigate NTP source quality before cloud starts dropping RPCs",
+                    );
+                }
+            }
+            Outcome::pass(
+                "9.0",
+                "time_sync",
+                "synchronized AND |skew_ms| <= 30000",
+                actual,
+            )
+        }
+        time_sync::SyncState::Unsynchronized => Outcome::fail(
+            "9.0",
+            "time_sync",
+            "synchronized AND |skew_ms| <= 30000",
+            actual,
+            "run `sudo systemctl restart chrony && chronyc tracking` — leap status must be `Normal`",
+        ),
+        time_sync::SyncState::Unavailable => Outcome::warn(
+            "9.0",
+            "time_sync",
+            "synchronized AND |skew_ms| <= 30000",
+            actual,
+            "install chrony (`sudo apt install chrony`) or use systemd-timesyncd; doctor cannot verify clock sync without one of them",
+        ),
+    }
 }
 
 fn check_health(client: &Client, base: &str) -> Outcome {

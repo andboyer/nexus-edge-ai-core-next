@@ -44,6 +44,7 @@ mod system_metrics;
 // `POST /api/v1/_test/inject_event` handler.
 #[cfg(feature = "test-injection")]
 mod test_inject;
+mod time_sync;
 mod usb_watch;
 mod visual_prompts_admin;
 

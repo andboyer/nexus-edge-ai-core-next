@@ -360,4 +360,26 @@ fi
 log ""
 log "  Smoke-test:"
 log "    sudo -u $NEXUS_SERVICE_USER /opt/nexus/current/bin/nexus-doctor"
+
+# --- Phase 1.15 — clock-sync posture hint ------------------------------------
+# `apt install chrony` happened in system_prep but chrony can take 30-90 s
+# to lock onto a source on a fresh box. If the operator is going to
+# enroll in the next few minutes, the `nexus-engine enroll` precheck
+# will refuse on an unsynced clock — show the current state now so
+# they aren't surprised at the enroll banner.
+log ""
+if command -v chronyc >/dev/null 2>&1; then
+    leap_line=$(chronyc tracking 2>/dev/null | awk -F': *' '/Leap status/ {print $2}')
+    if [[ "$leap_line" == "Normal" ]]; then
+        log "  Clock sync: chronyc tracking → Leap status: Normal ✓"
+    else
+        warn "  Clock sync: chronyc tracking → Leap status: ${leap_line:-unknown}"
+        warn "  'nexus-engine enroll' WILL REFUSE to enroll until the clock"
+        warn "  is synchronized. Wait 60-90s and rerun 'chronyc tracking', or"
+        warn "  override with NEXUS_TIME_SYNC_OVERRIDE=allow_unsynced (offline"
+        warn "  labs / GPS / PTP only — cloud will reject ±30 s skew RPCs)."
+    fi
+else
+    warn "  Clock sync: chronyc not on PATH (chrony install failed?)"
+fi
 log "================================================================"
