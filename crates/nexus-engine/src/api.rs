@@ -3600,6 +3600,19 @@ async fn rebuild_registry(s: &ApiState) -> Result<(), ApiError> {
 /// refresh-token in `config_json` can be decrypted in-memory at
 /// backend construction. None for `lan` because that backend has
 /// nothing secret to decrypt.
+///
+/// Phase 2 Step 2.1b: `azure_blob` is special — the cloud-tunnel
+/// supervisor owns the backend's lifecycle (it has the mTLS cert
+/// material already in hand from the enrollment artefact and
+/// constructs `GatewaySasIssuer` + `AzureBlobBackend` once
+/// post-enrollment, then installs them via
+/// [`nexus_storage::Registry::insert_reserved`]). The rebuild path
+/// MUST therefore refuse to construct an `azure_blob` backend so an
+/// admin update to an unrelated LAN/Drive row does not race the
+/// cloud-tunnel supervisor by trying to (re)build a backend without
+/// the cert material. The `Other` error is logged as a warning by
+/// [`rebuild_registry`]; the reserved entry the cloud tunnel
+/// installed survives the [`Registry::replace_all`] swap untouched.
 fn build_any_backend(
     handle: &str,
     kind: &str,
@@ -3618,6 +3631,11 @@ fn build_any_backend(
             })?;
             nexus_storage_cloud::build_from_config_json(handle, kind, config_json, secret)
         }
+        "azure_blob" => Err(nexus_storage::BackendError::Other(
+            "azure_blob backends are owned by the cloud-tunnel supervisor and registered \
+             as reserved entries; rebuild_registry must skip them"
+                .to_string(),
+        )),
         other => Err(nexus_storage::BackendError::Other(format!(
             "unknown backend kind '{other}'"
         ))),

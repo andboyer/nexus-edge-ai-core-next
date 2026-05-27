@@ -640,6 +640,7 @@ async fn schema_migrations_table_records_apply_order() {
             "0011_auth_refresh_tokens".to_string(),
             "0012_visual_prompts".to_string(),
             "0013_cloud_enrollment".to_string(),
+            "0014_storage_backends_azure_blob".to_string(),
         ]
     );
 }

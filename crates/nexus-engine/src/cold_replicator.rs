@@ -62,6 +62,19 @@ pub struct ColdReplicatorConfig {
     /// (which is stored as a path relative to clips_dir) to an
     /// absolute filesystem path the replicator can read from.
     pub clips_dir: std::path::PathBuf,
+    /// Optional external kick channel — when present, the cloud-
+    /// tunnel supervisor (or any other subsystem that newly
+    /// installs/replaces a cold backend) can call `notify_one()`
+    /// on this `Notify` to wake the replicator without waiting for
+    /// the 5-min polling backstop. When `None` (no cloud tunnel,
+    /// LAN-only deployments) the replicator falls back to its own
+    /// internal `Notify` that fires once at startup only.
+    ///
+    /// Wired in [Phase 2 Step 2.1b](../../../../nexus-cloud-console/docs/cloud-console/PHASES.md)
+    /// so a fresh enrollment kicks the replicator immediately
+    /// instead of stranding any pre-enrollment clip backlog for
+    /// up to 5 min.
+    pub kick: Option<Arc<Notify>>,
 }
 
 /// Subscriber payload for `topic::CLIP_CLOSED`. We only deserialise
@@ -133,7 +146,12 @@ pub async fn run_cold_replicator(
     // Kick a first tick immediately at startup so any backlog from
     // a previous engine run gets attention without waiting for
     // either an event or the first 5-min interval.
-    let kick = Arc::new(Notify::new());
+    //
+    // If the caller supplied an external `kick` (Phase 2 Step
+    // 2.1b — the cloud-tunnel supervisor shares one so a fresh
+    // enrollment wakes the replicator immediately), use that;
+    // otherwise we own a private `Notify` for the boot pulse only.
+    let kick = cfg.kick.clone().unwrap_or_else(|| Arc::new(Notify::new()));
     kick.notify_one();
 
     let mut interval = tokio::time::interval(POLL_INTERVAL);
@@ -617,6 +635,7 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
         let cfg = ColdReplicatorConfig {
             clips_dir: clips_dir.clone(),
+            kick: None,
         };
         let store_clone = store.clone();
         let bus_clone = bus.clone();
@@ -666,6 +685,7 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
         let cfg = ColdReplicatorConfig {
             clips_dir: clips_dir.clone(),
+            kick: None,
         };
         let store_clone = store.clone();
         let bus_clone = bus.clone();
@@ -721,6 +741,7 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
         let cfg = ColdReplicatorConfig {
             clips_dir: clips_dir.clone(),
+            kick: None,
         };
         let store_clone = store.clone();
         let bus_clone = bus.clone();
@@ -788,6 +809,7 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
         let cfg = ColdReplicatorConfig {
             clips_dir: clips_dir.clone(),
+            kick: None,
         };
         let store_clone = store.clone();
         let bus_clone = bus.clone();

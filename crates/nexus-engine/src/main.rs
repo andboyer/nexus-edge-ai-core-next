@@ -672,12 +672,23 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
         Err(e) => warn!(error = %e, "cold replicator: list_storage_backends failed at boot"),
     }
     let (cold_shutdown_tx, cold_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    // Phase 2 Step 2.1b — single `Arc<Notify>` shared between the
+    // cold replicator (consumer) and the cloud-tunnel supervisor
+    // (producer, post-enrollment). The cold replicator fires once
+    // at boot from the internal initial-pulse path AND once per
+    // external `notify_one()` thereafter, so the cloud-tunnel
+    // supervisor calling `notify_one()` right after installing the
+    // Azure backend drains any pre-enrollment clip backlog
+    // immediately instead of waiting up to 5 min for the polling
+    // backstop.
+    let cold_kick = std::sync::Arc::new(tokio::sync::Notify::new());
     let cold_handle = {
         let store = store.clone();
         let bus = bus.clone();
         let registry = registry.clone();
         let cfg = cold_replicator::ColdReplicatorConfig {
             clips_dir: clips_dir.clone(),
+            kick: Some(cold_kick.clone()),
         };
         tokio::spawn(async move {
             cold_replicator::run_cold_replicator(cfg, store, bus, registry, async {
@@ -820,8 +831,18 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
     // tunnel to `edge-gateway`, sending heartbeats every 30s. When
     // no enrollment is present, the task logs and exits — the engine
     // continues to serve locally (fail-open per Hard Rule 5).
-    let (cloud_tunnel_shutdown_tx, cloud_tunnel_handle) =
-        cloud_tunnel::spawn_tunnel(store.clone(), Some(trace_rx));
+    //
+    // Phase 2 Step 2.1b — also receives the shared `registry` +
+    // `cold_kick` so post-enrollment it can install the cloud
+    // `AzureBlobBackend` under the reserved handle `"cloud"`, bind
+    // `storage_cold_replica` to it if still NULL, and kick the
+    // replicator immediately.
+    let (cloud_tunnel_shutdown_tx, cloud_tunnel_handle) = cloud_tunnel::spawn_tunnel(
+        store.clone(),
+        registry.clone(),
+        cold_kick.clone(),
+        Some(trace_rx),
+    );
 
     let cache_jobs = cold_read_cache::CacheJobs::new(
         store.clone(),

@@ -278,7 +278,22 @@ pub struct PutReceipt {
 /// next tick without restarting the engine task.
 #[derive(Clone, Default)]
 pub struct Registry {
-    inner: Arc<RwLock<std::collections::HashMap<String, Arc<dyn ColdBackend>>>>,
+    inner: Arc<RwLock<RegistryInner>>,
+}
+
+#[derive(Default)]
+struct RegistryInner {
+    /// Backends sourced from the `storage_backends` table. Wiped
+    /// and rebuilt on every [`Registry::replace_all`] call (i.e.
+    /// every admin-driven create/update/delete of a user-managed
+    /// backend row).
+    backends: std::collections::HashMap<String, Arc<dyn ColdBackend>>,
+    /// Reserved backends owned by an internal subsystem (Phase 2:
+    /// the cloud-tunnel supervisor's `azure_blob` backend under the
+    /// handle `"cloud"`). These survive [`Registry::replace_all`]
+    /// so an unrelated admin update to a user-managed row does not
+    /// drop the cloud cold target between cold-replicator ticks.
+    reserved: std::collections::HashMap<String, Arc<dyn ColdBackend>>,
 }
 
 impl Registry {
@@ -286,8 +301,11 @@ impl Registry {
         Self::default()
     }
 
-    /// Replace the entire backend set in one swap. Called by the
-    /// boot loader and by the `STORAGE_BACKENDS_CHANGED` handler.
+    /// Replace the user-managed backend set in one swap. Called by
+    /// the boot loader and by the `STORAGE_BACKENDS_CHANGED`
+    /// handler. Reserved backends ([`Self::insert_reserved`]) are
+    /// preserved across the swap — see the doc on
+    /// [`RegistryInner::reserved`] for why.
     pub fn replace_all<I>(&self, backends: I)
     where
         I: IntoIterator<Item = Arc<dyn ColdBackend>>,
@@ -296,23 +314,50 @@ impl Registry {
         for b in backends {
             new_map.insert(b.handle().to_string(), b);
         }
-        *self.inner.write() = new_map;
+        self.inner.write().backends = new_map;
+    }
+
+    /// Install a reserved (internal-subsystem-owned) backend that
+    /// persists across [`Self::replace_all`] calls. Used by the
+    /// cloud-tunnel supervisor to register the cloud `azure_blob`
+    /// backend post-enrollment so an admin updating an unrelated
+    /// LAN backend does not blow away the cloud cold target.
+    ///
+    /// If the same handle was previously inserted (reserved or
+    /// user-managed), it is overwritten.
+    pub fn insert_reserved(&self, backend: Arc<dyn ColdBackend>) {
+        let handle = backend.handle().to_string();
+        let mut guard = self.inner.write();
+        guard.reserved.insert(handle, backend);
     }
 
     /// Look up a backend by handle. Returns `None` if the registry
     /// has no entry — the replicator treats that as "cold disabled
-    /// for this tick" and skips quietly.
+    /// for this tick" and skips quietly. Reserved backends shadow
+    /// user-managed rows that happen to use the same handle.
     pub fn get(&self, handle: &str) -> Option<Arc<dyn ColdBackend>> {
-        self.inner.read().get(handle).cloned()
+        let guard = self.inner.read();
+        guard
+            .reserved
+            .get(handle)
+            .or_else(|| guard.backends.get(handle))
+            .cloned()
     }
 
     /// Iterate over `(handle, kind)` for the admin API listing.
+    /// Reserved backends shadow user-managed rows with the same
+    /// handle (matches [`Self::get`] precedence).
     pub fn snapshot(&self) -> Vec<(String, String)> {
-        self.inner
-            .read()
+        let guard = self.inner.read();
+        let mut out: std::collections::HashMap<String, String> = guard
+            .backends
             .iter()
             .map(|(h, b)| (h.clone(), b.kind().to_string()))
-            .collect()
+            .collect();
+        for (h, b) in &guard.reserved {
+            out.insert(h.clone(), b.kind().to_string());
+        }
+        out.into_iter().collect()
     }
 }
 
@@ -344,5 +389,128 @@ pub fn build_backend(
         other => Err(BackendError::Other(format!(
             "unknown backend kind '{other}' (cloud kinds need `nexus-storage-cloud`)",
         ))),
+    }
+}
+
+#[cfg(test)]
+mod registry_tests {
+    use super::*;
+    use async_trait::async_trait;
+
+    /// Minimal in-memory `ColdBackend` for Registry behaviour tests.
+    /// Production backends (LAN, Azure) cover the trait surface in
+    /// their own crates; this stub only exercises the
+    /// `handle()`/`kind()` round-trip the Registry depends on.
+    #[derive(Debug)]
+    struct StubBackend {
+        handle: String,
+        kind: String,
+    }
+
+    impl StubBackend {
+        fn make(handle: &str, kind: &str) -> Arc<dyn ColdBackend> {
+            Arc::new(Self {
+                handle: handle.to_string(),
+                kind: kind.to_string(),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl ColdBackend for StubBackend {
+        fn handle(&self) -> &str {
+            &self.handle
+        }
+        fn kind(&self) -> &str {
+            &self.kind
+        }
+        async fn put(
+            &self,
+            _path: &str,
+            _bytes: &[u8],
+            _expected_sha256: &str,
+        ) -> Result<PutReceipt, BackendError> {
+            unimplemented!("stub")
+        }
+        async fn get_range(
+            &self,
+            _path: &str,
+            _start: u64,
+            _end_inclusive: u64,
+        ) -> Result<Vec<u8>, BackendError> {
+            unimplemented!("stub")
+        }
+        async fn delete(&self, _path: &str) -> Result<bool, BackendError> {
+            unimplemented!("stub")
+        }
+        async fn exists(
+            &self,
+            _path: &str,
+            _expected_sha256: &str,
+        ) -> Result<bool, BackendError> {
+            unimplemented!("stub")
+        }
+        async fn volume_info(&self) -> Result<VolumeInfo, BackendError> {
+            unimplemented!("stub")
+        }
+        async fn health(&self) -> HealthStatus {
+            unimplemented!("stub")
+        }
+    }
+
+    #[test]
+    fn replace_all_preserves_reserved_handles() {
+        let reg = Registry::new();
+        reg.insert_reserved(StubBackend::make("cloud", "azure_blob"));
+        reg.replace_all(vec![StubBackend::make("lan-archive", "lan")]);
+
+        // User-managed `lan-archive` is visible.
+        assert_eq!(reg.get("lan-archive").map(|b| b.kind().to_string()), Some("lan".to_string()));
+        // Reserved `cloud` survived the replace_all swap.
+        assert_eq!(reg.get("cloud").map(|b| b.kind().to_string()), Some("azure_blob".to_string()));
+
+        // A subsequent replace_all that removes `lan-archive` does
+        // not affect `cloud`.
+        reg.replace_all(Vec::<Arc<dyn ColdBackend>>::new());
+        assert!(reg.get("lan-archive").is_none());
+        assert_eq!(reg.get("cloud").map(|b| b.kind().to_string()), Some("azure_blob".to_string()));
+    }
+
+    #[test]
+    fn reserved_handle_shadows_user_managed_row_with_same_handle() {
+        // Defensive: if a stray admin write inserts a user row
+        // named "cloud", the reserved backend (real, cloud-tunnel-
+        // owned) must win at lookup time so we never silently
+        // route uploads through the wrong impl.
+        let reg = Registry::new();
+        reg.insert_reserved(StubBackend::make("cloud", "azure_blob"));
+        reg.replace_all(vec![StubBackend::make("cloud", "lan")]);
+
+        assert_eq!(reg.get("cloud").map(|b| b.kind().to_string()), Some("azure_blob".to_string()));
+
+        let snap = reg.snapshot();
+        let kinds: Vec<_> = snap
+            .iter()
+            .filter(|(h, _)| h == "cloud")
+            .map(|(_, k)| k.as_str())
+            .collect();
+        assert_eq!(kinds, vec!["azure_blob"]);
+    }
+
+    #[test]
+    fn snapshot_lists_both_user_and_reserved_backends() {
+        let reg = Registry::new();
+        reg.replace_all(vec![StubBackend::make("lan-archive", "lan")]);
+        reg.insert_reserved(StubBackend::make("cloud", "azure_blob"));
+
+        let mut snap = reg.snapshot();
+        snap.sort();
+        assert_eq!(
+            snap,
+            vec![
+                ("cloud".to_string(), "azure_blob".to_string()),
+                ("lan-archive".to_string(), "lan".to_string()),
+            ]
+        );
     }
 }

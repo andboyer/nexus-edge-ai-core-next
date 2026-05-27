@@ -104,6 +104,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0013_cloud_enrollment",
         include_str!("../migrations/0013_cloud_enrollment.sql"),
     ),
+    (
+        "0014_storage_backends_azure_blob",
+        include_str!("../migrations/0014_storage_backends_azure_blob.sql"),
+    ),
 ];
 
 #[derive(Debug, Error)]

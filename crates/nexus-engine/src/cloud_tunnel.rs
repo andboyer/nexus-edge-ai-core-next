@@ -27,9 +27,11 @@ use nexus_cloud_client::trace_uploader::{
 };
 use nexus_cloud_client::{TunnelClient, TunnelHandle};
 use nexus_cloud_protocol::v1::{Envelope, EnvelopeBody, EnvelopeMeta, HeartbeatPayload};
+use nexus_storage::Registry;
+use nexus_storage_cloud::{AzureBlobBackend, GatewaySasIssuer};
 use nexus_store::cloud::CloudEnrollment;
 use nexus_store::Store;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Notify};
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -54,8 +56,23 @@ const BACKOFF_MAX: Duration = Duration::from_secs(60);
 /// dropped: the bounded channel fills at `queue_capacity` and further
 /// pushes from the `TraceLayer` fail silently per the fail-open
 /// posture in Hard Rule 5.
+///
+/// `registry` and `replicator_kick` are wired by Phase 2 Step 2.1b:
+/// post-enrollment we construct a [`GatewaySasIssuer`] + [`AzureBlobBackend`]
+/// using the same mTLS cert material as the WSS tunnel, install it
+/// in the registry under the reserved handle `"cloud"`, upsert a
+/// matching `storage_backends` row (so the admin UI lists it), bind
+/// `storage_cold_replica.backend_handle = "cloud"` if the singleton
+/// is still NULL (first-enrollment default), and `notify_one()` the
+/// replicator kick so any pre-enrollment clip backlog drains
+/// immediately instead of waiting up to 5 min for the polling
+/// backstop. Any error in this block is logged and the supervisor
+/// continues — the engine remains fully functional locally (Hard
+/// Rule 5 / fail-open).
 pub fn spawn_tunnel(
     store: Arc<Store>,
+    registry: Registry,
+    replicator_kick: Arc<Notify>,
     trace_rx: Option<mpsc::Receiver<Span>>,
 ) -> (oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
     let (tx, rx) = oneshot::channel::<()>();
@@ -78,12 +95,166 @@ pub fn spawn_tunnel(
             gateway_url = %enrollment.gateway_url,
             "starting cloud tunnel supervisor",
         );
+        install_cloud_blob_backend(&enrollment, &store, &registry, &replicator_kick).await;
         if let Some(rx) = trace_rx {
             spawn_trace_uploader(&enrollment, rx);
         }
         run(enrollment, rx).await;
     });
     (tx, handle)
+}
+
+/// Build the cloud `AzureBlobBackend` from the enrollment artefact
+/// (mTLS cert chain for the SAS-issuance hop, plain HTTPS for direct
+/// Azure Blob PUT/GET) and install it into the registry under the
+/// reserved handle `"cloud"`. Idempotent — safe to call on every
+/// supervisor boot.
+///
+/// Errors in this block are logged and swallowed (Hard Rule 5):
+///   * SAS-issuer HTTP client construction failure → no cloud
+///     replication this boot; engine continues serving locally.
+///   * `upsert_storage_backend` SQL failure → ditto.
+///   * `write_cold_replica` SQL failure → the existing binding (if
+///     any) is left as-is; on next boot we try again.
+async fn install_cloud_blob_backend(
+    enrollment: &CloudEnrollment,
+    store: &Arc<Store>,
+    registry: &Registry,
+    replicator_kick: &Arc<Notify>,
+) {
+    // Reuse the trace-uploader's mTLS recipe verbatim for the SAS
+    // issuance hop; the gateway authenticates the edge by client
+    // cert just like for traces.
+    let mtls_http = match build_mtls_http_client(
+        enrollment.cert_pem.as_bytes(),
+        enrollment.private_key_pem.as_bytes(),
+        enrollment.ca_chain_pem.as_bytes(),
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(
+                error = %e,
+                "cloud blob backend: mTLS client build failed; cloud replication disabled this boot",
+            );
+            return;
+        }
+    };
+    // Direct-to-Azure client. SAS URL carries its own auth; no
+    // cert material needed here. 5 min total timeout is generous
+    // for a single PUT of a typical 30-60 s clip MP4 (a few MB).
+    let azure_http = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(5 * 60))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(
+                error = %e,
+                "cloud blob backend: Azure direct HTTP client build failed; cloud replication disabled this boot",
+            );
+            return;
+        }
+    };
+    let gateway_url = derive_https_base(&enrollment.gateway_url);
+    let issuer = Arc::new(GatewaySasIssuer::new(mtls_http, gateway_url.clone()));
+    let backend: Arc<dyn nexus_storage::ColdBackend> =
+        Arc::new(AzureBlobBackend::new("cloud", issuer, azure_http));
+
+    // Persist a `storage_backends` row so the admin UI surfaces
+    // the cloud backend. `build_any_backend` refuses to (re)build
+    // this kind from the row (the cloud-tunnel supervisor owns
+    // the live impl); `rebuild_registry` skips it with a warn.
+    let config_json = format!(r#"{{"gateway_url":"{gateway_url}"}}"#);
+    if let Err(e) = store
+        .upsert_storage_backend("cloud", "azure_blob", &config_json)
+        .await
+    {
+        warn!(
+            error = %e,
+            "cloud blob backend: upsert_storage_backend(\"cloud\") failed; admin listing will not show it",
+        );
+        // Continue anyway — the in-memory registry entry below is
+        // what the cold replicator actually consumes.
+    }
+
+    // Auto-bind cold replication to the cloud backend on first
+    // enrollment so the operator does not have to flip a switch
+    // for clips to start uploading. If the operator has already
+    // configured a LAN/USB/Drive backend, leave their choice
+    // alone — they can switch to "cloud" via the admin UI.
+    match store.read_cold_replica().await {
+        Ok(cur) => {
+            if cur.backend_handle.is_none() {
+                if let Err(e) = store.write_cold_replica(Some("cloud"), cur.throttle_bps).await {
+                    warn!(
+                        error = %e,
+                        "cloud blob backend: write_cold_replica(\"cloud\") failed; replication will stay disabled until operator picks one",
+                    );
+                } else {
+                    info!(
+                        gateway_url = %gateway_url,
+                        "cloud blob backend: auto-bound storage_cold_replica → \"cloud\" (was NULL)",
+                    );
+                }
+            } else {
+                info!(
+                    current = ?cur.backend_handle,
+                    "cloud blob backend: storage_cold_replica already bound; leaving operator choice intact",
+                );
+            }
+        }
+        Err(e) => {
+            warn!(
+                error = %e,
+                "cloud blob backend: read_cold_replica failed; cannot auto-bind",
+            );
+        }
+    }
+
+    registry.insert_reserved(backend);
+    replicator_kick.notify_one();
+    info!(
+        gateway_url = %gateway_url,
+        "cloud blob backend installed under reserved handle \"cloud\"; cold replicator kicked",
+    );
+}
+
+/// Mirror of [`nexus_cloud_client::trace_uploader::build_mtls_transport`]
+/// minus the `BatchTransport` wrapper — we just need the bare
+/// `reqwest::Client` for the SAS-issuance POST.
+fn build_mtls_http_client(
+    cert_pem: &[u8],
+    key_pem: &[u8],
+    ca_chain_pem: &[u8],
+) -> Result<reqwest::Client, String> {
+    let identity = reqwest::Identity::from_pem(&[cert_pem, key_pem].concat())
+        .map_err(|e| format!("reqwest identity from PEM: {e}"))?;
+    let ca = reqwest::Certificate::from_pem(ca_chain_pem)
+        .map_err(|e| format!("reqwest ca from PEM: {e}"))?;
+    reqwest::Client::builder()
+        .use_rustls_tls()
+        .identity(identity)
+        .add_root_certificate(ca)
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|e| format!("reqwest build: {e}"))
+}
+
+/// Derive the HTTPS base for cloud APIs from the tunnel URL
+/// (`wss://host/v1/tunnel` → `https://host`). Matches the same
+/// transform [`derive_trace_endpoint`] does but stops before
+/// appending the per-API suffix.
+fn derive_https_base(wss_url: &str) -> String {
+    let base = wss_url
+        .strip_prefix("wss://")
+        .map(|s| format!("https://{s}"))
+        .or_else(|| wss_url.strip_prefix("ws://").map(|s| format!("http://{s}")))
+        .unwrap_or_else(|| wss_url.to_string());
+    let trimmed = base.trim_end_matches('/');
+    trimmed
+        .strip_suffix("/v1/tunnel")
+        .unwrap_or(trimmed)
+        .to_string()
 }
 
 /// Derive the HTTP(S) base URL for cloud APIs from the websocket
