@@ -9,16 +9,29 @@
 //!
 //! Phase 1.8 ships heartbeats only. RPC dispatch lands in the next
 //! slice once `nexus-engine` has handlers.
+//!
+//! Phase 1.14 — this supervisor also owns the trace-uploader consumer
+//! task: when the engine boots, `main.rs` calls
+//! [`nexus_cloud_client::trace_uploader::TraceUploader::channel`] to
+//! get the producer half (handed to the tracing subscriber) and the
+//! receiver half (passed in here). Once `cloud_enrollment` is read,
+//! the receiver is drained by a [`TraceUploader::run_with_mtls`] task
+//! that reuses the same cert / key / CA chain as the tunnel itself.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use nexus_cloud_client::trace_uploader::{
+    Span, TraceUploader, TraceUploaderConfig, DEFAULT_BATCH_SIZE, DEFAULT_FLUSH_INTERVAL,
+    DEFAULT_QUEUE_CAPACITY,
+};
 use nexus_cloud_client::{TunnelClient, TunnelHandle};
 use nexus_cloud_protocol::v1::{Envelope, EnvelopeBody, EnvelopeMeta, HeartbeatPayload};
 use nexus_store::cloud::CloudEnrollment;
 use nexus_store::Store;
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
+use uuid::Uuid;
 
 /// Heartbeat cadence. Matches the cloud edge-gateway's `liveness_timeout / 2`
 /// expectation.
@@ -32,13 +45,27 @@ const BACKOFF_MAX: Duration = Duration::from_secs(60);
 /// exits immediately. Returns the shutdown sender + join handle pair
 /// so the engine shutdown sequence can clean it up the same way it
 /// cleans up the other long-running tasks.
-pub fn spawn_tunnel(store: Arc<Store>) -> (oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
+///
+/// `trace_rx`, when provided, is the consumer half of the
+/// boot-time-allocated trace-uploader channel. After enrollment is
+/// successfully read, a [`TraceUploader::run_with_mtls`] task is
+/// spawned to drain the channel and ship batches to the edge-gateway.
+/// When no enrollment is present (local-only mode), the receiver is
+/// dropped: the bounded channel fills at `queue_capacity` and further
+/// pushes from the `TraceLayer` fail silently per the fail-open
+/// posture in Hard Rule 5.
+pub fn spawn_tunnel(
+    store: Arc<Store>,
+    trace_rx: Option<mpsc::Receiver<Span>>,
+) -> (oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
     let (tx, rx) = oneshot::channel::<()>();
     let handle = tokio::spawn(async move {
         let enrollment = match store.get_cloud_enrollment().await {
             Ok(Some(e)) => e,
             Ok(None) => {
                 info!("no cloud enrollment present; cloud tunnel disabled");
+                // trace_rx is dropped here — `TraceLayer` pushes fail
+                // closed once the bounded channel fills.
                 return;
             }
             Err(e) => {
@@ -51,9 +78,69 @@ pub fn spawn_tunnel(store: Arc<Store>) -> (oneshot::Sender<()>, tokio::task::Joi
             gateway_url = %enrollment.gateway_url,
             "starting cloud tunnel supervisor",
         );
+        if let Some(rx) = trace_rx {
+            spawn_trace_uploader(&enrollment, rx);
+        }
         run(enrollment, rx).await;
     });
     (tx, handle)
+}
+
+/// Derive the HTTP(S) base URL for cloud APIs from the websocket
+/// tunnel URL: replace `wss://` with `https://` (or `ws://` with
+/// `http://`), strip any trailing `/v1/tunnel` path, and append
+/// `/v1/edge/traces`.
+fn derive_trace_endpoint(wss_url: &str) -> String {
+    let base = wss_url
+        .strip_prefix("wss://")
+        .map(|s| format!("https://{s}"))
+        .or_else(|| wss_url.strip_prefix("ws://").map(|s| format!("http://{s}")))
+        .unwrap_or_else(|| wss_url.to_string());
+    let trimmed = base.trim_end_matches('/');
+    let stripped = trimmed.strip_suffix("/v1/tunnel").unwrap_or(trimmed);
+    format!("{stripped}/v1/edge/traces")
+}
+
+fn spawn_trace_uploader(enrollment: &CloudEnrollment, rx: mpsc::Receiver<Span>) {
+    let core_id = match Uuid::parse_str(&enrollment.core_id) {
+        Ok(id) => id,
+        Err(e) => {
+            warn!(
+                core_id = %enrollment.core_id,
+                error = %e,
+                "cloud enrollment core_id is not a valid UUID; trace uploader disabled",
+            );
+            return;
+        }
+    };
+    let endpoint_url = derive_trace_endpoint(&enrollment.gateway_url);
+    let cfg = TraceUploaderConfig {
+        endpoint_url,
+        core_id,
+        batch_size: DEFAULT_BATCH_SIZE,
+        flush_interval: DEFAULT_FLUSH_INTERVAL,
+        queue_capacity: DEFAULT_QUEUE_CAPACITY,
+    };
+    match TraceUploader::run_with_mtls(
+        rx,
+        cfg,
+        enrollment.cert_pem.as_bytes(),
+        enrollment.private_key_pem.as_bytes(),
+        enrollment.ca_chain_pem.as_bytes(),
+    ) {
+        Ok(_join) => {
+            info!(
+                core_id = %enrollment.core_id,
+                "trace uploader spawned; engine spans will ship to edge-gateway",
+            );
+        }
+        Err(e) => {
+            warn!(
+                error = %e,
+                "trace uploader spawn failed; engine spans will not ship",
+            );
+        }
+    }
 }
 
 async fn run(enrollment: CloudEnrollment, mut shutdown: oneshot::Receiver<()>) {

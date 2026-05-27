@@ -225,7 +225,21 @@ fn build_runtime(cfg: &nexus_config::RuntimeConfig) -> Result<tokio::runtime::Ru
 }
 
 async fn run(cfg: Config, cli: Cli) -> Result<()> {
-    let _telemetry = nexus_telemetry::init(&cfg.telemetry)?;
+    // Phase 1.14 — pre-create the trace uploader channel BEFORE
+    // telemetry init so the producer half can be wired into the
+    // tracing subscriber straight away (every engine span captured by
+    // the layer's EnvFilter from that point on enqueues onto the
+    // bounded mpsc). The consumer half is parked here until
+    // `cloud_tunnel::spawn_tunnel` reads cloud_enrollment and either
+    // (a) spawns the uploader task with the matching mTLS material,
+    // or (b) drops the receiver — at which point the bounded channel
+    // fills at `queue_capacity` and pushes fail closed per Hard Rule 5
+    // (fail-open: the engine continues without cloud trace shipping).
+    let (trace_handle, trace_rx) = nexus_cloud_client::trace_uploader::TraceUploader::channel(
+        nexus_cloud_client::trace_uploader::DEFAULT_QUEUE_CAPACITY,
+    );
+
+    let _telemetry = nexus_telemetry::init(&cfg.telemetry, Some(trace_handle))?;
     info!(version = env!("CARGO_PKG_VERSION"), "nexus-engine starting");
 
     let store = Arc::new(Store::open(&cfg.store).await?);
@@ -806,7 +820,8 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
     // tunnel to `edge-gateway`, sending heartbeats every 30s. When
     // no enrollment is present, the task logs and exits — the engine
     // continues to serve locally (fail-open per Hard Rule 5).
-    let (cloud_tunnel_shutdown_tx, cloud_tunnel_handle) = cloud_tunnel::spawn_tunnel(store.clone());
+    let (cloud_tunnel_shutdown_tx, cloud_tunnel_handle) =
+        cloud_tunnel::spawn_tunnel(store.clone(), Some(trace_rx));
 
     let cache_jobs = cold_read_cache::CacheJobs::new(
         store.clone(),

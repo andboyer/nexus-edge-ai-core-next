@@ -2414,6 +2414,7 @@ name = "nexus-telemetry"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "nexus-cloud-client",
  "nexus-config",
  "opentelemetry",
  "opentelemetry-otlp",

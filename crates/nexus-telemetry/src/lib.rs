@@ -4,10 +4,22 @@
 //! spans for `decode / gate / infer / track / rules`. This crate sets up
 //! the subscriber so those spans are emitted (and, when configured,
 //! exported via OTLP gRPC).
+//!
+//! ## Cloud trace shipping (Phase 1.14)
+//!
+//! Callers may pass a [`TraceUploaderHandle`] obtained from
+//! [`nexus_cloud_client::trace_uploader::TraceUploader::channel`]. When
+//! present, a [`TraceLayer`] is wired into the subscriber stack so every
+//! engine span (subject to `EnvFilter`) is shipped to the edge-gateway
+//! over the same mTLS identity the WSS tunnel uses. The consumer half
+//! (the receiver) is spawned separately once cloud enrollment has been
+//! read \u2014 see `nexus-engine`'s `cloud_tunnel::spawn_tunnel`.
 
 #![forbid(unsafe_code)]
 
 use anyhow::Result;
+use nexus_cloud_client::trace_layer::TraceLayer;
+pub use nexus_cloud_client::trace_uploader::TraceUploaderHandle;
 use nexus_config::TelemetryConfig;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::WithExportConfig;
@@ -27,8 +39,18 @@ impl Drop for TelemetryGuard {
     }
 }
 
-/// Set up the tracing subscriber. Returns a guard that flushes OTLP on drop.
-pub fn init(cfg: &TelemetryConfig) -> Result<TelemetryGuard> {
+/// Set up the tracing subscriber. Returns a guard that flushes OTLP on
+/// drop.
+///
+/// `trace_handle` is the producer side of the
+/// [`nexus_cloud_client::trace_uploader::TraceUploader`] channel; when
+/// `Some`, a [`TraceLayer`] is added to the subscriber so every span
+/// captured by the layer's `EnvFilter` is shipped to the edge-gateway.
+/// When `None`, no cloud trace shipping is wired up (local-only mode).
+pub fn init(
+    cfg: &TelemetryConfig,
+    trace_handle: Option<TraceUploaderHandle>,
+) -> Result<TelemetryGuard> {
     let env_filter =
         EnvFilter::try_new(&cfg.log_level).unwrap_or_else(|_| EnvFilter::new("info,nexus=debug"));
 
@@ -43,6 +65,10 @@ pub fn init(cfg: &TelemetryConfig) -> Result<TelemetryGuard> {
             .compact()
             .boxed()
     };
+
+    // Cloud trace shipping: `tracing_subscriber` implements `Layer` for
+    // `Option<L>`, so `None` is a zero-cost no-op.
+    let trace_layer = trace_handle.map(TraceLayer::new);
 
     let mut guard = TelemetryGuard { provider: None };
 
@@ -79,10 +105,14 @@ pub fn init(cfg: &TelemetryConfig) -> Result<TelemetryGuard> {
         let tracer = provider.tracer("nexus-engine");
         let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
 
-        registry.with(fmt_layer).with(otel_layer).try_init()?;
+        registry
+            .with(fmt_layer)
+            .with(otel_layer)
+            .with(trace_layer)
+            .try_init()?;
         guard.provider = Some(provider);
     } else {
-        registry.with(fmt_layer).try_init()?;
+        registry.with(fmt_layer).with(trace_layer).try_init()?;
     }
 
     Ok(guard)

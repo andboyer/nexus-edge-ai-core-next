@@ -84,22 +84,26 @@ impl<'a> Visit for FieldVisitor<'a> {
     }
 
     fn record_str(&mut self, field: &Field, value: &str) {
-        self.attrs.insert(field.name().to_string(), value.to_string());
+        self.attrs
+            .insert(field.name().to_string(), value.to_string());
         if field.name() == "error" {
             *self.status = SpanStatus::Error;
         }
     }
 
     fn record_i64(&mut self, field: &Field, value: i64) {
-        self.attrs.insert(field.name().to_string(), value.to_string());
+        self.attrs
+            .insert(field.name().to_string(), value.to_string());
     }
 
     fn record_u64(&mut self, field: &Field, value: u64) {
-        self.attrs.insert(field.name().to_string(), value.to_string());
+        self.attrs
+            .insert(field.name().to_string(), value.to_string());
     }
 
     fn record_bool(&mut self, field: &Field, value: bool) {
-        self.attrs.insert(field.name().to_string(), value.to_string());
+        self.attrs
+            .insert(field.name().to_string(), value.to_string());
     }
 }
 
@@ -231,9 +235,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 #[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
-    use crate::trace_uploader::{
-        BatchTransport, TraceBatch, TraceUploader, TraceUploaderConfig,
-    };
+    use crate::trace_uploader::{BatchTransport, TraceBatch, TraceUploader, TraceUploaderConfig};
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::Mutex as TokioMutex;
@@ -308,7 +310,10 @@ mod tests {
         assert_eq!(batches.len(), 1);
         let span = &batches[0].spans[0];
         assert_eq!(span.name, "test.span");
-        assert_eq!(span.attributes.get("key").map(String::as_str), Some("value"));
+        assert_eq!(
+            span.attributes.get("key").map(String::as_str),
+            Some("value")
+        );
         assert_eq!(span.status, SpanStatus::Ok);
         assert!(span.parent_span_id.is_none());
         assert_eq!(span.trace_id.len(), 32);
@@ -336,7 +341,15 @@ mod tests {
             let _child = tracing::info_span!("child").entered();
         });
         for _ in 0..20 {
-            if transport.batches.lock().await.iter().map(|b| b.spans.len()).sum::<usize>() >= 2 {
+            if transport
+                .batches
+                .lock()
+                .await
+                .iter()
+                .map(|b| b.spans.len())
+                .sum::<usize>()
+                >= 2
+            {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -345,7 +358,10 @@ mod tests {
         let all: Vec<_> = batches.iter().flat_map(|b| b.spans.iter()).collect();
         assert_eq!(all.len(), 2, "expected exactly two spans");
         let child = all.iter().find(|s| s.name == "child").expect("child span");
-        let parent = all.iter().find(|s| s.name == "parent").expect("parent span");
+        let parent = all
+            .iter()
+            .find(|s| s.name == "parent")
+            .expect("parent span");
         assert_eq!(child.trace_id, parent.trace_id, "trace_id must propagate");
         assert_eq!(
             child.parent_span_id.as_deref(),

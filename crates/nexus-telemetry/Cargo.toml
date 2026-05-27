@@ -7,6 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 nexus-config = { workspace = true }
+nexus-cloud-client = { path = "../nexus-cloud-client" }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tracing-opentelemetry = { workspace = true }

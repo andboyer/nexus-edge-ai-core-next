@@ -281,19 +281,61 @@ impl TraceUploader {
         key_pem: &[u8],
         ca_chain_pem: &[u8],
     ) -> Result<(TraceUploaderHandle, tokio::task::JoinHandle<()>), String> {
-        let identity = reqwest::Identity::from_pem(&[cert_pem, key_pem].concat())
-            .map_err(|e| format!("reqwest identity from PEM: {e}"))?;
-        let ca = reqwest::Certificate::from_pem(ca_chain_pem)
-            .map_err(|e| format!("reqwest ca from PEM: {e}"))?;
-        let client = reqwest::Client::builder()
-            .use_rustls_tls()
-            .identity(identity)
-            .add_root_certificate(ca)
-            .timeout(Duration::from_secs(30))
-            .build()
-            .map_err(|e| format!("reqwest build: {e}"))?;
-        let transport = Arc::new(ReqwestMtlsTransport::new(client, cfg.endpoint_url.clone()));
+        let transport = build_mtls_transport(&cfg.endpoint_url, cert_pem, key_pem, ca_chain_pem)?;
         Ok(Self::spawn(cfg, transport))
+    }
+
+    /// Create the (handle, receiver) pair WITHOUT spawning the consumer
+    /// loop. Useful at engine boot: the [`TraceUploaderHandle`] can be
+    /// handed to the tracing subscriber immediately (so the
+    /// `TraceLayer` starts capturing spans straight away), while the
+    /// receiver waits until cloud enrollment is read and the mTLS
+    /// material is available before the consumer is spawned.
+    ///
+    /// If the consumer is never spawned (engine isn't enrolled), the
+    /// bounded channel fills up at `queue_capacity` and subsequent
+    /// pushes return [`TraceUploaderError::QueueFull`] — the
+    /// fail-open posture per Hard Rule 5.
+    #[must_use]
+    pub fn channel(queue_capacity: usize) -> (TraceUploaderHandle, mpsc::Receiver<Span>) {
+        let (tx, rx) = mpsc::channel::<Span>(queue_capacity.max(1));
+        let dropped = Arc::new(Mutex::new(0_u64));
+        (TraceUploaderHandle { tx, dropped }, rx)
+    }
+
+    /// Spawn the consumer loop against a pre-built [`mpsc::Receiver`]
+    /// + transport. Pair with [`Self::channel`] when the receiver had
+    ///   to be created at a different point in the boot sequence than
+    ///   the transport.
+    ///
+    /// Dropping every clone of the matching [`TraceUploaderHandle`]
+    /// closes the channel, which causes this task to drain one final
+    /// batch and exit.
+    pub fn run(
+        rx: mpsc::Receiver<Span>,
+        cfg: TraceUploaderConfig,
+        transport: Arc<dyn BatchTransport>,
+    ) -> tokio::task::JoinHandle<()> {
+        spawn_loop(rx, cfg, transport)
+    }
+
+    /// As [`Self::run`], but builds the mTLS transport from PEM material
+    /// up-front so the caller doesn't need to construct a
+    /// `reqwest::Client` themselves.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error string when `reqwest::Client` construction
+    /// fails (bad PEM, missing key, rustls install failure).
+    pub fn run_with_mtls(
+        rx: mpsc::Receiver<Span>,
+        cfg: TraceUploaderConfig,
+        cert_pem: &[u8],
+        key_pem: &[u8],
+        ca_chain_pem: &[u8],
+    ) -> Result<tokio::task::JoinHandle<()>, String> {
+        let transport = build_mtls_transport(&cfg.endpoint_url, cert_pem, key_pem, ca_chain_pem)?;
+        Ok(spawn_loop(rx, cfg, transport))
     }
 
     /// Spawn the uploader against an arbitrary [`BatchTransport`]. Tests
@@ -303,52 +345,79 @@ impl TraceUploader {
         cfg: TraceUploaderConfig,
         transport: Arc<dyn BatchTransport>,
     ) -> (TraceUploaderHandle, tokio::task::JoinHandle<()>) {
-        let (tx, mut rx) = mpsc::channel::<Span>(cfg.queue_capacity);
-        let dropped = Arc::new(Mutex::new(0_u64));
-        let handle = TraceUploaderHandle {
-            tx,
-            dropped: dropped.clone(),
-        };
-        let core_id = cfg.core_id;
-        let batch_size = cfg.batch_size.max(1);
-        let flush_interval = cfg.flush_interval;
-
-        let join = tokio::spawn(async move {
-            let mut buf: Vec<Span> = Vec::with_capacity(batch_size);
-            let mut ticker = tokio::time::interval(flush_interval);
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            // Skip the immediate first tick so we don't flush an empty
-            // buffer on startup.
-            ticker.tick().await;
-            loop {
-                tokio::select! {
-                    biased;
-                    maybe = rx.recv() => {
-                        match maybe {
-                            Some(span) => {
-                                buf.push(span);
-                                if buf.len() >= batch_size {
-                                    flush(&transport, core_id, &mut buf).await;
-                                }
-                            }
-                            None => {
-                                // Sender dropped — drain and exit.
-                                debug!(remaining = buf.len(), "trace uploader: channel closed; final flush");
-                                flush(&transport, core_id, &mut buf).await;
-                                break;
-                            }
-                        }
-                    }
-                    _ = ticker.tick() => {
-                        flush(&transport, core_id, &mut buf).await;
-                    }
-                }
-            }
-            debug!("trace uploader: exited");
-        });
-
+        let (handle, rx) = Self::channel(cfg.queue_capacity);
+        let join = spawn_loop(rx, cfg, transport);
         (handle, join)
     }
+}
+
+/// Construct a `reqwest::Client` carrying the engine's mTLS identity
+/// (same cert / key / CA chain as the WSS tunnel) and wrap it in a
+/// [`ReqwestMtlsTransport`] pointed at `endpoint_url`.
+fn build_mtls_transport(
+    endpoint_url: &str,
+    cert_pem: &[u8],
+    key_pem: &[u8],
+    ca_chain_pem: &[u8],
+) -> Result<Arc<dyn BatchTransport>, String> {
+    let identity = reqwest::Identity::from_pem(&[cert_pem, key_pem].concat())
+        .map_err(|e| format!("reqwest identity from PEM: {e}"))?;
+    let ca = reqwest::Certificate::from_pem(ca_chain_pem)
+        .map_err(|e| format!("reqwest ca from PEM: {e}"))?;
+    let client = reqwest::Client::builder()
+        .use_rustls_tls()
+        .identity(identity)
+        .add_root_certificate(ca)
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|e| format!("reqwest build: {e}"))?;
+    Ok(Arc::new(ReqwestMtlsTransport::new(
+        client,
+        endpoint_url.to_string(),
+    )))
+}
+
+fn spawn_loop(
+    mut rx: mpsc::Receiver<Span>,
+    cfg: TraceUploaderConfig,
+    transport: Arc<dyn BatchTransport>,
+) -> tokio::task::JoinHandle<()> {
+    let core_id = cfg.core_id;
+    let batch_size = cfg.batch_size.max(1);
+    let flush_interval = cfg.flush_interval;
+    tokio::spawn(async move {
+        let mut buf: Vec<Span> = Vec::with_capacity(batch_size);
+        let mut ticker = tokio::time::interval(flush_interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Skip the immediate first tick so we don't flush an empty
+        // buffer on startup.
+        ticker.tick().await;
+        loop {
+            tokio::select! {
+                biased;
+                maybe = rx.recv() => {
+                    match maybe {
+                        Some(span) => {
+                            buf.push(span);
+                            if buf.len() >= batch_size {
+                                flush(&transport, core_id, &mut buf).await;
+                            }
+                        }
+                        None => {
+                            // Sender dropped — drain and exit.
+                            debug!(remaining = buf.len(), "trace uploader: channel closed; final flush");
+                            flush(&transport, core_id, &mut buf).await;
+                            break;
+                        }
+                    }
+                }
+                _ = ticker.tick() => {
+                    flush(&transport, core_id, &mut buf).await;
+                }
+            }
+        }
+        debug!("trace uploader: exited");
+    })
 }
 
 /// Flush helper. No-op on empty buffer; logs WARN on transport error
