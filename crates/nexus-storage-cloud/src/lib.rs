@@ -64,10 +64,12 @@ use nexus_storage::token_crypto::{self, EncryptedToken, RefreshToken};
 use nexus_storage::{BackendError, ColdBackend};
 use serde::{Deserialize, Serialize};
 
+pub mod azure;
 pub mod gdrive;
 pub mod oauth;
 pub mod onedrive;
 
+pub use azure::{AzureBlobBackend, GatewaySasIssuer, IssuedSas, SasIssuer};
 pub use gdrive::GoogleDriveBackend;
 pub use oauth::{authorize_url, exchange_code, new_state, ExchangedTokens, Provider};
 pub use onedrive::OneDriveBackend;
