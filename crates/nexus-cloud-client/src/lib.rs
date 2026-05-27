@@ -40,6 +40,7 @@ pub mod error;
 pub mod jti_cache;
 pub mod response_cache;
 pub mod sink;
+pub mod trace_uploader;
 pub mod tunnel;
 
 pub use actor_token::{EnvelopeContext, TrustedKey, VerifiedActor, Verifier, VerifierBuilder};
@@ -49,4 +50,8 @@ pub use enrollment::{EnrollmentClient, EnrollmentError, EnrollmentRequest, Enrol
 pub use error::{DispatchError, InvalidReason, RejectReason};
 pub use jti_cache::JtiReplayCache;
 pub use response_cache::RpcResponseCache;
+pub use trace_uploader::{
+    now_unix_ns, BatchTransport, ReqwestMtlsTransport, Span, SpanKind, SpanStatus, TraceBatch,
+    TraceUploader, TraceUploaderConfig, TraceUploaderError, TraceUploaderHandle,
+};
 pub use tunnel::{TunnelClient, TunnelError, TunnelHandle};
