@@ -20,6 +20,8 @@ serde_json = { workspace = true }
 base64 = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+getrandom = "0.3"
 parking_lot = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }

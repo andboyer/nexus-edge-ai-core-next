@@ -40,6 +40,7 @@ pub mod error;
 pub mod jti_cache;
 pub mod response_cache;
 pub mod sink;
+pub mod trace_layer;
 pub mod trace_uploader;
 pub mod tunnel;
 

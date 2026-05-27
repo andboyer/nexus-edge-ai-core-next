@@ -2119,6 +2119,7 @@ dependencies = [
  "chrono",
  "ed25519-dalek",
  "futures-util",
+ "getrandom 0.3.4",
  "nexus-cloud-protocol",
  "nexus-types",
  "parking_lot",
@@ -2134,6 +2135,7 @@ dependencies = [
  "tokio-rustls",
  "tokio-tungstenite 0.24.0",
  "tracing",
+ "tracing-subscriber",
  "uuid",
  "wiremock",
 ]
