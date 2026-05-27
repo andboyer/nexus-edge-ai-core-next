@@ -42,6 +42,27 @@ pub struct EnrollArgs {
     /// Defaults to the local hostname.
     #[arg(long)]
     pub label: Option<String>,
+
+    /// Phase 2 · Step 2.9 / ARCHITECTURE §21.2 — replay the local
+    /// motion-clip backlog into the cloud after enrollment. On the
+    /// next `nexus-engine serve` boot the engine waits for the WSS
+    /// tunnel to come up and then re-sends every clip recorded
+    /// since `now - history_days` as a `clip_replicated` envelope
+    /// with `attached_history: true`. The cloud renders an
+    /// "imported" badge and suppresses notify-svc fan-out for these.
+    ///
+    /// Default: off. Most M7-migration customers will not want
+    /// pre-cloud noise in their fresh console.
+    #[arg(long, default_value_t = false)]
+    pub keep_history: bool,
+
+    /// Phase 2 · Step 2.9 — how many days of local history to replay
+    /// when `--keep-history` is set. Defaults to 30 (the same number
+    /// the spec calls out in ARCHITECTURE.md §21.2). Capped at 365
+    /// to keep the replay window bounded; values above 365 are
+    /// clamped with a warning.
+    #[arg(long, default_value_t = 30)]
+    pub history_days: u32,
 }
 
 /// Run the enrollment subcommand. Loads the store from `cfg.store`,
@@ -95,6 +116,36 @@ pub async fn run_enroll(cfg: &Config, args: &EnrollArgs) -> Result<()> {
 
     // 4. Persist.
     let store = Store::open(&cfg.store).await.context("open local store")?;
+
+    // Phase 2 · Step 2.9 — if `--keep-history` was passed, record the
+    // replay cutoff alongside the enrollment so the next `serve`
+    // boot's attach-replay task knows to drain the local backlog
+    // through the cloud outbox. The JWT's `iat` is approximately
+    // `now()` (the cloud just minted it), so we don't bother
+    // parsing the JWT — `Utc::now() - history_days` is within
+    // milliseconds of `iat - history_days` and the cloud-side
+    // `ON CONFLICT (core_id, edge_clip_id) DO UPDATE` upsert
+    // tolerates any minor over-replay.
+    let attach_replay_after = if args.keep_history {
+        let mut days = args.history_days;
+        if days > 365 {
+            tracing::warn!(
+                history_days = days,
+                "--history-days capped at 365; clamping"
+            );
+            days = 365;
+        }
+        let cutoff = chrono::Utc::now() - chrono::Duration::days(i64::from(days));
+        info!(
+            history_days = days,
+            cutoff = %cutoff.to_rfc3339(),
+            "--keep-history set: local clip backlog since cutoff will be replayed on next serve"
+        );
+        Some(cutoff)
+    } else {
+        None
+    };
+
     store
         .set_cloud_enrollment(&CloudEnrollment {
             core_id: resp.core_id.clone(),
@@ -106,6 +157,7 @@ pub async fn run_enroll(cfg: &Config, args: &EnrollArgs) -> Result<()> {
             signing_key_pem: resp.entitlement_signing_key_pem,
             signing_kid: resp.entitlement_signing_kid,
             enrolled_at: chrono::Utc::now(),
+            attach_replay_after,
         })
         .await
         .context("persist cloud_enrollment row")?;

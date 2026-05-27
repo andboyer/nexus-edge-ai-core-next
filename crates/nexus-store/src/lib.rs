@@ -112,6 +112,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0015_motion_clips_priority",
         include_str!("../migrations/0015_motion_clips_priority.sql"),
     ),
+    (
+        "0016_cloud_enrollment_attach_replay",
+        include_str!("../migrations/0016_cloud_enrollment_attach_replay.sql"),
+    ),
 ];
 
 #[derive(Debug, Error)]

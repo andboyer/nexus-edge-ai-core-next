@@ -35,6 +35,18 @@ pub struct CloudEnrollment {
     pub signing_kid: Option<String>,
     /// UTC timestamp of the enrollment round-trip.
     pub enrolled_at: DateTime<Utc>,
+    /// Phase 2 · Step 2.9 — when `nexus-engine enroll --keep-history`
+    /// is used, this is the cutoff timestamp (computed as
+    /// `entitlement.iat - history_days`) and signals to the next
+    /// `serve` boot that the local motion-clip backlog since this
+    /// instant should be replayed through the cloud outbox as
+    /// `clip_replicated` envelopes with `attached_history: true`.
+    /// NULL after a successful replay (or when `--keep-history` was
+    /// not passed). The replay task NULLs the column only after the
+    /// whole window has been re-sent; partial replays roll back to
+    /// the same cutoff, idempotent via the cloud-side
+    /// `ON CONFLICT (core_id, edge_clip_id) DO UPDATE`.
+    pub attach_replay_after: Option<DateTime<Utc>>,
 }
 
 impl Store {
@@ -48,18 +60,20 @@ impl Store {
             r#"
             INSERT INTO cloud_enrollment
                 (id, core_id, gateway_url, cert_pem, private_key_pem,
-                 ca_chain_pem, entitlement_jwt, signing_key_pem, signing_kid)
-            VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)
+                 ca_chain_pem, entitlement_jwt, signing_key_pem, signing_kid,
+                 attach_replay_after)
+            VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
-                core_id          = excluded.core_id,
-                gateway_url      = excluded.gateway_url,
-                cert_pem         = excluded.cert_pem,
-                private_key_pem  = excluded.private_key_pem,
-                ca_chain_pem     = excluded.ca_chain_pem,
-                entitlement_jwt  = excluded.entitlement_jwt,
-                signing_key_pem  = excluded.signing_key_pem,
-                signing_kid      = excluded.signing_kid,
-                enrolled_at      = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                core_id              = excluded.core_id,
+                gateway_url          = excluded.gateway_url,
+                cert_pem             = excluded.cert_pem,
+                private_key_pem      = excluded.private_key_pem,
+                ca_chain_pem         = excluded.ca_chain_pem,
+                entitlement_jwt      = excluded.entitlement_jwt,
+                signing_key_pem      = excluded.signing_key_pem,
+                signing_kid          = excluded.signing_kid,
+                attach_replay_after  = excluded.attach_replay_after,
+                enrolled_at          = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
             "#,
         )
         .bind(&e.core_id)
@@ -70,6 +84,7 @@ impl Store {
         .bind(&e.entitlement_jwt)
         .bind(e.signing_key_pem.as_deref())
         .bind(e.signing_kid.as_deref())
+        .bind(e.attach_replay_after.map(|ts| ts.to_rfc3339()))
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -85,7 +100,7 @@ impl Store {
             r#"
             SELECT core_id, gateway_url, cert_pem, private_key_pem,
                    ca_chain_pem, entitlement_jwt, signing_key_pem,
-                   signing_kid, enrolled_at
+                   signing_kid, enrolled_at, attach_replay_after
               FROM cloud_enrollment
              WHERE id = 1
             "#,
@@ -97,6 +112,16 @@ impl Store {
         let enrolled_at = DateTime::parse_from_rfc3339(&enrolled_at_str)
             .map_err(|e| crate::StoreError::Decode(format!("enrolled_at parse: {e}")))?
             .with_timezone(&Utc);
+        let attach_replay_after = row
+            .try_get::<Option<String>, _>("attach_replay_after")?
+            .map(|s| {
+                DateTime::parse_from_rfc3339(&s)
+                    .map(|d| d.with_timezone(&Utc))
+                    .map_err(|e| {
+                        crate::StoreError::Decode(format!("attach_replay_after parse: {e}"))
+                    })
+            })
+            .transpose()?;
         Ok(Some(CloudEnrollment {
             core_id: row.try_get("core_id")?,
             gateway_url: row.try_get("gateway_url")?,
@@ -107,7 +132,29 @@ impl Store {
             signing_key_pem: row.try_get("signing_key_pem")?,
             signing_kid: row.try_get("signing_kid")?,
             enrolled_at,
+            attach_replay_after,
         }))
+    }
+
+    /// Phase 2 · Step 2.9 — clear the attach-history replay cursor
+    /// after a successful drain of the historical motion-clip backlog
+    /// through the cloud outbox. Idempotent: clearing an already-NULL
+    /// column is a no-op single-row UPDATE.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::StoreError::Sqlx`] on database failure.
+    pub async fn clear_attach_replay_after(&self) -> Result<(), crate::StoreError> {
+        sqlx::query(
+            r#"
+            UPDATE cloud_enrollment
+               SET attach_replay_after = NULL
+             WHERE id = 1
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 }
 
@@ -142,6 +189,7 @@ mod tests {
             ),
             signing_kid: Some("kid-1".into()),
             enrolled_at: Utc::now(), // overwritten by the DB default
+            attach_replay_after: None,
         }
     }
 
@@ -175,5 +223,29 @@ mod tests {
             .expect("present");
         assert_eq!(got.core_id, "99999999-9999-9999-9999-999999999999");
         assert_eq!(got.signing_kid.as_deref(), Some("kid-2"));
+    }
+
+    #[tokio::test]
+    async fn attach_replay_after_round_trips_and_clears() {
+        // Phase 2 · Step 2.9 — `--keep-history` writes a cutoff; the
+        // boot-time replay task NULLs it on success.
+        let (store, _tmp) = fresh_store().await;
+        let mut e = sample();
+        let cutoff = Utc::now() - chrono::Duration::days(30);
+        e.attach_replay_after = Some(cutoff);
+        store.set_cloud_enrollment(&e).await.unwrap();
+        let got = store.get_cloud_enrollment().await.unwrap().expect("row");
+        let got_cutoff = got.attach_replay_after.expect("cutoff persisted");
+        // Sub-millisecond drift through RFC3339 string round-trip.
+        assert!((got_cutoff - cutoff).num_milliseconds().abs() < 2);
+
+        store.clear_attach_replay_after().await.unwrap();
+        let cleared = store.get_cloud_enrollment().await.unwrap().expect("row");
+        assert!(cleared.attach_replay_after.is_none());
+
+        // Idempotent clear.
+        store.clear_attach_replay_after().await.unwrap();
+        let still_clear = store.get_cloud_enrollment().await.unwrap().expect("row");
+        assert!(still_clear.attach_replay_after.is_none());
     }
 }

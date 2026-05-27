@@ -314,6 +314,45 @@ async fn tick(
         return;
     }
 
+    // Phase 2 · Step 2.9 — enrollment-aware filter. If the box has
+    // been enrolled, gate which clips are eligible for cloud cold
+    // replication by the enrollment timestamp; clips that predate
+    // the enrollment window stay local-only unless the operator
+    // explicitly opted into history replay via
+    // `nexus-engine enroll --keep-history`.
+    //
+    // * No enrollment row → LAN/USB-only deployment, no filter
+    //   (today's behaviour).
+    // * Enrollment row, `attach_replay_after = NULL` → floor is
+    //   `enrolled_at`; pre-enrollment clips skipped silently.
+    // * Enrollment row, `attach_replay_after = Some(cutoff)` →
+    //   floor is `cutoff`; pre-enrollment clips in [cutoff,
+    //   enrolled_at) are uploaded AND stamped
+    //   `attached_history: true` on the wire so the cloud renders
+    //   an "imported" badge and suppresses notify-svc fan-out.
+    let enrollment = match store.get_cloud_enrollment().await {
+        Ok(e) => e,
+        Err(e) => {
+            warn!(error = %e, "cold replicator: get_cloud_enrollment failed");
+            None
+        }
+    };
+    let (floor, enrolled_at_opt) = match enrollment.as_ref() {
+        Some(e) => {
+            let floor = e.attach_replay_after.unwrap_or(e.enrolled_at);
+            (Some(floor), Some(e.enrolled_at))
+        }
+        None => (None, None),
+    };
+    let pending: Vec<ClipRow> = match floor {
+        Some(f) => pending.into_iter().filter(|c| c.started_at >= f).collect(),
+        None => pending,
+    };
+    if pending.is_empty() {
+        debug!("cold replicator: all pending clips predate enrollment floor; skipping batch");
+        return;
+    }
+
     // Sync the persistent bucket to the current admin throttle.
     // `set_rate` preserves whatever credit accrued during the quiet
     // interval, so a normal "one clip every 30 s" workload is
@@ -326,7 +365,29 @@ async fn tick(
     let mut uploaded = 0usize;
     let mut failed = 0usize;
     for clip in pending {
-        match upload_one(cfg, store, &*backend, throttle, &backend_handle, &clip).await {
+        // Phase 2 · Step 2.9 — stamp `attached_history: true` iff
+        // (a) the operator opted into history replay AND (b) the
+        // clip predates the enrollment timestamp. The combination
+        // means "this clip would not exist in the cloud at all
+        // without --keep-history; flag it so the console renders
+        // an 'imported' badge and notify-svc skips fan-out."
+        let attached_history = match (enrolled_at_opt, enrollment.as_ref()) {
+            (Some(enrolled_at), Some(e)) if e.attach_replay_after.is_some() => {
+                Some(clip.started_at < enrolled_at)
+            }
+            _ => None,
+        };
+        match upload_one(
+            cfg,
+            store,
+            &*backend,
+            throttle,
+            &backend_handle,
+            &clip,
+            attached_history,
+        )
+        .await
+        {
             Ok(()) => uploaded += 1,
             Err(e) => {
                 failed += 1;
@@ -357,6 +418,7 @@ async fn upload_one(
     throttle: &TokenBucket,
     backend_handle: &str,
     clip: &ClipRow,
+    attached_history: Option<bool>,
 ) -> Result<(), UploadError> {
     let hot_path_rel = clip
         .hot_path
@@ -447,7 +509,7 @@ async fn upload_one(
             codec: Some(clip.codec.clone()),
             container: Some(clip.container.clone()),
             thumbnail_blob_url: None,
-            attached_history: None,
+            attached_history,
         };
         match outbox
             .send(nexus_cloud_client::build_clip_replicated_envelope(
@@ -906,5 +968,144 @@ mod tests {
             0,
             "fast-path must NOT call put when exists() returns true"
         );
+    }
+
+    /// Phase 2 · Step 2.9 — when an enrollment row is present and
+    /// `attach_replay_after` is NULL (i.e. the operator did NOT
+    /// pass `--keep-history`), clips that predate the enrollment
+    /// timestamp MUST stay local-only. The replicator skips them
+    /// silently; no `put()`, no cold-pointer stamp.
+    ///
+    /// Acceptance criterion from
+    /// [ARCHITECTURE.md §21.2](../../../../nexus-cloud-console/docs/cloud-console/ARCHITECTURE.md):
+    /// > "without the flag, history is left local"
+    #[tokio::test]
+    async fn pre_enrollment_clip_stays_local_without_keep_history() {
+        let (store, clip_id, clips_dir, _dir) = seed_one_pending_clip().await;
+        store.write_cold_replica(Some("mock"), 0).await.unwrap();
+
+        // Enrollment timestamp AFTER the seeded clip's started_at
+        // (seed_one_pending_clip sets started_at = now - 60s).
+        let mut enrollment = nexus_store::cloud::CloudEnrollment {
+            core_id: "11111111-2222-3333-4444-555555555555".into(),
+            gateway_url: "wss://gateway.test/v1/tunnel".into(),
+            cert_pem: "x".into(),
+            private_key_pem: "x".into(),
+            ca_chain_pem: "x".into(),
+            entitlement_jwt: "x".into(),
+            signing_key_pem: None,
+            signing_kid: None,
+            enrolled_at: Utc::now(), // overwritten by DB default
+            attach_replay_after: None,
+        };
+        store.set_cloud_enrollment(&enrollment).await.unwrap();
+        // Reload to capture the DB-default enrolled_at.
+        enrollment = store.get_cloud_enrollment().await.unwrap().unwrap();
+        assert!(
+            enrollment.enrolled_at > Utc::now() - ChronoDuration::seconds(30),
+            "enrolled_at should be ~now"
+        );
+
+        let bus: Arc<dyn Bus> = Arc::new(BroadcastBus::new(64));
+        let backend = MockBackend::new("mock", HealthStatus::Ok);
+        let registry = Registry::new();
+        registry.replace_all([backend.clone() as Arc<dyn ColdBackend>]);
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let cfg = ColdReplicatorConfig {
+            clips_dir: clips_dir.clone(),
+            kick: None,
+            outbox: None,
+        };
+        let store_clone = store.clone();
+        let bus_clone = bus.clone();
+        let task = tokio::spawn(async move {
+            run_cold_replicator(cfg, store_clone, bus_clone, registry, async move {
+                let _ = shutdown_rx.await;
+            })
+            .await;
+        });
+
+        // Give the replicator ample time to NOT do the thing.
+        // 600ms is well above the boot-kick + one drain budget.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let _ = shutdown_tx.send(());
+        let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+
+        // Clip is STILL pending (no cold pointer).
+        let pending = store.clips_pending_cold_upload(8).await.unwrap();
+        assert!(
+            pending.iter().any(|c| c.id == clip_id),
+            "pre-enrollment clip should stay local-only without --keep-history"
+        );
+        assert_eq!(
+            backend.put_count(),
+            0,
+            "replicator must NOT upload pre-enrollment clips by default"
+        );
+    }
+
+    /// Phase 2 · Step 2.9 — when `attach_replay_after` is set
+    /// (operator passed `--keep-history`), the same pre-enrollment
+    /// clip IS uploaded (so the cloud can render the "imported"
+    /// badge after the cold-pointer is stamped).
+    #[tokio::test]
+    async fn pre_enrollment_clip_uploads_with_keep_history() {
+        let (store, clip_id, clips_dir, _dir) = seed_one_pending_clip().await;
+        store.write_cold_replica(Some("mock"), 0).await.unwrap();
+
+        // `attach_replay_after` 30 days back; enrolled_at = now.
+        // Clip's started_at = now - 60s — sits inside the window.
+        let enrollment = nexus_store::cloud::CloudEnrollment {
+            core_id: "11111111-2222-3333-4444-555555555555".into(),
+            gateway_url: "wss://gateway.test/v1/tunnel".into(),
+            cert_pem: "x".into(),
+            private_key_pem: "x".into(),
+            ca_chain_pem: "x".into(),
+            entitlement_jwt: "x".into(),
+            signing_key_pem: None,
+            signing_kid: None,
+            enrolled_at: Utc::now(),
+            attach_replay_after: Some(Utc::now() - ChronoDuration::days(30)),
+        };
+        store.set_cloud_enrollment(&enrollment).await.unwrap();
+
+        let bus: Arc<dyn Bus> = Arc::new(BroadcastBus::new(64));
+        let backend = MockBackend::new("mock", HealthStatus::Ok);
+        let registry = Registry::new();
+        registry.replace_all([backend.clone() as Arc<dyn ColdBackend>]);
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let cfg = ColdReplicatorConfig {
+            clips_dir: clips_dir.clone(),
+            kick: None,
+            outbox: None,
+        };
+        let store_clone = store.clone();
+        let bus_clone = bus.clone();
+        let task = tokio::spawn(async move {
+            run_cold_replicator(cfg, store_clone, bus_clone, registry, async move {
+                let _ = shutdown_rx.await;
+            })
+            .await;
+        });
+
+        let mut got_cold = false;
+        for _ in 0..80 {
+            let row = store.clips_pending_cold_upload(8).await.unwrap();
+            if !row.iter().any(|c| c.id == clip_id) {
+                got_cold = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let _ = shutdown_tx.send(());
+        let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+
+        assert!(
+            got_cold,
+            "pre-enrollment clip should upload when --keep-history was set"
+        );
+        assert_eq!(backend.put_count(), 1, "exactly one put expected");
     }
 }
