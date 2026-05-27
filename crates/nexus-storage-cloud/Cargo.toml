@@ -29,8 +29,11 @@ chrono = { workspace = true }
 tracing = { workspace = true }
 
 # Crypto / encoding for `exists()` checksum spot-check + base64
-# manipulations of OAuth response bodies.
+# manipulations of OAuth response bodies. `md-5` powers the Azure
+# Blob `x-ms-blob-content-md5` header for upload-integrity verification
+# (Phase 2 · Step 2.8).
 sha2 = "0.10"
+md-5 = { workspace = true }
 hex = { workspace = true }
 base64 = { workspace = true }
 

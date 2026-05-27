@@ -248,6 +248,20 @@ impl TunnelHandle for Connection {
     }
 }
 
+/// Blanket impl so engine code that holds an `Arc<Connection>` can
+/// hand it to anything that wants `Arc<dyn TunnelHandle>` (or to a
+/// generic bound `T: TunnelHandle`) without an extra adapter type.
+///
+/// Phase 2 \u00b7 Step 2.8 \u2014 [`crate::TunnelOutbox::set_handle`] stores
+/// an `Arc<Connection>` cloned per-reconnect; the outbox publishes
+/// through that handle via this impl.
+#[async_trait]
+impl<T: TunnelHandle + ?Sized> TunnelHandle for Arc<T> {
+    async fn send(&self, envelope: Envelope) -> Result<(), TunnelError> {
+        (**self).send(envelope).await
+    }
+}
+
 /// Build a [`ClientConfig`] with mTLS identity + a root store seeded
 /// from `ca_chain_pem` (the internal CA we trust the gateway against).
 fn build_client_config(

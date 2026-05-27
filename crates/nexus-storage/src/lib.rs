@@ -249,7 +249,10 @@ pub trait ColdBackend: Send + Sync {
 
 /// Receipt returned by [`ColdBackend::put`]. The replicator passes
 /// the `cold_path` + `cold_uploaded_at` straight into
-/// `Store::mark_cold_replicated`.
+/// `Store::mark_cold_replicated`, and the `cold_url` straight into
+/// the `clip_replicated` envelope (Phase 2 · Step 2.8) so the cloud
+/// can record an absolute, browser-fetchable blob URL on the
+/// `clips` row.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PutReceipt {
     /// Backend-resolved path that the clip now lives at. For
@@ -261,6 +264,16 @@ pub struct PutReceipt {
     /// Bytes actually written (may differ from input length on
     /// resumable uploads where part of the file was already there).
     pub bytes_written: u64,
+    /// Absolute URL of the freshly-written blob with the SAS query
+    /// string stripped (cloud-only; LAN/USB backends set `None`).
+    /// Phase 2 · Step 2.8 — populated by `AzureBlobBackend` from the
+    /// SAS issuer's `blob_url_unsigned` so the cold replicator can
+    /// place it verbatim into `ClipReplicatedPayload.blob_url`.
+    /// `None` for backends whose addressing model is not URL-based
+    /// (e.g. LAN filesystems); the cloud replicator never emits a
+    /// `clip_replicated` envelope in that case.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cold_url: Option<String>,
 }
 
 // ---------------------------------------------------------------------------

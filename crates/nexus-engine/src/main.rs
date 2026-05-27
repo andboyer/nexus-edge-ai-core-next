@@ -683,6 +683,13 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
     // immediately instead of waiting up to 5 min for the polling
     // backstop.
     let cold_kick = std::sync::Arc::new(tokio::sync::Notify::new());
+    // Phase 2 · Step 2.8 — shared tunnel-handle slot. The cloud
+    // tunnel reconnect loop publishes the active `Arc<Connection>`
+    // into this on connect / clears on disconnect; the cold
+    // replicator publishes `clip_replicated` envelopes through it
+    // as a best-effort, fire-and-forget side effect after each
+    // successful upload + cold-pointer commit.
+    let cloud_outbox = std::sync::Arc::new(nexus_cloud_client::TunnelOutbox::new());
     let cold_handle = {
         let store = store.clone();
         let bus = bus.clone();
@@ -690,6 +697,7 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
         let cfg = cold_replicator::ColdReplicatorConfig {
             clips_dir: clips_dir.clone(),
             kick: Some(cold_kick.clone()),
+            outbox: Some(cloud_outbox.clone()),
         };
         tokio::spawn(async move {
             cold_replicator::run_cold_replicator(cfg, store, bus, registry, async {
@@ -842,6 +850,7 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
         store.clone(),
         registry.clone(),
         cold_kick.clone(),
+        cloud_outbox.clone(),
         Some(trace_rx),
     );
 

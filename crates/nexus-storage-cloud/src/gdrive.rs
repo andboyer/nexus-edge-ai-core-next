@@ -367,6 +367,10 @@ impl ColdBackend for GoogleDriveBackend {
                         cold_path: path.to_string(),
                         uploaded_at: Utc::now(),
                         bytes_written: 0,
+                        // Google Drive cold replication is not wired into
+                        // the cloud-tunnel `clip_replicated` envelope
+                        // path (Phase 2 · Step 2.8 covers Azure only).
+                        cold_url: None,
                     });
                 }
                 debug!(
@@ -390,6 +394,7 @@ impl ColdBackend for GoogleDriveBackend {
                 cold_path: path.to_string(),
                 uploaded_at: Utc::now(),
                 bytes_written: bytes.len() as u64,
+                cold_url: None,
             })
             .map(|mut r| {
                 r.cold_path = file.name.unwrap_or_else(|| path.to_string());

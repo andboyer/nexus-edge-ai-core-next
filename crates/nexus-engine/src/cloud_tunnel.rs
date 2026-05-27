@@ -82,6 +82,7 @@ pub fn spawn_tunnel(
     store: Arc<Store>,
     registry: Registry,
     replicator_kick: Arc<Notify>,
+    cloud_outbox: Arc<nexus_cloud_client::TunnelOutbox>,
     trace_rx: Option<mpsc::Receiver<Span>>,
 ) -> (oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
     let (tx, rx) = oneshot::channel::<()>();
@@ -109,7 +110,7 @@ pub fn spawn_tunnel(
             spawn_trace_uploader(&enrollment, rx);
         }
         let dispatcher = build_rpc_dispatcher(&enrollment, &store, &replicator_kick);
-        run(enrollment, dispatcher, rx).await;
+        run(enrollment, dispatcher, cloud_outbox, rx).await;
     });
     (tx, handle)
 }
@@ -407,6 +408,7 @@ fn spawn_trace_uploader(enrollment: &CloudEnrollment, rx: mpsc::Receiver<Span>) 
 async fn run(
     enrollment: CloudEnrollment,
     dispatcher: Option<Arc<RpcDispatcher<EngineRpcHandler>>>,
+    cloud_outbox: Arc<nexus_cloud_client::TunnelOutbox>,
     mut shutdown: oneshot::Receiver<()>,
 ) {
     let client = TunnelClient::new(
@@ -421,18 +423,31 @@ async fn run(
         // Check for shutdown before each connect attempt.
         if shutdown.try_recv().is_ok() {
             info!(core_id = %core_id, "cloud tunnel shutdown requested");
+            cloud_outbox.set_handle(None);
             return;
         }
         match client.connect().await {
             Ok(mut conn) => {
                 backoff = BACKOFF_MIN;
+                // Take the inbound receiver BEFORE Arc-wrapping the
+                // Connection — `take_inbound` is `&mut self` so it
+                // needs unique access.
                 let inbound = conn.take_inbound();
-                let pump = pump_heartbeats(&conn, &core_id);
-                let dispatch = pump_rpc_dispatch(&conn, inbound, dispatcher.as_deref(), &core_id);
+                let conn = Arc::new(conn);
+                // Phase 2 · Step 2.8 — publish the live handle into
+                // the shared outbox so the cold replicator (and any
+                // future publisher) can fire envelopes through this
+                // session. Cleared on every disconnect path below.
+                cloud_outbox.set_handle(Some(
+                    conn.clone() as Arc<dyn nexus_cloud_client::TunnelHandle>
+                ));
+                let pump = pump_heartbeats(&*conn, &core_id);
+                let dispatch = pump_rpc_dispatch(&*conn, inbound, dispatcher.as_deref(), &core_id);
                 tokio::select! {
                     biased;
                     _ = &mut shutdown => {
                         info!(core_id = %core_id, "cloud tunnel shutdown requested");
+                        cloud_outbox.set_handle(None);
                         return;
                     }
                     _ = pump => {
@@ -444,6 +459,7 @@ async fn run(
                         warn!(core_id = %core_id, "cloud tunnel inbound dispatch ended; will reconnect");
                     }
                 }
+                cloud_outbox.set_handle(None);
             }
             Err(e) => {
                 warn!(
@@ -458,6 +474,7 @@ async fn run(
             biased;
             _ = &mut shutdown => {
                 info!(core_id = %core_id, "cloud tunnel shutdown requested");
+                cloud_outbox.set_handle(None);
                 return;
             }
             _ = tokio::time::sleep(backoff) => {}

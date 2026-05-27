@@ -211,6 +211,8 @@ impl ColdBackend for LanFsBackend {
             cold_path: path.to_string(),
             uploaded_at: Utc::now(),
             bytes_written,
+            // LAN/USB backends are filesystem-addressed; no URL form.
+            cold_url: None,
         })
     }
 

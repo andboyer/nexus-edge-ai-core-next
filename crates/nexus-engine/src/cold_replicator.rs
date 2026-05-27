@@ -30,6 +30,7 @@ use std::time::Duration;
 use chrono::Utc;
 use futures::StreamExt;
 use nexus_bus::{topic, Bus, BusExt};
+use nexus_cloud_client::{ClipReplicatedProjection, TunnelError, TunnelOutbox};
 use nexus_storage::{BackendError, HealthStatus, Registry};
 use nexus_store::{ClipColdMark, ClipRow, Store};
 use serde::Deserialize;
@@ -75,6 +76,21 @@ pub struct ColdReplicatorConfig {
     /// instead of stranding any pre-enrollment clip backlog for
     /// up to 5 min.
     pub kick: Option<Arc<Notify>>,
+    /// Optional shared outbox to the cloud tunnel. When present
+    /// and a fresh upload yielded a [`nexus_storage::PutReceipt::cold_url`],
+    /// the replicator fires a `clip_replicated` envelope through
+    /// it as a best-effort, fire-and-forget side effect AFTER
+    /// `Store::mark_cold_replicated` has committed. When `None`
+    /// (LAN-only / pre-enrollment deployments) the replicator
+    /// just stamps the row and moves on.
+    ///
+    /// Fire-and-forget semantics: `TunnelError::Disconnected` is
+    /// logged at `debug` (a stub stamp will normally not race with
+    /// the tunnel; when it does, the Phase 6.17 reconciler sweep
+    /// re-emits). Any other `TunnelError` is logged at `warn`.
+    ///
+    /// Phase 2 · Step 2.8.
+    pub outbox: Option<Arc<TunnelOutbox>>,
 }
 
 /// Subscriber payload for `topic::CLIP_CLOSED`. We only deserialise
@@ -397,6 +413,9 @@ async fn upload_one(
         .await
         .map_err(UploadError::Backend)?;
 
+    let cold_url = receipt.cold_url.clone();
+    let receipt_bytes = receipt.bytes_written;
+
     store
         .mark_cold_replicated(
             clip.id,
@@ -409,9 +428,52 @@ async fn upload_one(
         .await
         .map_err(UploadError::Store)?;
 
+    // Phase 2 · Step 2.8 — emit `clip_replicated` to cloud after
+    // the local commit. Best-effort, fire-and-forget: a disconnect
+    // here is normal during boot-before-tunnel, and the Phase 6.17
+    // reconciler sweep is the authoritative recovery. We only emit
+    // when the backend returned a URL-form receipt (LAN/USB
+    // backends don't have one) AND an outbox is wired.
+    if let (Some(outbox), Some(url)) = (cfg.outbox.as_ref(), cold_url) {
+        let camera_id = u64::try_from(clip.camera_id).unwrap_or(0);
+        let projection = ClipReplicatedProjection {
+            edge_clip_id: clip.id.to_string(),
+            camera_id,
+            blob_url: url,
+            started_at: clip.started_at,
+            duration_ms: u64::try_from(clip.duration_ms).unwrap_or(0),
+            size_bytes: u64::try_from(clip.size_bytes).unwrap_or(receipt_bytes),
+            sha256_hex: sha256.to_string(),
+            codec: Some(clip.codec.clone()),
+            container: Some(clip.container.clone()),
+            thumbnail_blob_url: None,
+            attached_history: None,
+        };
+        match outbox
+            .send(nexus_cloud_client::build_clip_replicated_envelope(
+                projection,
+            ))
+            .await
+        {
+            Ok(()) => debug!(
+                clip_id = clip.id,
+                "cold replicator: clip_replicated emitted"
+            ),
+            Err(TunnelError::Disconnected) => debug!(
+                clip_id = clip.id,
+                "cold replicator: tunnel disconnected; phase 6.17 sweep will reconcile"
+            ),
+            Err(e) => warn!(
+                clip_id = clip.id,
+                error = %e,
+                "cold replicator: clip_replicated emit failed; phase 6.17 sweep will reconcile"
+            ),
+        }
+    }
+
     debug!(
         clip_id = clip.id,
-        bytes_written = receipt.bytes_written,
+        bytes_written = receipt_bytes,
         "cold replicator: clip uploaded"
     );
     Ok(())
@@ -508,6 +570,7 @@ mod tests {
                 cold_path: path.to_string(),
                 uploaded_at: Utc::now(),
                 bytes_written: bytes.len() as u64,
+                cold_url: None,
             })
         }
         async fn get_range(
@@ -636,6 +699,7 @@ mod tests {
         let cfg = ColdReplicatorConfig {
             clips_dir: clips_dir.clone(),
             kick: None,
+            outbox: None,
         };
         let store_clone = store.clone();
         let bus_clone = bus.clone();
@@ -686,6 +750,7 @@ mod tests {
         let cfg = ColdReplicatorConfig {
             clips_dir: clips_dir.clone(),
             kick: None,
+            outbox: None,
         };
         let store_clone = store.clone();
         let bus_clone = bus.clone();
@@ -742,6 +807,7 @@ mod tests {
         let cfg = ColdReplicatorConfig {
             clips_dir: clips_dir.clone(),
             kick: None,
+            outbox: None,
         };
         let store_clone = store.clone();
         let bus_clone = bus.clone();
@@ -810,6 +876,7 @@ mod tests {
         let cfg = ColdReplicatorConfig {
             clips_dir: clips_dir.clone(),
             kick: None,
+            outbox: None,
         };
         let store_clone = store.clone();
         let bus_clone = bus.clone();

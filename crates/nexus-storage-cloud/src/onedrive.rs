@@ -347,6 +347,11 @@ impl ColdBackend for OneDriveBackend {
                             cold_path: path.to_string(),
                             uploaded_at: Utc::now(),
                             bytes_written: 0,
+                            // OneDrive cold replication is not wired into
+                            // the cloud-tunnel `clip_replicated` envelope
+                            // path (Phase 2 · Step 2.8 covers Azure only);
+                            // leave `cold_url` empty until that lands.
+                            cold_url: None,
                         });
                     }
                 }
@@ -361,6 +366,7 @@ impl ColdBackend for OneDriveBackend {
                 cold_path: path.to_string(),
                 uploaded_at: Utc::now(),
                 bytes_written: bytes.len() as u64,
+                cold_url: None,
             })
         };
 

@@ -38,6 +38,7 @@ pub mod enrollment;
 pub mod entitlements;
 pub mod error;
 pub mod jti_cache;
+pub mod outbox;
 pub mod response_cache;
 pub mod sink;
 pub mod trace_layer;
@@ -50,7 +51,12 @@ pub use dispatcher::{AuditSink, Handler, NullAuditSink, RpcDispatcher, SystemMet
 pub use enrollment::{EnrollmentClient, EnrollmentError, EnrollmentRequest, EnrollmentResponse};
 pub use error::{DispatchError, InvalidReason, RejectReason};
 pub use jti_cache::JtiReplayCache;
+pub use outbox::TunnelOutbox;
 pub use response_cache::RpcResponseCache;
+pub use sink::{
+    build_alert_envelope, build_clip_replicated_envelope, AlertProjection,
+    ClipReplicatedProjection, CloudConsoleSink,
+};
 pub use trace_uploader::{
     now_unix_ns, BatchTransport, ReqwestMtlsTransport, Span, SpanKind, SpanStatus, TraceBatch,
     TraceUploader, TraceUploaderConfig, TraceUploaderError, TraceUploaderHandle,

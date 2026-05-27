@@ -42,11 +42,15 @@
 //!
 //! Stamped into the blob's `x-ms-meta-nexus-sha256` user metadata
 //! at PUT time. [`Self::exists`] re-reads it with a HEAD and
-//! returns `true` only if the metadata round-trips. We don't rely
-//! on Azure's own `Content-MD5` because Azure stores it only when
-//! we set it on PUT, and the rotation is to MD5 which we treat as
-//! a non-cryptographic upload integrity check (matches what
-//! [`OneDriveBackend`] does with `description`).
+//! returns `true` only if the metadata round-trips. In addition,
+//! Phase 2 \u00b7 Step 2.8 pins the body's true MD5 into
+//! `x-ms-blob-content-md5` on PUT so Azure records it on the
+//! blob's properties \u2014 the Phase 6.17 cloud-side integrity sweep
+//! reads BOTH the SHA-256 user metadata AND the MD5 content header
+//! and cross-checks them against a fresh re-hash of the body. The
+//! redundant pair gives an attacker who tampers with cold (via
+//! SAS replay, op-error, etc.) a much higher forge cost than
+//! either hash alone.
 //!
 //! ## What we explicitly DO NOT implement (yet)
 //!
@@ -344,12 +348,29 @@ impl ColdBackend for AzureBlobBackend {
         // later read it back and confirm the blob is what we wrote.
         // Azure rejects metadata-header values containing characters
         // outside US-ASCII printables; hex passes trivially.
+        //
+        // Also pin `x-ms-blob-content-md5` (Phase 2 \u00b7 Step 2.8). Azure
+        // records this on the blob's properties and returns it on
+        // HEAD/GetProperties; the Phase 6.17 cloud-side integrity
+        // sweep cross-checks it against a fresh re-hash to detect a
+        // post-PUT tamper (SAS-replay overwrite, op-error during
+        // hot-rehydrate, etc.). Note the `x-ms-blob-*` family of
+        // content-MD5 headers is RECORDED only — Azure does NOT
+        // reject the PUT on mismatch the way the bare `Content-MD5`
+        // header would. We deliberately use `x-ms-blob-content-md5`
+        // (record, never reject) instead of `Content-MD5` (reject on
+        // mismatch) because the SHA-256 pre-verification block above
+        // is already a stronger upload-side check, and we want
+        // Azure's record of the MD5 even when the body is identical
+        // to the on-disk bytes we computed against.
+        let content_md5 = content_md5_b64(bytes);
         let resp = self
             .http
             .put(&sas.url)
             .header("x-ms-blob-type", "BlockBlob")
             .header("x-ms-version", AZURE_API_VERSION)
             .header(format!("x-ms-meta-{AZURE_SHA256_META}"), expected_sha256)
+            .header("x-ms-blob-content-md5", &content_md5)
             .header("content-length", bytes.len().to_string())
             .body(bytes.to_vec())
             .send()
@@ -369,6 +390,12 @@ impl ColdBackend for AzureBlobBackend {
             cold_path: sas.blob_path,
             uploaded_at: Utc::now(),
             bytes_written: bytes.len() as u64,
+            // Phase 2 \u00b7 Step 2.8 \u2014 the cold replicator stamps this into
+            // `ClipReplicatedPayload.blob_url` so the cloud's `clips`
+            // table records an absolute, browser-fetchable URL (the
+            // SAS query is omitted by definition; this is the bare
+            // `blob_url_unsigned` minted by the SAS issuer).
+            cold_url: Some(sas.blob_url_unsigned),
         })
     }
 
@@ -555,28 +582,19 @@ impl ColdBackend for AzureBlobBackend {
 // Tests
 // ---------------------------------------------------------------------------
 
-/// Compute the base64-encoded MD5 of `bytes`. Currently unused
-/// internally (we don't pin `Content-MD5` because the SAS endpoint
-/// already validates `Content-Length`), but exposed for future
-/// integrity-tightening callers (Phase 2.8 cold-rehydrate cache
-/// would benefit from it). Kept private to this module.
-#[allow(dead_code)]
+/// Compute the base64-encoded MD5 of `bytes` for the `x-ms-blob-content-md5`
+/// Azure Blob storage header. Azure records this on the blob and returns it on
+/// GetProperties / HEAD, so the Phase 6.17 cloud-side integrity sweep can
+/// cross-check it against a fresh re-hash of the body without trusting our
+/// custom `x-ms-meta-nexus-sha256` metadata alone (defence-in-depth — an
+/// attacker who replays a SAS PUT must forge both an MD5 *and* a SHA-256 for
+/// the same body, which is computationally a no-op only if MD5 collision
+/// generation maps onto the SHA-256 preimage problem).
+///
+/// Phase 2 \u00b7 Step 2.8.
 fn content_md5_b64(bytes: &[u8]) -> String {
-    let digest = md5_compat(bytes);
+    let digest = md5::Md5::digest(bytes);
     base64::engine::general_purpose::STANDARD.encode(digest)
-}
-
-/// MD5 for the `Content-MD5` header. We don't import `md-5` (a new
-/// dep would need cargo-deny review for nothing); instead we
-/// re-use the lightweight in-tree `Sha256::digest`-style shim by
-/// fanning through a 16-byte truncation of a pre-computed hash. Per
-/// Azure docs this is acceptable as long as both sides agree; we
-/// document it so a future maintainer doesn't expect actual MD5.
-fn md5_compat(bytes: &[u8]) -> [u8; 16] {
-    let full = Sha256::digest(bytes);
-    let mut out = [0u8; 16];
-    out.copy_from_slice(&full[..16]);
-    out
 }
 
 #[cfg(test)]
