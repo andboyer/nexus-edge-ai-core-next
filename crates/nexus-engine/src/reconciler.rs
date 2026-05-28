@@ -64,6 +64,13 @@ pub struct RunningCameraEntry {
     /// Current ingest URL. Compared on each reconcile pass to
     /// decide whether a respawn is needed.
     pub url: String,
+    /// Resolved supervisor (RGB analysis) frame `(width, height)` in
+    /// effect for this camera. Compared on each reconcile pass so a
+    /// UI-side change to `model_override.input_width` triggers a
+    /// respawn (which rebuilds the GStreamer pipeline at the new
+    /// caps) without needing a process restart. See
+    /// [`nexus_pipeline::supervisor_frame_for`].
+    pub supervisor_dims: (u32, u32),
 }
 
 /// Bundle of every dependency `spawn_camera()` needs. Constructed
@@ -89,6 +96,12 @@ pub struct ReconcilerArgs {
     pub frame_stats: Arc<FrameStatsRegistry>,
     pub static_clear: Arc<StaticAnchorClearRegistry>,
     pub pre_roll_secs: u32,
+    /// Fallback detector input width when a camera's
+    /// `model_override` is absent. Sourced from
+    /// `cfg.inference.model.input_width`. Drives the per-camera
+    /// supervisor frame size via
+    /// [`nexus_pipeline::supervisor_frame_for`].
+    pub default_detector_width: u32,
     pub handles: HandleMap,
 }
 
@@ -175,23 +188,42 @@ async fn reconcile(args: &ReconcilerArgs) -> anyhow::Result<()> {
     for cam in live.into_iter().filter(|c| c.ingest.enabled) {
         let cam_id = cam.id;
         let url = cam.ingest.url.to_string();
+        let det_w = cam
+            .detector
+            .model_override
+            .as_ref()
+            .map(|m| m.input_width)
+            .unwrap_or(args.default_detector_width);
+        let want_dims = nexus_pipeline::supervisor_frame_for(det_w);
         match current.get(&cam_id) {
-            Some(entry) if entry.url == url => {
+            Some(entry) if entry.url == url && entry.supervisor_dims == want_dims => {
                 // No change — supervisor still alive, URL still the
-                // same. Skip (we deliberately do not respawn on
-                // unrelated config edits today).
+                // same, supervisor dims still match. Skip (we
+                // deliberately do not respawn on unrelated config
+                // edits today).
                 continue;
             }
-            Some(_) => {
-                info!(
-                    camera_id = cam_id,
-                    "camera reconciler: ingest URL changed; restarting supervisor"
-                );
+            Some(entry) => {
+                if entry.url != url {
+                    info!(
+                        camera_id = cam_id,
+                        "camera reconciler: ingest URL changed; restarting supervisor"
+                    );
+                } else {
+                    info!(
+                        camera_id = cam_id,
+                        prev_w = entry.supervisor_dims.0,
+                        prev_h = entry.supervisor_dims.1,
+                        new_w = want_dims.0,
+                        new_h = want_dims.1,
+                        "camera reconciler: detector input size changed; restarting supervisor"
+                    );
+                }
                 stop_camera(args, cam_id);
             }
             None => {}
         }
-        start_camera(args, cam, &url);
+        start_camera(args, cam, &url, want_dims);
     }
 
     Ok(())
@@ -210,16 +242,26 @@ fn stop_camera(args: &ReconcilerArgs, cam_id: CameraId) {
     args.frame_stats.clear(cam_id);
 }
 
-fn start_camera(args: &ReconcilerArgs, cam: CameraConfig, url: &str) {
+fn start_camera(
+    args: &ReconcilerArgs,
+    cam: CameraConfig,
+    url: &str,
+    supervisor_dims: (u32, u32),
+) {
     let cam_id = cam.id;
+    let (sup_w, sup_h) = supervisor_dims;
     // Pre-roll ingester first so the recorder is ready by the time
     // the supervisor opens its first motion clip. Failure is logged
     // but non-fatal: detection still runs; clip opens for this
     // camera return Refused until the next reconcile pass.
-    if let Err(e) =
-        args.recorder
-            .add_camera_ingester(cam_id, url, args.pre_roll_secs, cam.ingest.max_fps)
-    {
+    if let Err(e) = args.recorder.add_camera_ingester(
+        cam_id,
+        url,
+        args.pre_roll_secs,
+        cam.ingest.max_fps,
+        sup_w,
+        sup_h,
+    ) {
         error!(
             camera_id = cam_id,
             %url,
@@ -247,17 +289,22 @@ fn start_camera(args: &ReconcilerArgs, cam: CameraConfig, url: &str) {
         args.cache.clone(),
         args.frame_stats.clone(),
         args.static_clear.clone(),
+        sup_w,
+        sup_h,
     );
     args.handles.lock().insert(
         cam_id,
         RunningCameraEntry {
             task: Arc::new(handle.task),
             url: url.to_string(),
+            supervisor_dims,
         },
     );
     info!(
         camera_id = cam_id,
         %url,
+        sup_w,
+        sup_h,
         "camera reconciler: spawned supervisor + ingester"
     );
 }

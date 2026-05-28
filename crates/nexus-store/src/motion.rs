@@ -90,6 +90,16 @@ pub struct NewClip {
     pub hot_handle: String,
     pub codec: String,
     pub container: String,
+    /// Width (px) of the supervisor / analysis RGB frame at the
+    /// moment the clip was opened. Stored on the row so the
+    /// `/api/v1/clips/:id/tracks` overlay scales `motion_events`
+    /// bboxes against the correct denominator even after the
+    /// operator later changes the camera's detector size. Per the
+    /// per-camera supervisor-frame work — see
+    /// [`crate::supervisor_frame_for`] (in `nexus-pipeline`).
+    pub frame_width: u32,
+    /// Companion to [`Self::frame_width`].
+    pub frame_height: u32,
 }
 
 /// Args for closing an in-progress `motion_clips` row.
@@ -144,6 +154,13 @@ pub struct ClipRow {
     /// Expedite RPC handler bumps this to `1` so the clip jumps to
     /// the head of the next replicator tick.
     pub priority: i64,
+    /// Supervisor (analysis) frame width — the coordinate space
+    /// every `motion_events.bbox_*` value for this clip lives in.
+    /// Stamped on `open_clip`; default 960 for legacy rows. See
+    /// migration `0017_motion_clips_frame_size.sql`.
+    pub frame_width: u32,
+    /// Companion to [`Self::frame_width`].
+    pub frame_height: u32,
 }
 
 /// Args for [`Store::mark_cold_replicated`]. All three fields are
@@ -320,8 +337,9 @@ impl Store {
     pub async fn open_clip(&self, new: &NewClip) -> Result<ClipId, StoreError> {
         let row = sqlx::query(
             "INSERT INTO motion_clips
-                 (camera_id, started_at, codec, container, hot_handle, hot_path)
-             VALUES (?, ?, ?, ?, ?, ?)
+                 (camera_id, started_at, codec, container, hot_handle, hot_path,
+                  frame_width, frame_height)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
              RETURNING id",
         )
         .bind(new.camera_id)
@@ -330,6 +348,8 @@ impl Store {
         .bind(&new.container)
         .bind(&new.hot_handle)
         .bind(&new.hot_path)
+        .bind(new.frame_width as i64)
+        .bind(new.frame_height as i64)
         .fetch_one(&self.pool)
         .await?;
         Ok(row.get::<i64, _>(0))
@@ -1360,21 +1380,21 @@ impl Store {
 // Row decoders
 // ---------------------------------------------------------------------------
 
-/// The 15 ClipRow columns in stable bind-index order. Centralised so
+/// The 17 ClipRow columns in stable bind-index order. Centralised so
 /// the row decoder below can index by position instead of carrying a
 /// fragile column-name lookup. Every helper that returns
 /// `Result<ClipRow, _>` must SELECT these in this exact order.
 const CLIP_SELECT_COLUMNS_BASE: &str = "SELECT id, camera_id, started_at, ended_at, duration_ms,
             size_bytes, codec, container,
             hot_handle, hot_path, cold_handle, cold_path, cold_uploaded_at, sha256,
-            priority
+            priority, frame_width, frame_height
        FROM motion_clips";
 
 const CLIP_SELECT_COLUMNS_WHERE_ID: &str =
     "SELECT id, camera_id, started_at, ended_at, duration_ms,
             size_bytes, codec, container,
             hot_handle, hot_path, cold_handle, cold_path, cold_uploaded_at, sha256,
-            priority
+            priority, frame_width, frame_height
        FROM motion_clips WHERE id = ?";
 
 fn clip_row_from_row(row: sqlx::sqlite::SqliteRow) -> Result<ClipRow, StoreError> {
@@ -1403,6 +1423,8 @@ fn clip_row_from_row(row: sqlx::sqlite::SqliteRow) -> Result<ClipRow, StoreError
         cold_uploaded_at,
         sha256: row.try_get::<Option<String>, _>(13)?,
         priority: row.get::<i64, _>(14),
+        frame_width: row.get::<i64, _>(15) as u32,
+        frame_height: row.get::<i64, _>(16) as u32,
     })
 }
 

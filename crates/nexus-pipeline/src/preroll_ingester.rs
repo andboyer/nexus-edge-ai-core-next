@@ -79,7 +79,7 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::preroll::{NalRingBuffer, NalSample};
-use crate::source::{gst_init, RTSP_SOURCE_FRAME_HEIGHT, RTSP_SOURCE_FRAME_WIDTH};
+use crate::source::gst_init;
 
 /// How many in-flight live samples the broadcast channel buffers
 /// per subscriber. Tokio's broadcast drops the OLDEST sample when
@@ -132,6 +132,15 @@ pub enum IngesterError {
 struct FrameTap {
     tx: broadcast::Sender<Frame>,
     max_fps: u32,
+    /// RGB width the second branch's `videoscale` produces.
+    /// Derived at construction time from the camera's resolved
+    /// detector input size and threaded into the `format!` for
+    /// the pipeline string. Was hardcoded to
+    /// [`RTSP_SOURCE_FRAME_WIDTH`] (960) before the per-camera
+    /// supervisor-frame work.
+    width: u32,
+    /// Companion to [`Self::width`].
+    height: u32,
 }
 
 pub struct PreRollIngester {
@@ -180,11 +189,9 @@ impl PreRollIngester {
     }
 
     /// Variant of [`Self::new`] that also exposes a decoded RGB
-    /// frame stream off the same RTSP session, sized to the
-    /// engine's standard detector resolution
-    /// (`RTSP_SOURCE_FRAME_WIDTH × RTSP_SOURCE_FRAME_HEIGHT`) at
-    /// `max_fps` (0 ⇒ 15). Pipeline grows a `tee` after `h264parse`
-    /// plus a second branch
+    /// frame stream off the same RTSP session, sized to
+    /// `rgb_w × rgb_h` at `max_fps` (0 ⇒ 15). Pipeline grows a
+    /// `tee` after `h264parse` plus a second branch
     /// `queue → avdec_h264 → videoconvert → videoscale → videorate
     /// → appsink RGB`; the detector consumes frames via
     /// [`Self::subscribe_frames`] without opening a second
@@ -192,20 +199,28 @@ impl PreRollIngester {
     /// recorder is `gstreamer` so single-session cameras (e.g.
     /// InSight firmware caps at 1 session per stream path) work
     /// end-to-end.
+    ///
+    /// `rgb_w / rgb_h` are derived at the engine spawn site from
+    /// the camera's resolved `ModelConfig.input_width` via
+    /// [`crate::source::supervisor_frame_for`]; pass
+    /// `(RTSP_SOURCE_FRAME_WIDTH, RTSP_SOURCE_FRAME_HEIGHT)` to
+    /// reproduce the pre-per-camera (960×540) behaviour.
     pub fn new_with_rgb(
         camera_id: CameraId,
         url: impl Into<String>,
         pre_roll_secs: u32,
         max_fps: u32,
+        rgb_w: u32,
+        rgb_h: u32,
     ) -> Result<Arc<Self>, IngesterError> {
-        Self::build(camera_id, url, pre_roll_secs, Some(max_fps))
+        Self::build(camera_id, url, pre_roll_secs, Some((max_fps, rgb_w, rgb_h)))
     }
 
     fn build(
         camera_id: CameraId,
         url: impl Into<String>,
         pre_roll_secs: u32,
-        rgb_max_fps: Option<u32>,
+        rgb_params: Option<(u32, u32, u32)>,
     ) -> Result<Arc<Self>, IngesterError> {
         gst_init::ensure().map_err(|e| IngesterError::GstInit(e.to_string()))?;
         let url = url.into();
@@ -213,11 +228,13 @@ impl PreRollIngester {
             pre_roll_secs as u64,
         ))));
         let (live_tx, _rx) = broadcast::channel(BROADCAST_CAPACITY);
-        let frame_tap = rgb_max_fps.map(|fps| {
+        let frame_tap = rgb_params.map(|(fps, w, h)| {
             let (tx, _rx) = broadcast::channel(FRAME_BROADCAST_CAPACITY);
             FrameTap {
                 tx,
                 max_fps: if fps == 0 { 15 } else { fps },
+                width: w,
+                height: h,
             }
         });
         let active_pipeline = Arc::new(Mutex::new(None));
@@ -226,7 +243,9 @@ impl PreRollIngester {
         let task_url = url.clone();
         let task_ring = ring.clone();
         let task_tx = live_tx.clone();
-        let task_frame_tap = frame_tap.as_ref().map(|t| (t.tx.clone(), t.max_fps));
+        let task_frame_tap = frame_tap
+            .as_ref()
+            .map(|t| (t.tx.clone(), t.max_fps, t.width, t.height));
         let task_pipeline = active_pipeline.clone();
         let task_shutdown = shutdown.clone();
         let task = tokio::spawn(async move {
@@ -316,7 +335,7 @@ async fn run_supervisor(
     url: String,
     ring: Arc<Mutex<NalRingBuffer>>,
     live_tx: broadcast::Sender<NalSample>,
-    frame_tap: Option<(broadcast::Sender<Frame>, u32)>,
+    frame_tap: Option<(broadcast::Sender<Frame>, u32, u32, u32)>,
     active_pipeline: Arc<Mutex<Option<gst::Pipeline>>>,
     shutdown: Arc<AtomicBool>,
 ) {
@@ -368,7 +387,7 @@ async fn run_session(
     url: &str,
     ring: Arc<Mutex<NalRingBuffer>>,
     live_tx: broadcast::Sender<NalSample>,
-    frame_tap: Option<(broadcast::Sender<Frame>, u32)>,
+    frame_tap: Option<(broadcast::Sender<Frame>, u32, u32, u32)>,
     active_pipeline: Arc<Mutex<Option<gst::Pipeline>>>,
     shutdown: Arc<AtomicBool>,
 ) -> Result<(), IngesterError> {
@@ -390,8 +409,13 @@ async fn run_session(
     //   * `tap`  — the existing byte-stream H.264 appsink that
     //              feeds the ring buffer + recorder broadcast.
     //   * `rgb`  — `avdec_h264 → videoconvert → videoscale →
-    //              videorate → appsink RGB` at the engine's
-    //              standard 960×540 detector resolution. The
+    //              videorate → appsink RGB` at the camera's
+    //              per-camera supervisor-frame resolution
+    //              (derived from the camera's resolved detector
+    //              input size via
+    //              [`crate::source::supervisor_frame_for`]; see
+    //              the engine spawn site in
+    //              `nexus-engine/src/{main,reconciler}.rs`). The
     //              detector subscribes via
     //              [`PreRollIngester::subscribe_frames`] and never
     //              opens its own RTSP connection. Queues sit at
@@ -412,7 +436,7 @@ async fn run_session(
              ! appsink name=tap emit-signals=true sync=false \
                  max-buffers=200 drop=false"
         ),
-        Some((_, max_fps)) => format!(
+        Some((_, max_fps, rgb_w, rgb_h)) => format!(
             "rtspsrc location=\"{url_safe}\" latency=500 protocols=tcp \
              ! rtph264depay \
              ! h264parse config-interval=0 \
@@ -426,8 +450,8 @@ async fn run_session(
                 ! videoconvert ! videoscale ! videorate \
                 ! video/x-raw,format=RGB,width={w},height={h},framerate={fr}/1 \
                 ! appsink name=rgb emit-signals=true sync=false drop=true max-buffers=4",
-            w = RTSP_SOURCE_FRAME_WIDTH,
-            h = RTSP_SOURCE_FRAME_HEIGHT,
+            w = rgb_w,
+            h = rgb_h,
             fr = max_fps,
         ),
     };
@@ -502,7 +526,7 @@ async fn run_session(
     // reads, hard error on non-RGB caps, row-by-row tight pack
     // because every downstream consumer (image::JpegEncoder,
     // ndarray) wants width*height*3 with no padding.
-    if let Some((frame_tx, _max_fps)) = &frame_tap {
+    if let Some((frame_tx, _max_fps, _rgb_w, _rgb_h)) = &frame_tap {
         let rgb_sink = pipeline
             .by_name("rgb")
             .ok_or_else(|| IngesterError::AppSink("appsink 'rgb' not found".into()))?

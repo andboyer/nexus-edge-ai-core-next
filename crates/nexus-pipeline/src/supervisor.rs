@@ -39,6 +39,14 @@ pub struct CameraHandle {
 
 /// Build and launch one camera pipeline. Returns a join handle. If the source
 /// fails, the supervisor logs and exits — the engine owns restart policy.
+///
+/// `supervisor_w` / `supervisor_h` are the per-camera RGB analysis
+/// frame size (derived from the camera's resolved detector input
+/// size via [`crate::source::supervisor_frame_for`] at the engine
+/// spawn site). The dims are baked into the freshly-built
+/// `RtspSource` when the recorder does NOT provide a shared frame
+/// source; with the shared source, the recorder owns the same
+/// dims via [`crate::recorder::ClipRecorder::add_camera_ingester`].
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_camera(
     cfg: CameraConfig,
@@ -55,6 +63,8 @@ pub fn spawn_camera(
     cache: Arc<LatestFrameCache>,
     stats: Arc<FrameStatsRegistry>,
     static_clear: Arc<StaticAnchorClearRegistry>,
+    supervisor_w: u32,
+    supervisor_h: u32,
 ) -> CameraHandle {
     let camera_id = cfg.id;
     let task = tokio::spawn(run_camera(
@@ -72,6 +82,8 @@ pub fn spawn_camera(
         cache,
         stats,
         static_clear,
+        supervisor_w,
+        supervisor_h,
     ));
     CameraHandle { camera_id, task }
 }
@@ -92,6 +104,8 @@ async fn run_camera(
     cache: Arc<LatestFrameCache>,
     stats: Arc<FrameStatsRegistry>,
     static_clear: Arc<StaticAnchorClearRegistry>,
+    supervisor_w: u32,
+    supervisor_h: u32,
 ) {
     let span = info_span!(
         "camera.pipeline",
@@ -115,7 +129,7 @@ async fn run_camera(
             .await;
 
         let (tx, mut rx) = mpsc::channel::<Frame>(8);
-        let source = build_source(&cfg, &recorder);
+        let source = build_source(&cfg, &recorder, supervisor_w, supervisor_h);
         let cam_id = cfg.id;
         let source_task = tokio::spawn(async move {
             if let Err(e) = source.run(tx).await {
@@ -425,6 +439,8 @@ async fn run_camera(
                         .open(OpenClip {
                             camera_id: cfg.id,
                             started_at: d.captured_at,
+                            frame_width: supervisor_w,
+                            frame_height: supervisor_h,
                         })
                         .await
                     {
@@ -553,6 +569,8 @@ async fn run_camera(
 fn build_source(
     cfg: &CameraConfig,
     recorder: &Arc<dyn ClipRecorder>,
+    #[cfg_attr(not(feature = "gstreamer"), allow(unused_variables))] supervisor_w: u32,
+    #[cfg_attr(not(feature = "gstreamer"), allow(unused_variables))] supervisor_h: u32,
 ) -> Box<dyn FrameSource + Send> {
     // Prefer a frame source shared with the recorder's pre-roll
     // ingester whenever the recorder offers one. This collapses
@@ -572,6 +590,8 @@ fn build_source(
             camera_id: cfg.id,
             url: cfg.ingest.url.to_string(),
             max_fps: cfg.ingest.max_fps,
+            frame_width: supervisor_w,
+            frame_height: supervisor_h,
         }),
         // Without the `gstreamer` feature there is no real RTSP backend.
         // Refuse to silently fall back to a 640x480 black VirtualSource —

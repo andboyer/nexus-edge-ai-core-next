@@ -550,6 +550,7 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
         store.clone(),
         &clips_dir,
         &cameras,
+        cfg.inference.model.input_width,
         cfg.runtime.clips.pre_roll_secs,
         bus.clone(),
         usb_resolver.clone(),
@@ -585,6 +586,18 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
         // Fresh per-camera tracker — see the comment on `cfg.tracker`
         // above for why sharing one Arc across cameras is wrong.
         let tracker: Arc<dyn nexus_tracker::Tracker> = Arc::from(build_tracker(&cfg.tracker));
+        // Per-camera supervisor (analysis) RGB frame size: matches
+        // the camera's resolved detector input width so we don't
+        // burn CPU upscaling a 1280-trained net's input to a fixed
+        // 960 only to downscale back. See
+        // `nexus_pipeline::supervisor_frame_for`.
+        let det_w = cam
+            .detector
+            .model_override
+            .as_ref()
+            .map(|m| m.input_width)
+            .unwrap_or(cfg.inference.model.input_width);
+        let (sup_w, sup_h) = nexus_pipeline::supervisor_frame_for(det_w);
         let h = spawn_camera(
             cam,
             detector,
@@ -600,12 +613,15 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
             cache.clone(),
             frame_stats.clone(),
             static_clear.clone(),
+            sup_w,
+            sup_h,
         );
         running.lock().insert(
             cam_id,
             reconciler::RunningCameraEntry {
                 task: Arc::new(h.task),
                 url: cam_url,
+                supervisor_dims: (sup_w, sup_h),
             },
         );
     }
@@ -833,6 +849,7 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
         frame_stats: frame_stats.clone(),
         static_clear: static_clear.clone(),
         pre_roll_secs: cfg.runtime.clips.pre_roll_secs,
+        default_detector_width: cfg.inference.model.input_width,
         handles: running.clone(),
     });
 
@@ -1175,6 +1192,7 @@ fn build_recorder(
     store: Arc<nexus_store::Store>,
     clips_dir: &std::path::Path,
     cameras: &[CameraConfig],
+    default_detector_width: u32,
     pre_roll_secs: u32,
     bus: Arc<dyn nexus_bus::Bus>,
     usb_resolver: Arc<dyn nexus_pipeline::recorder::UsbResolver>,
@@ -1190,6 +1208,7 @@ fn build_recorder(
             store,
             clips_dir,
             cameras,
+            default_detector_width,
             pre_roll_secs,
             bus,
             usb_resolver,
@@ -1199,10 +1218,12 @@ fn build_recorder(
 }
 
 #[cfg(feature = "gstreamer")]
+#[allow(clippy::too_many_arguments)]
 fn build_gst_recorder(
     store: Arc<nexus_store::Store>,
     clips_dir: &std::path::Path,
     cameras: &[CameraConfig],
+    default_detector_width: u32,
     pre_roll_secs: u32,
     bus: Arc<dyn nexus_bus::Bus>,
     usb_resolver: Arc<dyn nexus_pipeline::recorder::UsbResolver>,
@@ -1223,17 +1244,32 @@ fn build_gst_recorder(
         if !cam.ingest.enabled {
             continue;
         }
+        // Per-camera supervisor (RGB analysis) frame size, derived
+        // from the camera's resolved detector input width via
+        // `nexus_pipeline::supervisor_frame_for`. Matches what the
+        // engine spawn site will pass to `spawn_camera`.
+        let det_w = cam
+            .detector
+            .model_override
+            .as_ref()
+            .map(|m| m.input_width)
+            .unwrap_or(default_detector_width);
+        let (rgb_w, rgb_h) = nexus_pipeline::supervisor_frame_for(det_w);
         match nexus_pipeline::PreRollIngester::new_with_rgb(
             cam.id,
             cam.ingest.url.to_string(),
             pre_roll_secs,
             cam.ingest.max_fps,
+            rgb_w,
+            rgb_h,
         ) {
             Ok(ing) => {
                 tracing::info!(
                     camera_id = cam.id,
                     pre_roll_secs,
                     max_fps = cam.ingest.max_fps,
+                    rgb_w,
+                    rgb_h,
                     "pre-roll ingester started (with shared rgb tap)"
                 );
                 ingesters.insert(cam.id, ing);
@@ -1255,10 +1291,12 @@ fn build_gst_recorder(
 }
 
 #[cfg(not(feature = "gstreamer"))]
+#[allow(clippy::too_many_arguments)]
 fn build_gst_recorder(
     store: Arc<nexus_store::Store>,
     clips_dir: &std::path::Path,
     _cameras: &[CameraConfig],
+    _default_detector_width: u32,
     _pre_roll_secs: u32,
     bus: Arc<dyn nexus_bus::Bus>,
     usb_resolver: Arc<dyn nexus_pipeline::recorder::UsbResolver>,

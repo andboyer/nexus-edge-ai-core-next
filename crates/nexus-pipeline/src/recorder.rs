@@ -52,6 +52,17 @@ pub const MAX_CLIP_DURATION_MS: i64 = 5 * 60 * 1_000;
 pub struct OpenClip {
     pub camera_id: CameraId,
     pub started_at: DateTime<Utc>,
+    /// Per-camera supervisor (analysis) RGB frame width in
+    /// effect when the clip was opened. Recorded onto the
+    /// `motion_clips` row so the `/api/v1/clips/:id/tracks`
+    /// overlay can scale `motion_events` bboxes (which live in
+    /// supervisor-frame coords) against the right denominator,
+    /// even after the operator later changes the camera's
+    /// detector input size. See
+    /// [`crate::source::supervisor_frame_for`].
+    pub frame_width: u32,
+    /// Companion to [`Self::frame_width`].
+    pub frame_height: u32,
 }
 
 /// Hand the closed handle back to the recorder so it can finalise the
@@ -149,6 +160,15 @@ pub trait ClipRecorder: Send + Sync {
     /// rate the old standalone `RtspSource` would have produced;
     /// other recorders ignore it.
     ///
+    /// `rgb_w` / `rgb_h` are the per-camera supervisor-frame
+    /// resolution the shared RGB tap should publish (derived from
+    /// the camera's resolved detector input size via
+    /// [`crate::source::supervisor_frame_for`] at the engine spawn
+    /// site). The GStreamer recorder threads them into the
+    /// pre-roll ingester's RGB tap pipeline string so the
+    /// detector receives frames at exactly its model's input
+    /// width with no extra resize; other recorders ignore.
+    ///
     /// Default impl is a no-op so the stub recorder (and any future
     /// non-pre-roll backend) doesn't have to opt in. The GStreamer
     /// recorder overrides it; failure to build the ingester is
@@ -161,6 +181,8 @@ pub trait ClipRecorder: Send + Sync {
         url: &str,
         pre_roll_secs: u32,
         max_fps: u32,
+        rgb_w: u32,
+        rgb_h: u32,
     ) -> Result<(), RecorderError> {
         Ok(())
     }
@@ -512,6 +534,8 @@ impl ClipRecorder for StubClipRecorder {
             codec: "stub".into(),
             container: "mp4".into(),
             hot_handle: hot_handle.clone(),
+            frame_width: args.frame_width,
+            frame_height: args.frame_height,
         };
         let clip_id = self.store.open_clip(&new).await?;
 
@@ -753,6 +777,8 @@ mod tests {
             .open(OpenClip {
                 camera_id: 1,
                 started_at: started,
+                frame_width: 960,
+                frame_height: 540,
             })
             .await
             .unwrap();
@@ -822,6 +848,8 @@ mod tests {
             .open(OpenClip {
                 camera_id: 1,
                 started_at: started,
+                frame_width: 960,
+                frame_height: 540,
             })
             .await
             .unwrap();
@@ -833,6 +861,8 @@ mod tests {
             .open(OpenClip {
                 camera_id: 1,
                 started_at: started + chrono::Duration::seconds(1),
+                frame_width: 960,
+                frame_height: 540,
             })
             .await;
         assert!(matches!(refused, Err(RecorderError::Refused)));
@@ -858,6 +888,8 @@ mod tests {
             .open(OpenClip {
                 camera_id: 1,
                 started_at: started + chrono::Duration::seconds(6),
+                frame_width: 960,
+                frame_height: 540,
             })
             .await
             .unwrap();
@@ -876,6 +908,8 @@ mod tests {
             .open(OpenClip {
                 camera_id: 1,
                 started_at: started,
+                frame_width: 960,
+                frame_height: 540,
             })
             .await
             .unwrap();
@@ -1049,6 +1083,8 @@ mod tests {
             .open(OpenClip {
                 camera_id: 1,
                 started_at: t1,
+                frame_width: 960,
+                frame_height: 540,
             })
             .await
             .unwrap();
@@ -1073,6 +1109,8 @@ mod tests {
             .open(OpenClip {
                 camera_id: 1,
                 started_at: t2,
+                frame_width: 960,
+                frame_height: 540,
             })
             .await
             .unwrap();
@@ -1118,6 +1156,8 @@ mod tests {
             .open(OpenClip {
                 camera_id: 1,
                 started_at: t3,
+                frame_width: 960,
+                frame_height: 540,
             })
             .await
             .unwrap();

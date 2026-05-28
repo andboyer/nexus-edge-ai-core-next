@@ -2959,8 +2959,8 @@ async fn get_clip_tracks(
             ended_at: clip.ended_at,
             duration_ms: clip.duration_ms,
         },
-        source_width: nexus_pipeline::RTSP_SOURCE_FRAME_WIDTH,
-        source_height: nexus_pipeline::RTSP_SOURCE_FRAME_HEIGHT,
+        source_width: clip.frame_width,
+        source_height: clip.frame_height,
         trigger_track_ids,
         events,
     }))
@@ -4982,6 +4982,8 @@ mod tests {
                 codec: "h264".into(),
                 container: "mp4".into(),
                 hot_handle: "local".into(),
+                frame_width: 960,
+                frame_height: 540,
             })
             .await
             .unwrap();
@@ -5249,6 +5251,8 @@ mod tests {
                 codec: "h264".into(),
                 container: "mp4".into(),
                 hot_handle: "local".into(),
+                frame_width: 960,
+                frame_height: 540,
             })
             .await
             .unwrap();

@@ -70,6 +70,8 @@ fn sample_clip(camera_id: i64, started: chrono::DateTime<Utc>) -> NewClip {
         codec: "h264".into(),
         container: "mp4".into(),
         hot_handle: "local".into(),
+        frame_width: 960,
+        frame_height: 540,
     }
 }
 
@@ -643,6 +645,7 @@ async fn schema_migrations_table_records_apply_order() {
             "0014_storage_backends_azure_blob".to_string(),
             "0015_motion_clips_priority".to_string(),
             "0016_cloud_enrollment_attach_replay".to_string(),
+            "0017_motion_clips_frame_size".to_string(),
         ]
     );
 }

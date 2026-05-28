@@ -71,6 +71,8 @@ async fn insert_pending_clip(store: &Store, camera_id: i64, started: chrono::Dat
             codec: "h264".into(),
             container: "mp4".into(),
             hot_handle: "local".into(),
+            frame_width: 960,
+            frame_height: 540,
         })
         .await
         .unwrap();

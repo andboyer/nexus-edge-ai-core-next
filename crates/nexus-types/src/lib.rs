@@ -398,8 +398,11 @@ pub enum PipelineState {
 // the on-disk shape of `<state_dir>/static_objects/cam-<id>.json` (see
 // `nexus-tracker::static_object::StaticAnchor`) so the wire payload and
 // the persisted file share a single JSON-field convention. Centroid is
-// in the detector frame (typically 960x540 — same coordinate system as
-// `TrackedObject.bbox`), so the UI overlay can use the same transform.
+// in the per-camera supervisor frame (16:9 derived from the camera's
+// detector input size — 640→640×360, 960→960×540, 1280→1280×720), same
+// coordinate system as `TrackedObject.bbox`; the UI gets the actual
+// dims from per-clip `source_width`/`source_height` on the tracks API
+// so the same transform applies to overlays.
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(

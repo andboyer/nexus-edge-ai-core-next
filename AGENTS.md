@@ -114,11 +114,14 @@ The wedge plan that drives the next three phases of work is
   (`ep-cpu`, `ep-coreml`, `ep-cuda`, `ep-openvino`, `ep-tensorrt`), WebRTC
   (`gstreamer-webrtc`), test injection (`test-injection`). NEVER add a feature gate via
   `cfg(debug_assertions)` for anything testing-related — use an explicit Cargo feature.
-- **Frame contract is fixed:** 960×540 RGB at the supervisor frame (see
-  `RTSP_SOURCE_FRAME_WIDTH/HEIGHT` constants in [crates/nexus-pipeline/src/source.rs](crates/nexus-pipeline/src/source.rs)).
-  All detector/tracker/re-ID inputs share this resolution. Clip recording is a separate
-  passthrough chain at native camera resolution; bbox coordinates need scaling when
-  overlaying on the MP4.
+- **Frame contract is per-camera:** the supervisor (analysis) frame is RGB,
+  16:9, derived from the resolved detector input width (640→640×360, 960→960×540,
+  1280→1280×720). See `supervisor_frame_for(detector_width)` in
+  [crates/nexus-pipeline/src/source.rs](crates/nexus-pipeline/src/source.rs).
+  Detector / tracker / re-ID all share one camera's resolution. Clip recording is
+  a separate passthrough chain at native camera resolution; bbox coords need
+  scaling when overlaying on the MP4 — read per-clip `frame_width`/`frame_height`
+  off the tracks API rather than hardcoding any value.
 - **UI is `ui/` (Vite + TS + vanilla `h()` helper).** Per-tab modules live in
   `ui/src/ui/`; new tabs register in `ui/src/main.ts` `TABS` array. Forbidden:
   `style: "string"` props (use object); arbitrary DOM-property assignment for getter-only
@@ -148,4 +151,4 @@ The wedge plan that drives the next three phases of work is
 - Persisting personal identifiers in the local SQLite store outside the M6 operator
   labels table.
 - Bypassing the GStreamer pipeline contract (e.g. introducing a parallel frame source
-  that doesn't share the 960×540 supervisor frame).
+  that doesn't honour the per-camera supervisor frame).

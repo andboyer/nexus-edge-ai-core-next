@@ -12,16 +12,51 @@ use thiserror::Error;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-/// Width of the RGB frame the `RtspSource` produces after
-/// `videoscale`. Every downstream consumer (detector, tracker,
-/// motion_events bbox, frame cache, JPEG endpoint) sees pixels in
-/// this coordinate space. The bbox values written into
-/// `motion_events` are in this same space, so the clip-overlay UI
-/// must scale them against `<video>.videoWidth` (which is the
-/// CAMERA's native H.264 resolution, NOT this).
+/// Legacy default width of the RGB frame the `RtspSource`
+/// produces after `videoscale` when no per-camera detector size is
+/// available. As of the per-camera supervisor-frame work, the
+/// active dims are passed in on `RtspSource::frame_width /
+/// frame_height` (and on `PreRollIngester::new_with_rgb`'s
+/// `rgb_w / rgb_h`), derived from the camera's resolved
+/// `ModelConfig.input_width`. Every downstream consumer (detector,
+/// tracker, motion_events bbox, frame cache, JPEG endpoint) sees
+/// pixels in whatever coordinate space the camera is currently
+/// running in. The bbox values written into `motion_events` are
+/// in that same space — the clip's `frame_width / frame_height`
+/// columns record which space, so the overlay UI scales bboxes
+/// against `(<video>.videoWidth, .videoHeight)` (the CAMERA's
+/// native H.264 resolution, NOT this).
 pub const RTSP_SOURCE_FRAME_WIDTH: u32 = 960;
 /// See [`RTSP_SOURCE_FRAME_WIDTH`].
 pub const RTSP_SOURCE_FRAME_HEIGHT: u32 = 540;
+
+/// Compute the supervisor (analysis) RGB frame size for a camera
+/// whose detector takes `detector_width` square inputs.
+///
+/// Returns a 16:9 frame whose width equals the detector size and
+/// whose height is `detector_width * 9 / 16` rounded up to an even
+/// integer (videoscale's caps negotiation prefers even dims; YUV
+/// chroma planes can't represent odd dimensions cleanly).
+///
+/// Examples:
+///   * `supervisor_frame_for(640)`  -> `(640,  360)`
+///   * `supervisor_frame_for(960)`  -> `(960,  540)`
+///   * `supervisor_frame_for(1280)` -> `(1280, 720)`
+///
+/// Rationale: cameras universally publish 16:9 streams (1080p,
+/// 720p, 4K all 16:9). videoscale will letterbox non-16:9 sources
+/// to fit; a square supervisor frame would waste ~33% of
+/// per-frame bandwidth on black bars AND distort the operator's
+/// live view aspect. Matching detector width to supervisor width
+/// also eliminates the upscale step inside `from_config` when a
+/// T36-S camera runs the 1280 model against the old hardcoded
+/// 960 supervisor frame.
+pub const fn supervisor_frame_for(detector_width: u32) -> (u32, u32) {
+    // (w * 9 / 16) rounded up to the next even integer.
+    let h_raw = detector_width * 9 / 16;
+    let h = (h_raw + 1) & !1;
+    (detector_width, h)
+}
 
 /// Hard ceiling on the gap between consecutive frames before a
 /// live RTSP session is considered stalled and the supervisor
@@ -164,6 +199,16 @@ pub struct RtspSource {
     pub camera_id: CameraId,
     pub url: String,
     pub max_fps: u32,
+    /// RGB frame width the videoscale element produces. Derived
+    /// at spawn time from the camera's resolved detector input
+    /// size via [`supervisor_frame_for`]; the supervisor passes
+    /// it down through `build_source`. Was hardcoded to
+    /// [`RTSP_SOURCE_FRAME_WIDTH`] (960) before the per-camera
+    /// work; callers without per-camera context can still pass
+    /// the constant.
+    pub frame_width: u32,
+    /// Companion to [`Self::frame_width`].
+    pub frame_height: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -322,8 +367,8 @@ impl RtspSource {
              ! videoconvert ! videoscale ! videorate \
              ! video/x-raw,format=RGB,width={w},height={h},framerate={fr}/1 \
              ! appsink name=sink emit-signals=false sync=false drop=true max-buffers=4",
-            w = RTSP_SOURCE_FRAME_WIDTH,
-            h = RTSP_SOURCE_FRAME_HEIGHT,
+            w = self.frame_width,
+            h = self.frame_height,
         );
 
         let pipeline = gst::parse::launch(&desc)

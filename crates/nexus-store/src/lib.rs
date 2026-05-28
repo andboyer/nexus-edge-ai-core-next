@@ -116,6 +116,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0016_cloud_enrollment_attach_replay",
         include_str!("../migrations/0016_cloud_enrollment_attach_replay.sql"),
     ),
+    (
+        "0017_motion_clips_frame_size",
+        include_str!("../migrations/0017_motion_clips_frame_size.sql"),
+    ),
 ];
 
 #[derive(Debug, Error)]

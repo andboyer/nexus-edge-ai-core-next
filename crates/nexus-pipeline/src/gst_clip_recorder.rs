@@ -477,6 +477,8 @@ impl ClipRecorder for GstClipRecorder {
             // tier resolution above. Cold pointer is left null for
             // the replicator to fill in after the close-time hash.
             hot_handle: hot_handle.clone(),
+            frame_width: args.frame_width,
+            frame_height: args.frame_height,
         };
         let clip_id = match self.store.open_clip(&new).await {
             Ok(id) => id,
@@ -785,6 +787,8 @@ impl ClipRecorder for GstClipRecorder {
         url: &str,
         pre_roll_secs: u32,
         max_fps: u32,
+        rgb_w: u32,
+        rgb_h: u32,
     ) -> Result<(), RecorderError> {
         // Idempotent + URL-aware: if we already have an ingester for
         // this camera with the same URL, do nothing. If the URL
@@ -809,7 +813,7 @@ impl ClipRecorder for GstClipRecorder {
         // RTSP session — required for cameras whose firmware caps
         // concurrent sessions at 1 per stream path (InSight et al).
         let new_ing =
-            PreRollIngester::new_with_rgb(camera_id, url.to_string(), pre_roll_secs, max_fps)
+            PreRollIngester::new_with_rgb(camera_id, url.to_string(), pre_roll_secs, max_fps, rgb_w, rgb_h)
                 .map_err(|e| RecorderError::Io(std::io::Error::other(format!("ingester: {e}"))))?;
         // Insert under the exclusive lock; dropping the previous
         // `Arc<PreRollIngester>` here triggers its supervisor
@@ -1049,6 +1053,7 @@ const FALLBACK_FRAME_INTERVAL_NS: u64 = 33_333_333;
 /// the 200 ms flush timer fires without a new arrival (flush
 /// `pending` so a stalled stream doesn't strand the last AU). See
 /// the module docstring + [`coalesce_same_pts`] for the pathology.
+#[allow(clippy::too_many_arguments)]
 async fn run_live_pump(
     camera_id: CameraId,
     clip_id: ClipId,
@@ -1321,6 +1326,8 @@ mod tests {
             .open(OpenClip {
                 camera_id: 1,
                 started_at: Utc::now(),
+                frame_width: 960,
+                frame_height: 540,
             })
             .await;
         assert!(matches!(res, Err(RecorderError::Refused)));
@@ -1335,6 +1342,8 @@ mod tests {
             .open(OpenClip {
                 camera_id: 1,
                 started_at: Utc::now(),
+                frame_width: 960,
+                frame_height: 540,
             })
             .await;
         assert!(matches!(res, Err(RecorderError::Refused)));
@@ -1398,6 +1407,8 @@ mod tests {
             .open(OpenClip {
                 camera_id: 1,
                 started_at,
+                frame_width: 960,
+                frame_height: 540,
             })
             .await
             .expect("open() should succeed against a reachable camera");

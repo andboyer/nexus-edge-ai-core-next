@@ -807,6 +807,8 @@ mod tests {
                 codec: "stub".into(),
                 container: "mp4".into(),
                 hot_handle: "local".into(),
+                frame_width: 960,
+                frame_height: 540,
             })
             .await
             .unwrap();
@@ -818,6 +820,8 @@ mod tests {
                 codec: "stub".into(),
                 container: "mp4".into(),
                 hot_handle: "local".into(),
+                frame_width: 960,
+                frame_height: 540,
             })
             .await
             .unwrap();
@@ -968,6 +972,8 @@ mod tests {
                         codec: "stub".into(),
                         container: "mp4".into(),
                         hot_handle: "local".into(),
+                        frame_width: 960,
+                        frame_height: 540,
                     })
                     .await
                     .unwrap();
@@ -1367,6 +1373,8 @@ mod tests {
                     codec: "stub".into(),
                     container: "mp4".into(),
                     hot_handle: "local".into(),
+                    frame_width: 960,
+                    frame_height: 540,
                 })
                 .await
                 .unwrap();

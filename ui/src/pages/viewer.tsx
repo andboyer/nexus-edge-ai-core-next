@@ -5,10 +5,11 @@
 // `<img>`. Click a tile to expand to a fullscreen modal.
 //
 // Coordinate systems:
-//   - Detector frame is locked at 960x540 (RTSP_SOURCE_FRAME_{WIDTH,HEIGHT})
-//     so every bbox in `latest.json` is in those units.
+//   - Supervisor (detector) frame is per-camera, 16:9 derived from the
+//     camera's resolved detector input width (640→640×360, 960→960×540,
+//     1280→1280×720). Every bbox in `latest.json` is in those units.
 //   - `FrameMetadata.width` / `.height` carry the actual source dims for
-//     a given snapshot, so we scale through them rather than assuming.
+//     a given snapshot — always trust these, never hardcode 960×540.
 //   - Zone polygons are normalised [0..1] — multiply by canvas dims.
 //
 // Network: snapshot URL is cache-busted via `?t=` so the browser doesn't
@@ -365,7 +366,9 @@ function FrameOverlay({
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       ctx.clearRect(0, 0, rect.width, rect.height);
 
-      // Source frame dims default to 960x540 (the detector frame size).
+      // Source frame dims come from FrameMetadata (per-camera supervisor
+      // frame); 960×540 is just the legacy default for cameras whose
+      // detector input width is unset or hasn't been resolved yet.
       const sw = meta?.width ?? 960;
       const sh = meta?.height ?? 540;
 
