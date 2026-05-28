@@ -44,9 +44,9 @@ ep_priority = ["openvino", "cpu"]   # Arc A380 = OpenVINO dGPU; same EP, differe
 [inference.model]
 kind = "yolo"
 pack_path = "/usr/share/nexus/models"  # baked into the Docker image; override to /var/lib/nexus/models for custom packs
-preset = "640"
-input_width = 640
-input_height = 640
+preset = "960"                  # T36 = 960. Arc A380's 6 GB VRAM comfortably runs two FP16 sessions at 960; operators can bump per-camera to 1280 for plate/face work.
+input_width = 960
+input_height = 960
 score_threshold = 0.30
 
 [tracker]

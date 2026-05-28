@@ -148,7 +148,7 @@ fail_soft = true
 ep_priority = ["openvino", "cpu"]
 
 [inference.model]
-# yolo (default, closed-vocab yolo26n_dynamic.onnx) | open_vocab | classifier_ensemble | mock
+# yolo (default, closed-vocab; ships per-size: yolo26n_640.onnx / _960.onnx / _1280.onnx) | open_vocab | classifier_ensemble | mock
 kind = "yolo"
 # Pack preset — "320" / "640" / "1280" from models-manifest.json.
 #   T10 → 320 (lowest latency)

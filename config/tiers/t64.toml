@@ -46,7 +46,7 @@ ep_priority = ["tensorrt", "cuda", "cpu"]
 [inference.model]
 kind = "yolo"
 pack_path = "/usr/share/nexus/models"  # baked into the Docker image; override to /var/lib/nexus/models for custom packs
-preset = "640"
+preset = "640"                  # T64 default = 640 to keep the three-worker pool fitting in 8 GB VRAM. Operators with high-detail use cases (plate / face / small object) can override to 1280 per-camera via the UI — the model registry ships yolo26n_1280.onnx for exactly this.
 input_width = 640
 input_height = 640
 score_threshold = 0.30

@@ -44,7 +44,7 @@ ep_priority = ["openvino", "cpu"]
 [inference.model]
 kind = "yolo"
 pack_path = "/usr/share/nexus/models"  # baked into the Docker image; override to /var/lib/nexus/models for custom packs
-preset = "640"                  # default operating point per models-manifest.json
+preset = "640"                  # T24 = 640 (default per models-manifest.json). Iris Xe iGPU has room for 960 on a single camera if needed — override per-camera in the UI.
 input_width = 640
 input_height = 640
 score_threshold = 0.30

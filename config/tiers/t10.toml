@@ -42,11 +42,11 @@ fail_soft = true
 ep_priority = ["openvino", "cpu"]
 
 [inference.model]
-kind = "yolo"                   # closed-vocab (yolo26n_dynamic.onnx)
+kind = "yolo"                   # closed-vocab (ships per-size: yolo26n_640.onnx)
 pack_path = "/usr/share/nexus/models"  # baked into the Docker image; override to /var/lib/nexus/models for custom packs
-preset = "320"                  # T10 picks the lowest-latency model-pack preset
-input_width = 320
-input_height = 320
+preset = "640"                  # T10 = 640. Even on the N150 with UHD 24EU iGPU the 640 model fits the 15 fps budget; per-camera operators can drop to a smaller experimental size only via UI override.
+input_width = 640
+input_height = 640
 score_threshold = 0.30
 
 [tracker]

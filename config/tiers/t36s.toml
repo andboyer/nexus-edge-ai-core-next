@@ -59,9 +59,9 @@ ep_priority = ["npu", "cpu"]
 [inference.model]
 kind = "yolo"
 pack_path = "/usr/share/nexus/models"  # baked into the Docker image; override to /var/lib/nexus/models for custom packs
-preset = "640"
-input_width = 640
-input_height = 640
+preset = "960"                  # T36-S = 960. Lunar Lake NPU 4 likes the larger static-shape model: more parallelism per inference, and the NPU compiler can cache the compiled blob across boots (only possible with static shapes — yolo26n_960.onnx is one of three static-shape exports we ship; the dynamic-shape variant is no longer in the release).
+input_width = 960
+input_height = 960
 score_threshold = 0.30
 
 [tracker]
