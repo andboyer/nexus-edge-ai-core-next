@@ -97,7 +97,7 @@ jobs:
     permissions:
       contents: write   # required to `gh release upload`
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
 
@@ -185,7 +185,11 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: tarball-${{ env.FEATURES }}
+          # shared-key MUST NOT contain commas (Swatinem/rust-cache@v2
+          # rejects them via checkKey). Use a stable hand-picked label
+          # instead of interpolating ${{ env.FEATURES }} which is the
+          # comma-separated feature list.
+          shared-key: tarball-all-eps
 
       - name: cargo build (release, all EPs)
         env:
@@ -197,7 +201,7 @@ jobs:
             --bin nexus-engine --bin nexus-doctor
           cargo build --release -p nexus-probe --bin nexus-probe
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with: { node-version: "22" }
 
       - name: build UI
