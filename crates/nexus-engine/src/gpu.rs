@@ -387,9 +387,7 @@ mod intel {
                 // always returns 8 bytes (single u64 counter)
                 // when `read_format == 0` (our default). EINTR
                 // isn't possible on a non-blocking sample read.
-                let n = unsafe {
-                    libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len())
-                };
+                let n = unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
                 if n != buf.len() as isize {
                     return None;
                 }
@@ -410,9 +408,7 @@ mod intel {
                             .map(|(c, p)| c.saturating_sub(*p))
                             .sum();
                         let n_engines = values.len() as u64;
-                        let pct = (busy_ns as f64
-                            / (n_engines as f64 * elapsed_ns as f64))
-                            * 100.0;
+                        let pct = (busy_ns as f64 / (n_engines as f64 * elapsed_ns as f64)) * 100.0;
                         Some((pct.clamp(0.0, 100.0)) as f32)
                     }
                 }
@@ -465,8 +461,7 @@ mod intel {
         // `exclude_*`, ...) default to 0 which matches the
         // "start enabled, count kernel + hv" mode we want for
         // an uncore PMU counter.
-        let mut attr: pes::bindings::perf_event_attr =
-            unsafe { std::mem::zeroed() };
+        let mut attr: pes::bindings::perf_event_attr = unsafe { std::mem::zeroed() };
         attr.size = std::mem::size_of::<pes::bindings::perf_event_attr>() as u32;
         attr.type_ = type_id;
         attr.config = config;
