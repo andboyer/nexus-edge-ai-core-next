@@ -22,11 +22,28 @@
 //! * **Unknown EP names** are dropped with a `warn!` log so operators
 //!   can see typos in their config without the engine refusing to
 //!   boot.
-//! * **`"npu"` routes through OpenVINO** with the OpenVINO EP's
-//!   default device-selection behaviour. NPU is not a first-class
-//!   ORT EP today; the OpenVINO runtime picks the device based on
-//!   the `OV_DEVICE` env var (`CPU`, `GPU`, `NPU`, `AUTO`). The T36-S
-//!   config sets `OV_DEVICE=NPU` via the per-tier compose overlay.
+//! * **`"npu"` and `"gpu"` route through OpenVINO** with an
+//!   explicit `device_type` set on the EP builder (`"NPU"` and
+//!   `"GPU"` respectively). NPU/GPU are not first-class ORT EPs
+//!   today; the OpenVINO EP is the dispatcher. If the model fails
+//!   to compile for the requested device (e.g. an unsupported op
+//!   on NPU), ORT silently falls through to the next EP in the
+//!   priority list — log `session.providers()` after commit to
+//!   see what actually attached.
+//! * **`"openvino"` is the operator-tunable entry**: it honours
+//!   `OV_DEVICE` (`CPU`, `GPU`, `NPU`, `AUTO`, `HETERO:NPU,GPU,CPU`,
+//!   …) and defaults to `"AUTO"` when unset, which lets OpenVINO
+//!   pick the best available device for the loaded model. Prefer
+//!   the explicit `"npu"` / `"gpu"` entries when you specifically
+//!   want that device — they're self-documenting in `nexus.toml`.
+//!
+//! Historical: before this commit, both `"npu"` and `"openvino"`
+//! built `OpenVINOExecutionProvider::default()`, whose default
+//! `device_type` is `"CPU"` (per the OpenVINO ONNX RT provider
+//! summary table) — so the OpenVINO EP attached successfully BUT
+//! every inference ran on the CPU plugin, and `/sys/class/accel/
+//! accel0/device/npu_busy_time_us` stayed at zero. The fix is to
+//! pass `device_type` explicitly.
 //!
 //! Logging
 //! -------
@@ -159,8 +176,13 @@ fn selected_for_priority_inner(
             "openvino" => {
                 if openvino_available {
                     use ort::execution_providers::OpenVINOExecutionProvider;
-                    dispatchers.push(OpenVINOExecutionProvider::default().build());
-                    names.push("openvino".into());
+                    let device = std::env::var("OV_DEVICE").unwrap_or_else(|_| "AUTO".into());
+                    dispatchers.push(
+                        OpenVINOExecutionProvider::default()
+                            .with_device_type(&device)
+                            .build(),
+                    );
+                    names.push(format!("openvino({device})"));
                 } else {
                     warn_openvino_unavailable_once();
                 }
@@ -219,15 +241,19 @@ fn selected_for_priority_inner(
                  --features ep-directml; skipping"
             ),
 
-            // NPU routes through OpenVINO; the operator picks the
-            // actual device via the `OV_DEVICE` env var (`CPU` /
-            // `GPU` / `NPU` / `AUTO`) — the per-tier compose overlay
-            // for T36-S sets `OV_DEVICE=NPU`.
+            // NPU routes through OpenVINO with device_type=NPU. ORT
+            // silently falls through to the next EP if NPU compile
+            // fails (e.g. unsupported op for this model), so always
+            // keep `cpu` as the final fallback.
             #[cfg(feature = "ep-openvino")]
             "npu" => {
                 if openvino_available {
                     use ort::execution_providers::OpenVINOExecutionProvider;
-                    dispatchers.push(OpenVINOExecutionProvider::default().build());
+                    dispatchers.push(
+                        OpenVINOExecutionProvider::default()
+                            .with_device_type("NPU")
+                            .build(),
+                    );
                     names.push("npu(via-openvino)".into());
                 } else {
                     warn_openvino_unavailable_once();
@@ -237,6 +263,30 @@ fn selected_for_priority_inner(
             "npu" => warn!(
                 "ep_priority requested 'npu' but the binary was built without \
                  --features ep-openvino (NPU routes through OpenVINO); skipping"
+            ),
+
+            // Intel iGPU/dGPU via OpenVINO with device_type=GPU.
+            // Symmetric with the `npu` entry above — self-documenting
+            // in nexus.toml. Use `openvino` + `OV_DEVICE=GPU.1` for
+            // multi-GPU selection.
+            #[cfg(feature = "ep-openvino")]
+            "gpu" => {
+                if openvino_available {
+                    use ort::execution_providers::OpenVINOExecutionProvider;
+                    dispatchers.push(
+                        OpenVINOExecutionProvider::default()
+                            .with_device_type("GPU")
+                            .build(),
+                    );
+                    names.push("gpu(via-openvino)".into());
+                } else {
+                    warn_openvino_unavailable_once();
+                }
+            }
+            #[cfg(not(feature = "ep-openvino"))]
+            "gpu" => warn!(
+                "ep_priority requested 'gpu' but the binary was built without \
+                 --features ep-openvino (Intel GPU routes through OpenVINO); skipping"
             ),
 
             other => warn!(ep = %other, "unknown EP name in ep_priority; ignoring"),
@@ -316,8 +366,29 @@ mod tests {
     #[test]
     fn openvino_then_cpu_when_feature_on() {
         // Force the device-present branch so the test is host-independent.
+        // `openvino` entry honours OV_DEVICE env or defaults to AUTO; the
+        // displayed name reflects whichever was picked so operators can
+        // see at a glance what's in effect.
+        let prev = std::env::var("OV_DEVICE").ok();
+        std::env::remove_var("OV_DEVICE");
         let (_, names) = selected_for_priority_inner(&["openvino".into(), "cpu".into()], true);
-        assert_eq!(names, vec!["openvino", "cpu"]);
+        if let Some(p) = prev {
+            std::env::set_var("OV_DEVICE", p);
+        }
+        assert_eq!(names, vec!["openvino(AUTO)", "cpu"]);
+    }
+
+    #[cfg(feature = "ep-openvino")]
+    #[test]
+    fn openvino_honors_ov_device_env() {
+        let prev = std::env::var("OV_DEVICE").ok();
+        std::env::set_var("OV_DEVICE", "GPU");
+        let (_, names) = selected_for_priority_inner(&["openvino".into()], true);
+        match prev {
+            Some(p) => std::env::set_var("OV_DEVICE", p),
+            None => std::env::remove_var("OV_DEVICE"),
+        }
+        assert_eq!(names, vec!["openvino(GPU)", "cpu(fallback)"]);
     }
 
     #[cfg(feature = "ep-openvino")]
@@ -325,6 +396,13 @@ mod tests {
     fn npu_routes_through_openvino() {
         let (_, names) = selected_for_priority_inner(&["npu".into()], true);
         assert_eq!(names, vec!["npu(via-openvino)", "cpu(fallback)"]);
+    }
+
+    #[cfg(feature = "ep-openvino")]
+    #[test]
+    fn gpu_routes_through_openvino() {
+        let (_, names) = selected_for_priority_inner(&["gpu".into()], true);
+        assert_eq!(names, vec!["gpu(via-openvino)", "cpu(fallback)"]);
     }
 
     /// v0.1.5 regression: when no Intel iGPU/NPU device node is reachable,
@@ -346,6 +424,14 @@ mod tests {
     fn npu_dropped_when_device_absent() {
         let (eps, names) = selected_for_priority_inner(&["npu".into()], false);
         // npu → openvino dropped, CPU appended as fallback.
+        assert_eq!(eps.len(), 1);
+        assert_eq!(names, vec!["cpu(fallback)"]);
+    }
+
+    #[cfg(feature = "ep-openvino")]
+    #[test]
+    fn gpu_dropped_when_device_absent() {
+        let (eps, names) = selected_for_priority_inner(&["gpu".into()], false);
         assert_eq!(eps.len(), 1);
         assert_eq!(names, vec!["cpu(fallback)"]);
     }
