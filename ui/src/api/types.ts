@@ -31,6 +31,11 @@ export interface AuthInfo {
   allows_local: boolean;
   allows_oidc: boolean;
   oidc_display_name?: string | null;
+  /// True iff the engine has no admin user yet AND mode allows
+  /// local users. The login page renders a "Set up the initial
+  /// admin password" form instead of the normal sign-in form
+  /// when this is true. See `POST /v1/auth/first-run-setup`.
+  first_run_pending?: boolean;
 }
 
 export interface AuthUser {

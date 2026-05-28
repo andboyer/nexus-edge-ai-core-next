@@ -129,6 +129,25 @@ pub struct ChangePasswordRequest {
     pub new_password: String,
 }
 
+/// Body of `POST /api/v1/auth/first-run-setup`. The endpoint is
+/// unauthenticated — the operator can't authenticate yet
+/// because no admin exists. Race protection is server-side
+/// (any 2nd hit after the row is written returns 409). The UI
+/// presents this form only when `GET /auth/info` reports
+/// `first_run_pending: true`.
+#[derive(Debug, Deserialize)]
+pub struct FirstRunSetupRequest {
+    /// Username for the initial admin account. Defaults to
+    /// `"admin"` if absent or blank so the operator can just
+    /// type a password and submit.
+    #[serde(default)]
+    pub username: Option<String>,
+    /// Plaintext password. Goes through the same
+    /// argon2id + min-length + denylist gate as
+    /// `change-password`.
+    pub password: String,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct TokenResponse {
     pub access_token: String,
@@ -174,6 +193,19 @@ pub enum AuthApiError {
     /// Operator must configure a secret first.
     #[error("auth_not_configured")]
     AuthNotConfigured,
+    /// HTTP 409. First-run-setup called after the `users`
+    /// table is already populated (either a real prior install
+    /// or a TOCTOU loser racing another setup request). The UI
+    /// reacts by re-fetching `/auth/info` and routing to the
+    /// normal login form.
+    #[error("first_run_already_complete")]
+    FirstRunAlreadyComplete,
+    /// HTTP 403. First-run-setup called against an engine whose
+    /// `auth.mode` doesn't allow local users (e.g. pure OIDC).
+    /// The UI should never present the form in this case — we
+    /// reject defensively because the endpoint is unauth.
+    #[error("first_run_mode_disallowed")]
+    FirstRunModeDisallowed,
     /// HTTP 500. Argon2 hash failure (almost certainly OOM
     /// under memory pressure — the cost params reserve 19 MiB
     /// per invocation).
@@ -234,6 +266,14 @@ impl IntoResponse for AuthApiError {
             AuthApiError::AuthNotConfigured => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 serde_json::json!({"error": "auth_not_configured"}),
+            ),
+            AuthApiError::FirstRunAlreadyComplete => (
+                StatusCode::CONFLICT,
+                serde_json::json!({"error": "first_run_already_complete"}),
+            ),
+            AuthApiError::FirstRunModeDisallowed => (
+                StatusCode::FORBIDDEN,
+                serde_json::json!({"error": "first_run_mode_disallowed"}),
             ),
             AuthApiError::PasswordHash(_)
             | AuthApiError::SessionInternal(_)
@@ -303,6 +343,12 @@ pub struct LoginState {
     /// operator rotates the generated OTP. See
     /// [`crate::auth::bootstrap::clear_bootstrap_sentinel`].
     pub state_dir: std::path::PathBuf,
+    /// Snapshot of `cfg.auth.mode`. The first-run-setup
+    /// handler ([`post_first_run_setup`]) refuses when
+    /// `!mode.allows_local()` so an OIDC-only deployment
+    /// cannot have an admin silently provisioned via the
+    /// unauth setup endpoint.
+    pub auth_mode: nexus_config::AuthMode,
 }
 
 // ---------------------------------------------------------------------------
@@ -803,6 +849,153 @@ pub async fn post_change_password(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// `POST /api/v1/auth/first-run-setup`
+///
+/// Unauthenticated. Provisions the initial local admin account
+/// the first time the engine boots against an empty database
+/// and immediately signs the operator in (returns the same
+/// [`TokenResponse`] shape as `/auth/login`).
+///
+/// The UI presents this form ONLY when
+/// `GET /auth/info` reports `first_run_pending: true`; the
+/// server also enforces the precondition because the endpoint
+/// is unauth.
+///
+/// Race / replay protection:
+///   * `count_users() > 0` → 409 Conflict.
+///   * `auth.mode` disallows local users → 403 Forbidden.
+///   * `auth.admin_secret_path` not configured → 503 (can't
+///     mint JWTs).
+///   * Insert lost a race with another setup request →
+///     [`UsersError::UsernameTaken`] surfaces as 409.
+///
+/// Any successful call writes one `setup.first_run` audit row
+/// plus one `login.success` audit row tagged with the source IP
+/// so the operator has provenance for who claimed the first
+/// admin account.
+pub async fn post_first_run_setup(
+    State(state): State<LoginState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(body): Json<FirstRunSetupRequest>,
+) -> Result<Response, AuthApiError> {
+    let ip = extract_client_ip(&headers, peer);
+    let ua = extract_user_agent(&headers);
+
+    if !state.auth_mode.allows_local() {
+        tracing::warn!(
+            mode = ?state.auth_mode,
+            ip = %ip,
+            "first-run-setup rejected: mode disallows local users",
+        );
+        return Err(AuthApiError::FirstRunModeDisallowed);
+    }
+
+    let secret = state
+        .admin_auth
+        .admin_secret()
+        .ok_or(AuthApiError::AuthNotConfigured)?
+        .to_string();
+
+    // Precondition check: any pre-existing user (active,
+    // disabled, or tombstoned) means setup has already
+    // happened. count_users() includes tombstones — see the
+    // doc-comment on `Store::count_users` for the rationale.
+    let n = state.store.count_users().await?;
+    if n > 0 {
+        tracing::warn!(
+            user_count = n,
+            ip = %ip,
+            "first-run-setup rejected: users table already populated",
+        );
+        return Err(AuthApiError::FirstRunAlreadyComplete);
+    }
+
+    let username = body
+        .username
+        .as_deref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(crate::auth::bootstrap::BOOTSTRAP_USERNAME)
+        .to_lowercase();
+
+    // Policy + hash. Argon2 is ~100 ms; the policy gate inside
+    // `hash_password` short-circuits before that for too-short
+    // or denylisted passwords.
+    let hash = hash_password(&body.password)?;
+
+    let user_id = match state
+        .store
+        .create_user(&nexus_store::NewUser {
+            username: &username,
+            role: Role::Admin,
+            password_hash: Some(&hash),
+            oidc_subject_hash: None,
+            force_password_reset: false,
+        })
+        .await
+    {
+        Ok(id) => id,
+        // Lost a race with another concurrent setup request —
+        // collapse to the same 409 so the UI's retry logic is
+        // identical to the "populated DB" case.
+        Err(UsersError::UsernameTaken) => {
+            tracing::warn!(
+                ip = %ip,
+                "first-run-setup rejected: lost race to another concurrent setup request",
+            );
+            return Err(AuthApiError::FirstRunAlreadyComplete);
+        }
+        Err(other) => return Err(AuthApiError::Users(other)),
+    };
+
+    // Best-effort: any stale OTP sentinel left over from a
+    // previous install / dev iteration is now obsolete.
+    crate::auth::bootstrap::clear_bootstrap_sentinel(&state.state_dir);
+
+    let now = Utc::now();
+    record_action_audit(
+        &state.store,
+        user_id,
+        &username,
+        "setup.first_run",
+        AuditOutcome::Success,
+        &ip,
+        ua,
+    )
+    .await;
+    state.store.record_login_success(user_id).await?;
+    record_login_success_audit(&state.store, user_id, &username, &ip, ua).await;
+    tracing::warn!(
+        user_id,
+        username = %username,
+        ip = %ip,
+        "FIRST-RUN ADMIN PROVISIONED via UI setup endpoint",
+    );
+
+    let access_token = issue_access_token(
+        user_id,
+        Role::Admin,
+        secret.as_bytes(),
+        now,
+        ACCESS_TOKEN_TTL,
+    )?;
+    let chain_id = Uuid::now_v7().to_string();
+    let (refresh_secret, _row_id) =
+        mint_refresh_row(&state.store, user_id, &chain_id, None, now, &ip, ua).await?;
+
+    Ok(make_token_response(
+        access_token,
+        refresh_secret.expose().to_string(),
+        SessionUser {
+            id: user_id,
+            username,
+            role: Role::Admin,
+            force_password_reset: false,
+        },
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // Bits the FromRef bridge needs on ApiState.
 // ---------------------------------------------------------------------------
@@ -814,6 +1007,7 @@ impl axum::extract::FromRef<crate::api::ApiState> for LoginState {
             admin_auth: input.admin_auth.clone(),
             lockout: input.lockout.clone(),
             state_dir: input.state_dir.clone(),
+            auth_mode: input.auth_mode,
         }
     }
 }
@@ -877,6 +1071,7 @@ mod tests {
             admin_auth,
             lockout,
             state_dir: dir.path().to_path_buf(),
+            auth_mode: nexus_config::AuthMode::Local,
         };
         // Seed an admin user with a known password.
         let phc = hash_password(ADMIN_PW).unwrap();

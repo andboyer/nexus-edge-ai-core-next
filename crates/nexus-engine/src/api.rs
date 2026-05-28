@@ -601,6 +601,18 @@ pub fn router(state: ApiState) -> Router {
             "/v1/auth/change-password",
             axum::routing::post(crate::auth::login::post_change_password),
         )
+        // First-run admin setup. UNAUTHENTICATED by design —
+        // the operator can't authenticate yet because no admin
+        // exists. The handler enforces the precondition
+        // (`users` table empty AND mode allows local) server-
+        // side; any abuse attempt after the initial admin is
+        // provisioned returns 409. The UI presents the setup
+        // form only when `GET /auth/info` reports
+        // `first_run_pending: true`.
+        .route(
+            "/v1/auth/first-run-setup",
+            axum::routing::post(crate::auth::login::post_first_run_setup),
+        )
         // M6 Phase 2 Step 2.9 — public auth-mode probe. The UI
         // hits this on first paint to decide which login form
         // to render (paste-a-dev-token vs. username+password
@@ -729,6 +741,27 @@ async fn health() -> Json<serde_json::Value> {
 /// particular nothing about the OIDC issuer (which would leak
 /// internal IdP topology), no lockout policy, no user counts.
 async fn get_auth_info(State(s): State<ApiState>) -> Json<serde_json::Value> {
+    // `first_run_pending` is the signal the UI's login page
+    // uses to render the "Set up the initial admin password"
+    // form instead of the normal sign-in form. True iff the
+    // engine's `auth.mode` allows local users AND the `users`
+    // table is empty (incl. tombstones). count_users() is a
+    // single indexed `COUNT(*)` so calling it on every
+    // /auth/info request is fine. If the DB is unreachable we
+    // fall back to `false` — the operator will see the
+    // "engine unreachable" banner from the broader error
+    // surface anyway.
+    let first_run_pending = if s.auth_mode.allows_local() {
+        match s.store.count_users().await {
+            Ok(n) => n == 0,
+            Err(e) => {
+                tracing::warn!(error = %e, "get_auth_info: count_users failed; defaulting first_run_pending=false");
+                false
+            }
+        }
+    } else {
+        false
+    };
     Json(serde_json::json!({
         "mode": match s.auth_mode {
             nexus_config::AuthMode::Local => "local",
@@ -744,6 +777,8 @@ async fn get_auth_info(State(s): State<ApiState>) -> Json<serde_json::Value> {
         // misconfigured / unreachable IdP doesn't surface a
         // button that 404s on click.
         "oidc_display_name": s.oidc_display_name,
+        // First-run setup signal — see comment above.
+        "first_run_pending": first_run_pending,
     }))
 }
 

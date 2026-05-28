@@ -304,56 +304,45 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
     cfg.inference.model =
         admin_runtime::resolve_persisted_inference_model(&store, &cfg.inference.model).await;
 
-    // M6 Phase 2 Step 2.7 — first-boot admin bootstrap. Runs
-    // exactly once across the lifetime of the database file;
-    // subsequent boots see `SkippedAlreadyBootstrapped` and
-    // emit no log line. Mode-gated: only fires for `Local` and
-    // `Hybrid`. When it does fire, the one-time password is
-    // surfaced via a single `warn!` line — operators MUST grab
-    // it from the journal and rotate via `/change-password` on
-    // first login. The plaintext is dropped from the engine's
-    // memory immediately after this match.
-    match auth::bootstrap::bootstrap_if_needed(&store, cfg.auth.mode).await {
-        Ok(auth::bootstrap::BootstrapOutcome::AdminCreated {
-            user_id,
-            username,
-            one_time_password,
-        }) => {
-            tracing::warn!(
-                user_id,
-                username = %username,
-                one_time_password = %one_time_password,
-                "FIRST-BOOT ADMIN PROVISIONED — log in once, change password, then redact this log line",
-            );
-            // M-Install Checkpoint 3c — also drop the OTP into
-            // `<state_dir>/bootstrap-password.txt` (mode 0600)
-            // so `install.sh` can `cat` it for the closing
-            // banner without scraping journalctl. The file is
-            // best-effort: a failure here only degrades the
-            // installer's UX, the admin user still exists.
-            match auth::bootstrap::write_bootstrap_sentinel(
-                &cfg.runtime.state_dir,
-                &one_time_password,
-            ) {
-                Ok(path) => tracing::warn!(
-                    sentinel = %path.display(),
-                    "bootstrap-password sentinel written; remove after first password change",
-                ),
-                Err(e) => tracing::warn!(
-                    error = %e,
-                    "could not write bootstrap-password sentinel; capture the WARN above instead",
-                ),
+    // First-boot admin: deferred to the UI's first-run-setup
+    // form. When `auth.mode` permits local users AND the
+    // `users` table is empty, we log a pointer to the UI and
+    // proceed; the operator picks the initial admin password
+    // via `POST /api/v1/auth/first-run-setup`
+    // (see `crate::auth::login::post_first_run_setup`). Any
+    // stale OTP sentinel from an older install (back when the
+    // engine generated and printed a one-time password) is
+    // cleaned up so the installer banner doesn't accidentally
+    // surface a now-dead value.
+    //
+    // Mode-gated: a pure-OIDC deployment has no concept of
+    // first-run-setup — admins materialise on first IdP login.
+    if cfg.auth.mode.allows_local() {
+        match store.count_users().await {
+            Ok(0) => {
+                tracing::info!(
+                    "auth: no admin users yet — open the UI to complete first-run setup \
+                     (POST /api/v1/auth/first-run-setup)",
+                );
+                auth::bootstrap::clear_bootstrap_sentinel(&cfg.runtime.state_dir);
+            }
+            Ok(n) => {
+                tracing::debug!(
+                    user_count = n,
+                    "auth: admin users present; skipping first-run setup hint",
+                );
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "could not count users for first-run check: {e}"
+                ));
             }
         }
-        Ok(auth::bootstrap::BootstrapOutcome::SkippedAlreadyBootstrapped) => {
-            tracing::debug!("bootstrap skipped: users table already populated");
-        }
-        Ok(auth::bootstrap::BootstrapOutcome::SkippedModeDisallowsLocal) => {
-            tracing::debug!(mode = ?cfg.auth.mode, "bootstrap skipped: mode does not allow local users");
-        }
-        Err(e) => {
-            return Err(anyhow::anyhow!("first-boot admin bootstrap failed: {e}"));
-        }
+    } else {
+        tracing::debug!(
+            mode = ?cfg.auth.mode,
+            "auth: mode does not allow local users; skipping first-run check",
+        );
     }
 
     // M6 Phase 3 Step 3.3 — discover the OIDC IdP when the

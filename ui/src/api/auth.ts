@@ -34,6 +34,17 @@ export const authApi = {
   changePassword: (old_password: string, new_password: string) =>
     api.post<void>("/v1/auth/change-password", { old_password, new_password }),
 
+  // First-run setup. Unauthenticated. Only call when
+  // `info.first_run_pending` is true; the engine returns 409
+  // otherwise. On success returns the same TokenResponse shape
+  // as /auth/login, so the caller can sign the operator in
+  // immediately.
+  firstRunSetup: (password: string, username?: string) =>
+    api.post<TokenResponse>(
+      "/v1/auth/first-run-setup",
+      username ? { username, password } : { password },
+    ),
+
   // OIDC: mints PKCE/state/nonce server-side, returns the IdP
   // authorization URL. Caller assigns it to `window.location` to
   // hand control to the IdP. The state cookie is set automatically

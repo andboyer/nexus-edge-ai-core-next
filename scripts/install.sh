@@ -65,15 +65,15 @@ export NEXUS_PREP_FIREWALL="${NEXUS_PREP_FIREWALL:-1}"
 export NEXUS_PREP_AUTO_UPDATES="${NEXUS_PREP_AUTO_UPDATES:-0}"
 export NEXUS_INSTALL_DRIVERS="${NEXUS_INSTALL_DRIVERS:-1}"
 
-# Unattended mode skips the interactive admin-password prompt and
-# falls back to the engine's one-time-password sentinel flow. Useful
-# for Ansible / packer / CI installs. Set by `--unattended` or by
-# pre-exporting `NEXUS_UNATTENDED=1`.
-UNATTENDED="${UNATTENDED:-${NEXUS_UNATTENDED:-0}}"
 # Path to a file containing the initial admin password (one line,
-# 0600 recommended). Wins over the interactive prompt. Removed
-# after install.sh hands it to nexus-engine.
+# 0600 recommended). When set, install.sh hands the file to
+# `nexus-engine set-admin-password` before starting the service,
+# skipping the UI's first-run-setup step. Removed after use.
 ADMIN_PASSWORD_FILE="${ADMIN_PASSWORD_FILE:-${NEXUS_ADMIN_PASSWORD_FILE:-}}"
+# Deprecated alias: the installer is unattended by default now
+# (first-run setup happens in the UI). Kept as a no-op so existing
+# Ansible playbooks don't break.
+UNATTENDED="${UNATTENDED:-${NEXUS_UNATTENDED:-0}}"
 
 usage() {
     cat <<EOF
@@ -95,16 +95,17 @@ Options:
                                   to nexus.toml.bak first.
   --no-start                      Install everything but don't enable or
                                   start the systemd unit.
-  --unattended                    Skip the interactive admin-password
-                                  prompt and fall back to the engine's
-                                  one-time-password sentinel flow.
-                                  Equivalent to NEXUS_UNATTENDED=1.
-                                  Useful for Ansible / packer / CI.
+  --unattended                    Deprecated no-op. The installer is now
+                                  unattended by default — the operator
+                                  sets the initial admin password in the
+                                  UI on first visit. Pass
+                                  --admin-password-file to pre-stage it.
   --admin-password-file <PATH>    Read the initial admin password from
                                   this file (one line, mode 0600
-                                  recommended) instead of prompting.
-                                  install.sh removes the file after the
-                                  password has been applied.
+                                  recommended) and apply it before
+                                  starting the engine, skipping the UI's
+                                  first-run-setup form. install.sh
+                                  shreds the file after use.
   --rollback                      Flip /opt/nexus/current to the
                                   previous_good_version recorded in
                                   install-state.json and restart.
@@ -325,18 +326,19 @@ previous="$(swap_current_symlink "$VERSION")"
 write_install_state "$VERSION" "$previous"
 
 # --- Initial admin password ---------------------------------------------------
-# On a true first install (no SQLite store yet) prompt the operator
-# to pick the admin password BEFORE systemd starts. We feed it to
-# `nexus-engine set-admin-password` as the `nexus` system user; the
-# subcommand runs the schema migrations as a side effect of opening
-# the store, inserts the admin row, exits. When the engine then
-# boots under systemd it observes `count_users() > 0` and skips the
-# OTP-generation path entirely.
+# Unattended-by-default. The first time the engine boots against
+# an empty DB it logs an info-level pointer at the operator-facing
+# first-run setup form (UI route `/login`, API endpoint
+# `POST /api/v1/auth/first-run-setup`). The operator visits the UI
+# and chooses the initial admin password there.
 #
-# Three exits from this block:
-#   ADMIN_PASSWORD_SET=1  → we set a password the operator chose; banner says so.
-#   ADMIN_PASSWORD_SET=0 + sentinel appears → unattended fallback; banner prints OTP.
-#   ADMIN_PASSWORD_SET=0 + no sentinel     → DB already had an admin; banner gives recovery hint.
+# Power-user escape hatch: `--admin-password-file <PATH>` (or env
+# `NEXUS_ADMIN_PASSWORD_FILE`) lets Ansible / packer / CI pre-stage
+# the password and skip the UI step. install.sh hands the file to
+# the dedicated `nexus-engine set-admin-password` CLI (reads stdin /
+# --password-file only, never argv) BEFORE systemd starts; the
+# engine then sees `count_users() > 0` and the UI's first-run form
+# never appears. install.sh shreds the file after use.
 ADMIN_PASSWORD_SET=0
 DB_PATH="${NEXUS_STATE_DIR}/nexus.db"
 set_admin_password_from_file() {
@@ -362,69 +364,12 @@ set_admin_password_from_file() {
     fi
     return 1
 }
-prompt_admin_password_interactive() {
-    # /dev/tty refers to the controlling terminal regardless of
-    # whether stdin is a pipe (curl|sudo bash) — the standard
-    # idiom for prompting from inside a piped-in script.
-    if [[ ! -r /dev/tty || ! -w /dev/tty ]]; then
-        return 1
-    fi
-    local pw1 pw2 attempts=0
-    {
-        printf "\n"
-        printf "  ─── Set the initial admin password ─────────────────────────\n"
-        printf "  This will be the password for user 'admin' on first login.\n"
-        printf "  Minimum 12 characters. Nothing is echoed as you type.\n\n"
-    } > /dev/tty
-    while :; do
-        attempts=$(( attempts + 1 ))
-        if (( attempts > 5 )); then
-            printf "  ✗ too many attempts; aborting interactive prompt\n" > /dev/tty
-            return 1
-        fi
-        printf "  password: " > /dev/tty
-        IFS= read -rs pw1 < /dev/tty
-        printf "\n" > /dev/tty
-        if [[ "${#pw1}" -lt 12 ]]; then
-            printf "  ✗ password too short (need ≥12 chars), try again\n" > /dev/tty
-            continue
-        fi
-        printf "  confirm:  " > /dev/tty
-        IFS= read -rs pw2 < /dev/tty
-        printf "\n" > /dev/tty
-        if [[ "$pw1" != "$pw2" ]]; then
-            printf "  ✗ passwords don't match, try again\n" > /dev/tty
-            continue
-        fi
-        break
-    done
-    # Feed the password to the CLI via stdin so it never appears
-    # in `ps aux`. printf %s\n keeps the value as a single line
-    # with the trailing newline the engine's `read_line` consumes.
-    if printf "%s\n" "$pw1" | sudo -u "$NEXUS_SERVICE_USER" \
-        "$RELEASE_DIR/bin/nexus-engine" set-admin-password \
-            --config "$NEXUS_CONFIG_DIR/nexus.toml" > /dev/tty 2>&1; then
-        unset pw1 pw2
-        ADMIN_PASSWORD_SET=1
-        return 0
-    fi
-    unset pw1 pw2
-    return 1
-}
 
 if [[ -n "$ADMIN_PASSWORD_FILE" ]]; then
     set_admin_password_from_file "$ADMIN_PASSWORD_FILE" \
         || die "failed to apply admin password from $ADMIN_PASSWORD_FILE"
-elif (( ! UNATTENDED )) && [[ ! -e "$DB_PATH" ]]; then
-    if ! prompt_admin_password_interactive; then
-        log "interactive admin-password prompt unavailable;"
-        log "falling back to the engine's one-time-password sentinel flow"
-    fi
 elif [[ -e "$DB_PATH" ]]; then
     log "existing $DB_PATH detected; preserving any existing admin user(s)"
-    log "(use --admin-password-file to override, or run after install:"
-    log "   sudo -u $NEXUS_SERVICE_USER $RELEASE_DIR/bin/nexus-engine set-admin-password \\"
-    log "     --config $NEXUS_CONFIG_DIR/nexus.toml)"
 fi
 
 # --- Start the service --------------------------------------------------------
@@ -460,47 +405,52 @@ log ""
 
 # --- First-boot admin credentials --------------------------------------------
 # Three cases handled here, in order of preference:
-#   1. We already set the password earlier (interactive prompt or
-#      --admin-password-file). Banner just confirms.
-#   2. The engine wrote a one-time bootstrap sentinel because we
-#      ran unattended on a true first install. Banner prints the
-#      OTP exactly once.
-#   3. Neither: the DB already had an admin row from a prior
-#      install. Banner explains how to recover (set-admin-password).
-SENTINEL="${NEXUS_STATE_DIR}/bootstrap-password.txt"
+#   1. We applied --admin-password-file earlier. Banner just confirms.
+#   2. The engine reports `first_run_pending: true` — the DB has
+#      no admin row yet. Banner points the operator at the UI's
+#      first-run setup form.
+#   3. The DB already had an admin row (re-install over an
+#      existing state dir). Banner explains how to recover.
+RECOVERY_CMD="sudo -u $NEXUS_SERVICE_USER /opt/nexus/current/bin/nexus-engine \\
+      set-admin-password --config $NEXUS_CONFIG_DIR/nexus.toml"
+# Ask the engine itself via its public /auth/info endpoint —
+# that's the canonical signal the UI uses too. Default to false
+# on any parse failure so the banner falls through to the
+# "DB already populated" branch (the conservative choice; the
+# operator can still set the password via the CLI).
+first_run_pending="$(
+    curl -fsS http://127.0.0.1:8089/api/v1/auth/info 2>/dev/null \
+        | python3 -c 'import json,sys; print(json.load(sys.stdin).get("first_run_pending", False))' \
+        2>/dev/null \
+        || echo False
+)"
 if (( ADMIN_PASSWORD_SET )); then
     log "  Admin user: admin"
-    log "  Password:   (set during install)"
+    log "  Password:   (set during install from --admin-password-file)"
     log ""
     log "  To rotate or recover the admin password later, run:"
-    log "    sudo -u $NEXUS_SERVICE_USER /opt/nexus/current/bin/nexus-engine \\"
-    log "      set-admin-password --config $NEXUS_CONFIG_DIR/nexus.toml"
+    log "    $RECOVERY_CMD"
+elif [[ "$first_run_pending" == "True" ]]; then
+    HOST="$(hostname -f 2>/dev/null || hostname)"
+    log "  ┌─────────────────────────────────────────────────────────────"
+    log "  │  FIRST-RUN SETUP REQUIRED                                   "
+    log "  │                                                             "
+    log "  │  No admin user exists yet. Open the UI and choose the       "
+    log "  │  initial admin password:                                    "
+    log "  │                                                             "
+    log "  │    http://${HOST}/login                                     "
+    log "  │                                                             "
+    log "  │  WARNING: anyone with network access to this device can     "
+    log "  │  claim the admin account until you complete setup. Do it    "
+    log "  │  now, or restrict network access first.                     "
+    log "  └─────────────────────────────────────────────────────────────"
+    log ""
+    log "  To pre-stage the password instead (e.g. from Ansible), re-run"
+    log "  install.sh with --admin-password-file <path-to-0600-file>."
 else
-    # Engine writes the sentinel just after it reaches healthy;
-    # wait_for_health already gave it 60s, so for a true first
-    # boot the file should be there already. Allow a short
-    # additional grace window for slow disks.
-    sentinel_deadline=$(( $(date +%s) + 10 ))
-    while [[ ! -f "$SENTINEL" && $(date +%s) -lt $sentinel_deadline ]]; do
-        sleep 1
-    done
-    if [[ -f "$SENTINEL" ]]; then
-        bootstrap_user="$(awk -F'\t' 'NR==1{print $1}' "$SENTINEL" 2>/dev/null || echo admin)"
-        bootstrap_pw="$(awk -F'\t' 'NR==1{print $2}' "$SENTINEL" 2>/dev/null || echo '')"
-        log "  First-boot admin credentials (printed ONCE):"
-        log "    user:     $bootstrap_user"
-        log "    password: $bootstrap_pw"
-        log ""
-        log "  The setup wizard will guide you through changing this"
-        log "  password and adding your first cameras and rules. After"
-        log "  the password change the engine deletes the file at:"
-        log "    $SENTINEL"
-    else
-        log "  Admin password unchanged (DB already had an admin user)."
-        log "  To rotate or recover the admin password, run:"
-        log "    sudo -u $NEXUS_SERVICE_USER /opt/nexus/current/bin/nexus-engine \\"
-        log "      set-admin-password --config $NEXUS_CONFIG_DIR/nexus.toml"
-    fi
+    log "  Admin password unchanged (DB already had an admin user)."
+    log "  To rotate or recover the admin password, run:"
+    log "    $RECOVERY_CMD"
 fi
 
 log ""
