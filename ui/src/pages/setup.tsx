@@ -107,13 +107,26 @@ export function SetupPage() {
     }
   };
 
+  // Marks setup complete on the server and then navigates to the
+  // requested destination. We thread the destination through the
+  // mutation variable so the same hook serves Finish (→ /dashboard)
+  // and the cameras/rules "Add ..." CTAs (→ /cameras, /rules).
+  //
+  // The CTAs MUST flip the latch before navigating: `appRoute.beforeLoad`
+  // probes `setup_complete` and bounces back to /setup if the latch is
+  // still false, so a plain `navigate({to:'/cameras'})` would loop the
+  // operator right back into the wizard with no visible effect.
+  type CompleteDest = "/dashboard" | "/cameras" | "/rules";
   const complete = useMutation({
-    mutationFn: () => setupApi.complete(),
-    onSuccess: async () => {
+    mutationFn: async (dest: CompleteDest) => {
+      await setupApi.complete();
+      return dest;
+    },
+    onSuccess: async (dest) => {
       // Refresh the gating query so appRoute.beforeLoad sees the latch
       // flipped before the next navigation.
       await queryClient.invalidateQueries({ queryKey: ["setup-status"] });
-      navigate({ to: "/dashboard" });
+      navigate({ to: dest });
     },
   });
 
@@ -154,14 +167,24 @@ export function SetupPage() {
           <CountStep
             icon={<Video className="h-5 w-5" />}
             title="Add your cameras"
-            description="Cameras stream into the engine over RTSP / ONVIF. You can also add them later from the Cameras page."
+            description="Cameras stream into the engine over RTSP / ONVIF. The Add cameras button takes you to the full camera page (and finishes this wizard along the way)."
             count={status.data!.cameras_count}
             countLabel="cameras configured"
             ctaLabel="Add cameras"
-            ctaPath="/cameras"
-            onSkip={goNext}
+            onCta={() => complete.mutate("/cameras")}
+            // Skipping the cameras step also skips rules — there's
+            // nothing for rules to fire on without a camera. Jump
+            // straight to Finish.
+            onSkip={() => setStep("finish")}
             onBack={goBack}
-            navigate={navigate}
+            ctaPending={complete.isPending}
+            error={
+              complete.isError
+                ? complete.error instanceof ApiError
+                  ? complete.error.message
+                  : String(complete.error)
+                : null
+            }
           />
         ) : step === "rules" ? (
           <CountStep
@@ -171,17 +194,24 @@ export function SetupPage() {
             count={status.data!.rules_count}
             countLabel="rules configured"
             ctaLabel="Add rules"
-            ctaPath="/rules"
+            onCta={() => complete.mutate("/rules")}
             onSkip={goNext}
             onBack={goBack}
-            navigate={navigate}
+            ctaPending={complete.isPending}
+            error={
+              complete.isError
+                ? complete.error instanceof ApiError
+                  ? complete.error.message
+                  : String(complete.error)
+                : null
+            }
           />
         ) : (
           <FinishStep
             cameras={status.data!.cameras_count}
             rules={status.data!.rules_count}
             onBack={goBack}
-            onFinish={() => complete.mutate()}
+            onFinish={() => complete.mutate("/dashboard")}
             pending={complete.isPending}
             error={
               complete.isError
@@ -431,10 +461,11 @@ function CountStep({
   count,
   countLabel,
   ctaLabel,
-  ctaPath,
+  onCta,
   onSkip,
   onBack,
-  navigate,
+  ctaPending,
+  error,
 }: {
   icon: React.ReactNode;
   title: string;
@@ -442,10 +473,11 @@ function CountStep({
   count: number;
   countLabel: string;
   ctaLabel: string;
-  ctaPath: "/cameras" | "/rules";
+  onCta: () => void;
   onSkip: () => void;
   onBack: () => void;
-  navigate: ReturnType<typeof useNavigate>;
+  ctaPending: boolean;
+  error: string | null;
 }) {
   return (
     <Card>
@@ -461,16 +493,21 @@ function CountStep({
           <span className="font-semibold tabular-nums">{count}</span>{" "}
           <span className="text-muted-foreground">{countLabel}</span>
         </div>
+        {error ? (
+          <div className="rounded-md border border-destructive/40 bg-destructive/10 p-2 text-xs text-destructive">
+            {error}
+          </div>
+        ) : null}
         <div className="flex justify-between">
-          <Button type="button" variant="ghost" onClick={onBack}>
+          <Button type="button" variant="ghost" onClick={onBack} disabled={ctaPending}>
             Back
           </Button>
           <div className="flex gap-2">
-            <Button type="button" variant="outline" onClick={onSkip}>
+            <Button type="button" variant="outline" onClick={onSkip} disabled={ctaPending}>
               Skip for now
             </Button>
-            <Button type="button" onClick={() => navigate({ to: ctaPath })}>
-              {ctaLabel}
+            <Button type="button" onClick={onCta} disabled={ctaPending}>
+              {ctaPending ? <Loader2 className="h-4 w-4 animate-spin" /> : ctaLabel}
             </Button>
           </div>
         </div>
