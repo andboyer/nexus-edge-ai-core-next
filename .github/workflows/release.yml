@@ -119,6 +119,11 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p models
+          # --clobber is required because models-manifest.json is now
+          # tracked in git (small text, source-of-truth for which artifacts
+          # ship); actions/checkout puts a copy on disk before this step
+          # runs, and the release-uploaded copy MUST win (it carries the
+          # per-release sha256 values patched by gen_yolo26n.py).
           gh release download "$TAG" \
             --repo "${{ github.repository }}" \
             --pattern 'yolo26n_640.onnx' \
@@ -127,7 +132,8 @@ jobs:
             --pattern 'yolo_world_v2_s.onnx' \
             --pattern 'yoloe26_s.onnx' \
             --pattern 'models-manifest.json' \
-            --dir models/
+            --dir models/ \
+            --clobber
           echo "Staged model pack:"
           ls -la models/
           # yolo26n now ships as three per-size static-shape exports (640/960/1280).
