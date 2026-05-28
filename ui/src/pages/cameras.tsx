@@ -731,25 +731,50 @@ function ModelOverrideEditor({
         <div className="rounded-md border border-border/60 bg-muted/20 p-3 space-y-3">
           <p className="text-xs text-muted-foreground">
             Leave any field blank to inherit the engine default. The
-            router dedups inference layers by kind, so structural
-            fields (preset, pack path, input size) only take effect
-            when the engine restarts — and the first camera to
-            introduce a kind wins for those fields.
+            router dedups inference layers by <em>(kind, input size)</em>,
+            so structural fields (size, pack path) only take effect when
+            the engine restarts — pick a size that the kind's model
+            registry actually ships.
           </p>
 
           <div className="space-y-2">
-            <Label htmlFor="cam-model-preset">Preset</Label>
-            <Input
-              id="cam-model-preset"
-              value={value?.preset ?? ""}
-              onChange={(e) => patch({ preset: e.target.value })}
-              placeholder="320 / 640 / 1280"
-              className="font-mono"
-            />
+            <Label htmlFor="cam-model-size">Input size</Label>
+            <select
+              id="cam-model-size"
+              className="h-9 w-full rounded-md border border-input bg-transparent px-2 text-sm"
+              value={value?.input_width ? String(value.input_width) : ""}
+              onChange={(e) => {
+                const raw = e.target.value;
+                if (raw === "") {
+                  // Clear all three coupled fields atomically.
+                  patch({
+                    preset: undefined,
+                    input_width: undefined,
+                    input_height: undefined,
+                  });
+                  return;
+                }
+                const n = Number(raw);
+                patch({
+                  preset: raw,
+                  input_width: n,
+                  input_height: n,
+                });
+              }}
+            >
+              <option value="">(use tier default)</option>
+              <option value="640">640 × 640 — fastest, fits every tier</option>
+              <option value="960">960 × 960 — balanced; default on T36 / T36-S</option>
+              <option value="1280">1280 × 1280 — highest detail; opt-in for plate/face</option>
+            </select>
             <p className="text-xs text-muted-foreground">
-              Model-pack preset name — resolved against the pack's
-              <code className="mx-1 font-mono">models-manifest.json</code>
-              when <code className="font-mono">pack_path</code> is set.
+              Sets preset + input width + input height to the same value
+              (the shipped <code className="font-mono">yolo26n_*.onnx</code>
+              models are square). For <code className="font-mono">yolo</code>
+              kind, the engine picks the matching
+              <code className="mx-1 font-mono">yolo26n_&lt;size&gt;.onnx</code>
+              from the pack. Other kinds use the size as their preset
+              lookup key.
             </p>
           </div>
 
@@ -763,41 +788,10 @@ function ModelOverrideEditor({
               className="font-mono"
             />
             <p className="text-xs text-muted-foreground">
-              Directory containing <code className="font-mono">models-manifest.json</code>.
-              When set, the engine ignores manual input width/height
-              and uses the pack's preset entry.
+              Directory containing <code className="font-mono">models-manifest.json</code>
+              and the <code className="font-mono">yolo26n_&lt;size&gt;.onnx</code>
+              files. Leave blank to use the engine's default pack.
             </p>
-          </div>
-
-          <div className="grid grid-cols-2 gap-3">
-            <div className="space-y-2">
-              <Label htmlFor="cam-model-width">Input width</Label>
-              <Input
-                id="cam-model-width"
-                type="number"
-                min={0}
-                step={32}
-                value={value?.input_width ?? ""}
-                onChange={(e) =>
-                  patch({ input_width: num(e.target.value) })
-                }
-                placeholder="640"
-              />
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="cam-model-height">Input height</Label>
-              <Input
-                id="cam-model-height"
-                type="number"
-                min={0}
-                step={32}
-                value={value?.input_height ?? ""}
-                onChange={(e) =>
-                  patch({ input_height: num(e.target.value) })
-                }
-                placeholder="640"
-              />
-            </div>
           </div>
 
           <div className="space-y-2">
