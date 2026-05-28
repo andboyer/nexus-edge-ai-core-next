@@ -15,7 +15,7 @@
 # `tools/models/gen_*.py` on cache miss (cached by script + requirements +
 # prompt-file hash, so re-runs against the same generation logic hit gha
 # cache in <30s; cold runs take ~5-10 min). The closed-vocab `yolo26n_*`
-# files cannot be generated here — `yolov26n.pt` is not a public
+# files cannot be generated here — `yolo26n.pt` is not a public
 # ultralytics checkpoint — so the operator must `gh release upload $TAG
 # models/yolo26n_640.onnx models/yolo26n_960.onnx models/yolo26n_1280.onnx`
 # before triggering this workflow. The six files (yolo26n_{640,960,1280},
@@ -106,7 +106,7 @@ jobs:
       # uploads the four files to the release BEFORE triggering this
       # workflow (or via `workflow_dispatch` after `gh release upload
       # $TAG models/...`). Auto-generation from `tools/models/gen_*.py`
-      # was tried earlier but `YOLO("yolov26n.pt")` is not a public
+      # was tried earlier but `YOLO("yolo26n.pt")` is not a public
       # ultralytics checkpoint — the gen scripts only work on hosts
       # where the operator has pre-staged the source weights, which
       # is not the case on GitHub-hosted runners. Pre-uploaded assets
@@ -140,7 +140,7 @@ jobs:
           # --all-static` and `gh release upload $TAG models/yolo26n_640.onnx
           # models/yolo26n_960.onnx models/yolo26n_1280.onnx` before this workflow
           # can run — GH-hosted runners cannot generate these themselves because
-          # yolov26n.pt is not a public ultralytics checkpoint.
+          # yolo26n.pt is not a public ultralytics checkpoint.
           for f in yolo26n_640.onnx yolo26n_960.onnx yolo26n_1280.onnx yolo_world_v2_s.onnx yoloe26_s.onnx models-manifest.json; do
             if [ ! -s "models/$f" ]; then
               echo "::error::Required model asset 'models/$f' missing from release $TAG. Upload via 'gh release upload $TAG models/$f' then re-run this workflow."

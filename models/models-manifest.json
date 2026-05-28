@@ -6,7 +6,7 @@
     {
       "id": "yolo26n",
       "task": "detect",
-      "_comment": "YOLOv26-nano. As of v0.1.19 the engine ships three STATIC-shape ONNX exports — yolo26n_640.onnx, yolo26n_960.onnx, yolo26n_1280.onnx — one per supported input size. Static shapes are mandatory for the Intel NPU plugin (which silently falls back to CPU on dynamic-shape models, observed on Lunar Lake k13) and let the OpenVINO blob cache hit on subsequent boots. Per-tier defaults: T10/T24=640, T36/T36-S=960, T64=640 (override per-camera to 1280 for plate/face detail). The legacy `yolo26n_dynamic.onnx` is deprecated and no longer shipped — regenerate with `python tools/models/gen_yolo26n.py --all-static` before tagging a release.",
+      "_comment": "YOLOv26-nano. As of v0.1.19 the engine ships three STATIC-shape ONNX exports \u2014 yolo26n_640.onnx, yolo26n_960.onnx, yolo26n_1280.onnx \u2014 one per supported input size. Static shapes are mandatory for the Intel NPU plugin (which silently falls back to CPU on dynamic-shape models, observed on Lunar Lake k13) and let the OpenVINO blob cache hit on subsequent boots. Per-tier defaults: T10/T24=640, T36/T36-S=960, T64=640 (override per-camera to 1280 for plate/face detail). The legacy `yolo26n_dynamic.onnx` is deprecated and no longer shipped \u2014 regenerate with `python tools/models/gen_yolo26n.py --all-static` before tagging a release.",
       "license": "AGPL-3.0",
       "weights_dataset_license": "COCO:CC-BY-4.0",
       "input": {
@@ -24,19 +24,19 @@
           "backend": "onnx",
           "path": "yolo26n_640.onnx",
           "preset": "640",
-          "sha256": null
+          "sha256": "e31f67b73ceeda7fd2d9a72684940c9da5511ddb9871608860a92c68f9a2b58e"
         },
         {
           "backend": "onnx",
           "path": "yolo26n_960.onnx",
           "preset": "960",
-          "sha256": null
+          "sha256": "1b6ef96627020587c2d2e8a44985e4be2d9057b75213377fd9e60a12749132fd"
         },
         {
           "backend": "onnx",
           "path": "yolo26n_1280.onnx",
           "preset": "1280",
-          "sha256": null
+          "sha256": "7eef96ae3449e16695fc088c7407f5c5c403b80985c275a29a74e2b0c0c14963"
         }
       ],
       "presets": [

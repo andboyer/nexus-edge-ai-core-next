@@ -101,7 +101,7 @@ The `models/` directory is in `.gitignore`. Stage it locally:
 
 ```bash
 mkdir -p models
-# Generate via tools/models/gen_yolo26n.py --all-static (needs yolov26n.pt
+# Generate via tools/models/gen_yolo26n.py --all-static (needs yolo26n.pt
 # in the modelgen venv), OR download from a release:
 gh release download v0.1.19 \
   --pattern 'yolo26n_640.onnx' \

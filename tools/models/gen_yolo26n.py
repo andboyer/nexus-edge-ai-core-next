@@ -153,9 +153,9 @@ def main() -> int:
         print("[gen_yolo26n]   pip install -r tools/models/requirements.txt")
         return 1
 
-    print("[gen_yolo26n] loading YOLOv26N checkpoint")
+    print("[gen_yolo26n] loading YOLO26N checkpoint")
     try:
-        model = YOLO("yolov26n.pt")
+        model = YOLO("yolo26n.pt")
     except Exception as ex:  # noqa: BLE001
         print(f"[gen_yolo26n] ERROR: checkpoint load failed: {ex}")
         return 1
@@ -223,12 +223,12 @@ def export_one(
         print(f"[gen_yolo26n] ERROR: export failed: {ex}")
         return 1
 
-    # ultralytics writes `yolov26n.onnx` to the current working directory
+    # ultralytics writes `yolo26n.onnx` to the current working directory
     # (or next to the source .pt). Sweep both spots.
     candidates = [
-        Path.cwd() / "yolov26n.onnx",
-        REPO_ROOT / "yolov26n.onnx",
-        MODELS_DIR / "yolov26n.onnx",
+        Path.cwd() / "yolo26n.onnx",
+        REPO_ROOT / "yolo26n.onnx",
+        MODELS_DIR / "yolo26n.onnx",
     ]
     src = next((p for p in candidates if p.is_file()), None)
     if src is None:
