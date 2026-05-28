@@ -169,7 +169,7 @@ fn build_detector_with_context(
 ) -> Result<Arc<dyn Detector>, InferenceError> {
     match cfg.model.kind.as_str() {
         // Closed-vocab YOLOv26-nano shipped as the default — matches v1's
-        // `models/yolo26n_dynamic.onnx` driven by the model-pack manifest's
+        // `models/yolo26n_<size>.onnx` driven by the model-pack manifest's
         // 320 / 640 / 1280 presets. Real ORT path lights up when the `ort`
         // cargo feature is on AND inference.model.pack_path is set; without
         // either we keep the MockDetector so the engine still boots on a

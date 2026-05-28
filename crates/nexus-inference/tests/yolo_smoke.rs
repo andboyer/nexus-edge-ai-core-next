@@ -1,12 +1,13 @@
-//! YOLO ORT smoke test — loads `models/yolo26n_dynamic.onnx`, runs it on a
-//! synthesized RGB frame, and verifies the session shape works end-to-end.
+//! YOLO ORT smoke test — loads `models/yolo26n_640.onnx` (or whichever
+//! `yolo26n_*` size the env var points at), runs it on a synthesized
+//! RGB frame, and verifies the session shape works end-to-end.
 //!
 //! Skipped automatically when the `ort` feature is off OR
 //! `NEXUS_TEST_YOLO_MODEL` is not set / does not exist. Locally:
 //!
 //! ```bash
 //! ORT_DYLIB_PATH=/opt/homebrew/lib/libonnxruntime.dylib \
-//!   NEXUS_TEST_YOLO_MODEL=$PWD/models/yolo26n_dynamic.onnx \
+//!   NEXUS_TEST_YOLO_MODEL=$PWD/models/yolo26n_640.onnx \
 //!   cargo test --locked -p nexus-inference --features ort,ep-cpu \
 //!   yolo_smoke -- --nocapture
 //! ```

@@ -1,7 +1,7 @@
 //! Real ORT-backed YOLO detector.
 //!
 //! Mirrors the v1 `nexus-edge-ai-core` `YoloDetector` close enough that
-//! the same models/yolo26n_dynamic.onnx + same COCO→domain label table
+//! the same models/yolo26n_<size>.onnx + same COCO→domain label table
 //! produces equivalent detections — only the host language changes.
 //!
 //! Wiring (gated by the `ort` cargo feature):
@@ -24,7 +24,8 @@
 //!     - ≥85     → YOLOv5: `[cx, cy, w, h, objectness, c0..cN]`
 //!     - else    → YOLOv8: `[cx, cy, w, h, c0..cN]`
 //!
-//!     yolo26n_dynamic.onnx is NMS-free (6 cols), so that's the hot path.
+//!     The shipped `yolo26n_<size>.onnx` exports are NMS-free (6 cols),
+//!     so that's the hot path.
 //!
 //!   * Filtering: confidence threshold + COCO→domain label mapping. Every
 //!     class id we don't have a domain label for is dropped (v1 does the
@@ -59,20 +60,32 @@ pub struct YoloOrtDetector {
 }
 
 impl YoloOrtDetector {
-    /// Build from a resolved [`InferenceConfig`]. Resolves the ONNX path as
-    /// `model.pack_path / yolo26n_dynamic.onnx` when `pack_path` is set; the
-    /// engine treats that as a hard requirement when `kind = "yolo"` and the
-    /// `ort` feature is on. Returns an error any other way so we never
-    /// silently fall back to mock under prod config.
+    /// Build from a resolved [`InferenceConfig`]. Picks the ONNX artifact
+    /// inside `model.pack_path` by matching the configured `input_width`
+    /// against the per-size files the engine ships:
+    ///
+    ///   * 640  → `yolo26n_640.onnx`
+    ///   * 960  → `yolo26n_960.onnx`
+    ///   * 1280 → `yolo26n_1280.onnx`
+    ///
+    /// Any other size falls back to whichever per-size file exists, then
+    /// to the legacy `yolo26n_dynamic.onnx` (preserved for niche dev
+    /// workflows). Returns `ModelLoad` if none of the candidates exist —
+    /// we never silently fall back to mock under prod config.
+    ///
+    /// Note: static-shape ONNX is mandatory for the Intel NPU plugin
+    /// (which otherwise silently routes every op to CPU, observed on
+    /// k13 Lunar Lake under v0.1.18). Dynamic-shape fallback is the
+    /// dev escape hatch, not a prod path.
     pub fn from_config(cfg: &InferenceConfig) -> Result<Self, InferenceError> {
         let pack = cfg.model.pack_path.as_ref().ok_or_else(|| {
             InferenceError::ModelLoad(
                 "yolo detector needs inference.model.pack_path; \
-                 point it at the directory holding yolo26n_dynamic.onnx"
+                 point it at the directory holding the yolo26n_<size>.onnx files"
                     .into(),
             )
         })?;
-        let path = pack.join("yolo26n_dynamic.onnx");
+        let path = resolve_yolo26n_path(pack, cfg.model.input_width, cfg.model.input_height)?;
         Self::open(
             &path,
             cfg.model.input_width,
@@ -125,6 +138,77 @@ impl YoloOrtDetector {
             _model_path: model_path.to_path_buf(),
         })
     }
+}
+
+/// Pick the right `yolo26n_*.onnx` inside `pack` for the requested input
+/// size. Strategy:
+///   1. Try the exact-size file (`yolo26n_<w>.onnx`) — matches what the
+///      release ships for 640 / 960 / 1280.
+///   2. Try every other ship-size file in order — useful when an operator
+///      configures a non-standard size like 416 on a dev box that only
+///      has the 640 file staged.
+///   3. Fall back to the legacy `yolo26n_dynamic.onnx` — preserved for
+///      niche dev workflows but NOT shipped from v0.1.19 onward.
+///
+/// Returns `ModelLoad` if no candidate exists. The selected path is
+/// logged at INFO so operators can see whether the engine actually
+/// honored their per-camera size override.
+fn resolve_yolo26n_path(
+    pack: &Path,
+    input_w: u32,
+    input_h: u32,
+) -> Result<PathBuf, InferenceError> {
+    // Square inputs only — the shipped exports are 1×3×N×N. Non-square
+    // is a latent dev case; pick the per-width file and let the
+    // preprocessor handle the asymmetric stretch (it does anyway).
+    let primary = pack.join(format!("yolo26n_{input_w}.onnx"));
+    if primary.exists() {
+        info!(
+            requested_w = input_w,
+            requested_h = input_h,
+            chosen = %primary.display(),
+            "yolo: picked size-matched ONNX"
+        );
+        return Ok(primary);
+    }
+
+    // Try every ship-size file. Useful when the operator picked a
+    // non-standard size (e.g. 416 for a memory-tight test) but only the
+    // standard set is on disk.
+    for sz in [640u32, 960, 1280] {
+        let candidate = pack.join(format!("yolo26n_{sz}.onnx"));
+        if candidate.exists() {
+            warn!(
+                requested_w = input_w,
+                requested_h = input_h,
+                fallback = %candidate.display(),
+                "yolo: requested size has no matching ONNX in pack; \
+                 falling back to nearest available — preprocessor will \
+                 resize to requested input dims"
+            );
+            return Ok(candidate);
+        }
+    }
+
+    // Legacy dev fallback. Production releases do NOT include this file.
+    let legacy = pack.join("yolo26n_dynamic.onnx");
+    if legacy.exists() {
+        warn!(
+            requested_w = input_w,
+            requested_h = input_h,
+            legacy = %legacy.display(),
+            "yolo: no static-shape ONNX in pack, using deprecated \
+             yolo26n_dynamic.onnx — DO NOT ship this in prod; the Intel \
+             NPU plugin silently falls back to CPU on dynamic shapes"
+        );
+        return Ok(legacy);
+    }
+
+    Err(InferenceError::ModelLoad(format!(
+        "no yolo26n_*.onnx in pack {}; expected yolo26n_{input_w}.onnx \
+         (or one of yolo26n_{{640,960,1280}}.onnx)",
+        pack.display()
+    )))
 }
 
 #[async_trait]
@@ -192,7 +276,7 @@ fn run_yolo(
         .run(ort::inputs![input])
         .map_err(|e| InferenceError::Failed(format!("session run: {e}")))?;
 
-    // First output only — yolo26n_dynamic exports a single det tensor.
+    // First output only — yolo26n exports a single det tensor.
     let (_name, value) = outputs
         .iter()
         .next()

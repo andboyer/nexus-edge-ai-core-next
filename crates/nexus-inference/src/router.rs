@@ -12,17 +12,27 @@
 //! this router is the layer that honors it.
 //!
 //! Shape:
-//!   * One [`InferenceLayer`] per *unique* model kind referenced by any
-//!     enabled camera — the default kind plus every distinct override.
-//!     Layers are built with the same backend / pool_worker_kind /
-//!     workers / ep_priority as the default, only the model substruct
-//!     is swapped. Operators paying for two pools of N workers each is
-//!     a deliberate cost — if you don't want it, don't override.
+//!   * One [`InferenceLayer`] per *unique* model identity referenced by
+//!     any enabled camera. As of v0.1.19 identity = `(kind, input_w,
+//!     input_h)` — two cameras that both override `kind = "yolo"` but
+//!     ask for different input sizes (640 vs. 1280) get *separate*
+//!     layers, each backed by its own per-size ONNX. Without this
+//!     per-size key, the router would dedupe by kind alone and the
+//!     first camera to introduce a kind would lock in its size for
+//!     every sibling — silently. Layers share backend / workers /
+//!     ep_priority with the default; only the `model` substruct
+//!     changes.
 //!   * [`detector_for_camera`] picks the layer keyed by the camera's
-//!     override, falling back to the default kind.
+//!     override (or the default identity), falling back to the
+//!     default if the override couldn't be built.
 //!   * [`default_pool`] gives the OPS API back its single-pool view
-//!     (shows the default kind's pool — every other kind's pool is
-//!     observable on `pools()` once the API surfaces it).
+//!     (shows the default identity's pool — every other identity's
+//!     pool is observable on `pools()` once the API surfaces it).
+//!   * [`detectors`] returns `(kind, detector)` pairs (kind only —
+//!     callers like `models_catalog` collect into a kind-keyed set
+//!     and don't care which size variant). If two layers share a
+//!     kind, both surface as `("yolo", _)` — consumers that need to
+//!     disambiguate should use [`layer_keys`].
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -35,17 +45,42 @@ use crate::pool::DetectorPool;
 use crate::visual_prompts::VisualPromptStore;
 use crate::{build_with_context, BuildContext, InferenceLayer};
 
+/// Composite identity key for an inference layer. Two cameras share a
+/// layer iff they would produce equal `LayerKey`s. Built from the
+/// `kind` + `(input_w, input_h)` of the camera's resolved model config
+/// (override if set, default otherwise).
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct LayerKey {
+    kind: String,
+    input_w: u32,
+    input_h: u32,
+}
+
+impl LayerKey {
+    fn from_model(model: &ModelConfig) -> Self {
+        Self {
+            kind: model.kind.clone(),
+            input_w: model.input_width,
+            input_h: model.input_height,
+        }
+    }
+
+    fn display(&self) -> String {
+        format!("{}@{}x{}", self.kind, self.input_w, self.input_h)
+    }
+}
+
 pub struct InferenceRouter {
-    /// Default layer — used by every camera that doesn't override.
-    default_kind: String,
-    layers: BTreeMap<String, InferenceLayer>,
+    /// Default identity — used by every camera that doesn't override.
+    default_key: LayerKey,
+    layers: BTreeMap<LayerKey, InferenceLayer>,
 }
 
 impl InferenceRouter {
     /// Build a router from one default config + the list of cameras that
-    /// will run on it. Walks `cameras` for every distinct
-    /// `model_override.kind` and builds an additional [`InferenceLayer`]
-    /// for each, sharing the default's backend / workers / ep_priority.
+    /// will run on it. Walks `cameras` for every distinct override
+    /// identity and builds an additional [`InferenceLayer`] for each,
+    /// sharing the default's backend / workers / ep_priority.
     ///
     /// Disabled cameras are still considered — we want the router to
     /// own a layer the moment a camera is re-enabled at runtime, not
@@ -72,72 +107,78 @@ impl InferenceRouter {
             visual_prompt_store,
             visual_embedding_dim,
         };
-        let default_kind = default_cfg.model.kind.clone();
-        let mut layers: BTreeMap<String, InferenceLayer> = BTreeMap::new();
+        let default_key = LayerKey::from_model(&default_cfg.model);
+        let mut layers: BTreeMap<LayerKey, InferenceLayer> = BTreeMap::new();
 
         let default_layer = build_with_context(default_cfg, &ctx)?;
-        info!(kind = %default_kind, "router: built default inference layer");
-        layers.insert(default_kind.clone(), default_layer);
+        info!(
+            key = %default_key.display(),
+            "router: built default inference layer"
+        );
+        layers.insert(default_key.clone(), default_layer);
 
-        // Walk overrides, dedup by (kind, …model fields). For now we key
-        // the layer table by the kind string only — two cameras that pick
-        // the same `kind` but different thresholds share one layer (and
+        // Walk overrides, dedup by (kind, input_w, input_h). Two
+        // cameras that pick the same kind+size share one layer (and
         // the per-camera score_threshold is honored at the rule layer).
-        // If we ever need per-camera-thresholds-in-the-detector, we'll
-        // rev the key shape here without changing callers.
+        // The (kind, size) key matters: as of v0.1.19 we ship three
+        // per-size yolo26n ONNXs and the engine's `from_config` picks
+        // the file by input_width — two cameras with kind=yolo but
+        // different sizes MUST get different layers, otherwise the
+        // first one to be processed silently locks the size.
         for cam in cameras {
             let Some(override_cfg) = cam.detector.model_override.as_ref() else {
                 continue;
             };
-            let kind = override_cfg.kind.clone();
-            if kind == default_kind || layers.contains_key(&kind) {
+            let key = LayerKey::from_model(override_cfg);
+            if key == default_key || layers.contains_key(&key) {
                 continue;
             }
             let derived = derive_inference_cfg(default_cfg, override_cfg);
             match build_with_context(&derived, &ctx) {
                 Ok(layer) => {
                     info!(
-                        kind = %kind,
+                        key = %key.display(),
                         camera_id = cam.id,
                         "router: built override inference layer"
                     );
-                    layers.insert(kind, layer);
+                    layers.insert(key, layer);
                 }
                 Err(e) => {
                     warn!(
-                        kind = %kind,
+                        key = %key.display(),
                         camera_id = cam.id,
                         "router: failed to build override layer ({e}); \
-                         camera will fall back to the default kind"
+                         camera will fall back to the default identity"
                     );
                 }
             }
         }
 
         Ok(Self {
-            default_kind,
+            default_key,
             layers,
         })
     }
 
-    /// Detector for a given camera. Picks the override if its kind has a
-    /// layer; falls back to the default kind otherwise. Always returns
-    /// some `Arc<dyn Detector>` — the default layer is built before this
-    /// can be called, so the fallback is total.
+    /// Detector for a given camera. Picks the override-identity layer
+    /// if one exists for that camera's override; falls back to the
+    /// default identity otherwise. Always returns some `Arc<dyn
+    /// Detector>` — the default layer is built before this can be
+    /// called, so the fallback is total.
     pub fn detector_for_camera(&self, cam: &CameraConfig) -> Arc<dyn Detector> {
-        let kind = cam
+        let key = cam
             .detector
             .model_override
             .as_ref()
-            .map(|m| m.kind.as_str())
-            .unwrap_or(self.default_kind.as_str());
-        match self.layers.get(kind) {
+            .map(LayerKey::from_model)
+            .unwrap_or_else(|| self.default_key.clone());
+        match self.layers.get(&key) {
             Some(layer) => layer.detector.clone(),
             None => {
                 // Build-time warning already explained why we don't have
                 // this layer; on the hot path just use the default.
                 self.layers
-                    .get(self.default_kind.as_str())
+                    .get(&self.default_key)
                     .expect("router invariant: default layer present")
                     .detector
                     .clone()
@@ -145,34 +186,47 @@ impl InferenceRouter {
         }
     }
 
-    /// Default kind's pool, for back-compat with the existing
+    /// Default identity's pool, for back-compat with the existing
     /// `/api/backends` endpoint.
     pub fn default_pool(&self) -> Option<Arc<DetectorPool>> {
         self.layers
-            .get(self.default_kind.as_str())
+            .get(&self.default_key)
             .and_then(|l| l.pool.clone())
     }
 
     /// Every (kind, pool) the router owns. Future expansion of the
-    /// OPS API — today only `default_pool()` is surfaced.
+    /// OPS API — today only `default_pool()` is surfaced. Returns the
+    /// kind alone (not the composite identity) so the wire shape
+    /// stays back-compat; two layers that share a kind both surface
+    /// as `("yolo", _)`.
     pub fn pools(&self) -> Vec<(String, Arc<DetectorPool>)> {
         self.layers
             .iter()
-            .filter_map(|(k, l)| l.pool.clone().map(|p| (k.clone(), p)))
+            .filter_map(|(k, l)| l.pool.clone().map(|p| (k.kind.clone(), p)))
             .collect()
     }
 
     /// Every (kind, detector) — useful for fan-pushing per-camera config
-    /// updates to the right detector at startup or hot reload.
+    /// updates to the right detector at startup or hot reload. Returns
+    /// the kind alone (not the composite identity); see [`layer_keys`]
+    /// for the disambiguated form.
     pub fn detectors(&self) -> Vec<(String, Arc<dyn Detector>)> {
         self.layers
             .iter()
-            .map(|(k, l)| (k.clone(), l.detector.clone()))
+            .map(|(k, l)| (k.kind.clone(), l.detector.clone()))
             .collect()
     }
 
+    /// Every layer's composite identity (`kind@WxH`) as a display
+    /// string. Useful for diagnostics / `/api/backends` extensions —
+    /// callers that need to enumerate every distinct (kind, size)
+    /// layer should consume this instead of [`detectors`].
+    pub fn layer_keys(&self) -> Vec<String> {
+        self.layers.keys().map(LayerKey::display).collect()
+    }
+
     pub fn default_kind(&self) -> &str {
-        &self.default_kind
+        &self.default_key.kind
     }
 }
 
@@ -373,5 +427,65 @@ mod tests {
         assert!(kinds.contains(&"ensemble".to_string()), "got {kinds:?}");
         let d = router.detector_for_camera(&cam2);
         assert_eq!(d.name(), "ensemble");
+    }
+
+    /// v0.1.19 — two cameras that share a kind but ask for different
+    /// input sizes MUST get separate layers. Without per-size keying,
+    /// the second camera would silently inherit the first one's size
+    /// (and the first one to be processed would lock the size for
+    /// every sibling). Verified via `layer_keys()`, which exposes
+    /// the composite identity.
+    #[test]
+    fn router_dedups_by_kind_plus_input_size() {
+        let cfg = cfg_with_kind("mock");
+        let mut cam_640 = cam(1, None);
+        cam_640.detector.model_override = Some(ModelConfig {
+            kind: "mock".into(),
+            input_width: 640,
+            input_height: 640,
+            ..Default::default()
+        });
+        let mut cam_960 = cam(2, None);
+        cam_960.detector.model_override = Some(ModelConfig {
+            kind: "mock".into(),
+            input_width: 960,
+            input_height: 960,
+            ..Default::default()
+        });
+        let mut cam_1280 = cam(3, None);
+        cam_1280.detector.model_override = Some(ModelConfig {
+            kind: "mock".into(),
+            input_width: 1280,
+            input_height: 1280,
+            ..Default::default()
+        });
+        // Duplicate of cam_960 to verify dedup still works at the new
+        // composite-key level.
+        let cam_960_dup = {
+            let mut c = cam(4, None);
+            c.detector.model_override = Some(ModelConfig {
+                kind: "mock".into(),
+                input_width: 960,
+                input_height: 960,
+                ..Default::default()
+            });
+            c
+        };
+        let cams = vec![cam_640.clone(), cam_960.clone(), cam_1280, cam_960_dup];
+        let router = InferenceRouter::build(&cfg, &cams).unwrap();
+
+        // Default cfg is 640×640 mock — so cam_640's identity collides
+        // with the default and we should see exactly three distinct
+        // layers: mock@640x640 (default + cam_640 + cam_960_dup share
+        // none of these, only the default's size), mock@960x960,
+        // mock@1280x1280. Actually only the default layer is at 640,
+        // cam_640's override is its own identity but happens to equal
+        // the default → also collides into one layer.
+        let keys = router.layer_keys();
+        assert!(keys.iter().any(|k| k == "mock@640x640"), "got {keys:?}");
+        assert!(keys.iter().any(|k| k == "mock@960x960"), "got {keys:?}");
+        assert!(keys.iter().any(|k| k == "mock@1280x1280"), "got {keys:?}");
+        // Exactly three distinct identities — no duplicate 960 layer.
+        assert_eq!(keys.len(), 3, "got {keys:?}");
     }
 }

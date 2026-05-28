@@ -879,7 +879,7 @@ pub struct ModelConfig {
     /// | `"classifier_ensemble"` | `"ensemble"` (M3.2 same-camera multi-
     /// detector fan-out — see `members` below) | `"mock"`.
     ///
-    /// `yolo` matches the v1 ship — `models/yolo26n_dynamic.onnx` driven
+    /// `yolo` matches the v1 ship — `models/yolo26n_<size>.onnx` driven
     /// by a model-pack manifest with 320 / 640 / 1280 presets.
     #[serde(default = "default_model_kind")]
     pub kind: String,

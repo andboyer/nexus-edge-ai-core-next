@@ -16,7 +16,7 @@
 //! ## Configuration
 //! Picks the model kind from `$NEXUS_WORKER_MODEL_KIND` (default `mock`).
 //! For the `yolo` family the worker also reads `$NEXUS_WORKER_MODEL_PATH`
-//! (full path to `yolo26n_dynamic.onnx`), `$NEXUS_WORKER_INPUT_W` /
+//! (full path to `yolo26n_640.onnx` or another shipped size), `$NEXUS_WORKER_INPUT_W` /
 //! `$NEXUS_WORKER_INPUT_H` (default 640), and
 //! `$NEXUS_WORKER_SCORE_THRESHOLD` (default 0.30) and lights up the real
 //! ORT session when the binary was built with `--features ort,ep-cpu`.
