@@ -28,31 +28,59 @@
 
 ## Table of contents
 
-1. [Decide the hardware tier](#1-decide-the-hardware-tier)
-2. [BIOS + firmware pre-install](#2-bios--firmware-pre-install)
-3. [Install Ubuntu 24.04 LTS Server](#3-install-ubuntu-2404-lts-server)
-4. [What `install.sh` does for you](#4-what-installsh-does-for-you)
-5. [Tier-specific accelerator drivers](#5-tier-specific-accelerator-drivers)
-   - [5.1 T10 / T24 — Intel UHD / Iris Xe iGPU](#51-t10--t24--intel-uhd--iris-xe-igpu)
-   - [5.2 T36 — Intel Arc A380 dGPU](#52-t36--intel-arc-a380-dgpu)
-   - [5.3 T36-S — Lunar Lake (Arc 140V iGPU + NPU 4)](#53-t36-s--lunar-lake-arc-140v-igpu--npu-4)
-   - [5.4 T64 — NVIDIA RTX 4060](#54-t64--nvidia-rtx-4060)
-6. [Install the engine](#6-install-the-engine)
-   - [6.1 One-liner from GitHub Releases](#61-one-liner-from-github-releases)
-   - [6.2 What the installer does, step by step](#62-what-the-installer-does-step-by-step)
-   - [6.3 On-disk layout](#63-on-disk-layout)
-   - [6.4 Configure cameras + first boot](#64-configure-cameras--first-boot)
-   - [6.5 OS-level network manager (optional)](#65-os-level-network-manager-optional)
-   - [6.6 Authentication](#66-authentication)
-   - [6.7 Upgrades + rollback](#67-upgrades--rollback)
-   - [6.8 Uninstall](#68-uninstall)
-7. [Verification — smoke test](#7-verification--smoke-test)
-8. [Operating + day-2 essentials](#8-operating--day-2-essentials)
-9. [Troubleshooting](#9-troubleshooting)
-10. [Appendix A — End-to-end T24 transcript](#10-appendix-a--end-to-end-t24-transcript)
-11. [Appendix B — End-to-end T36-S transcript](#11-appendix-b--end-to-end-t36-s-transcript)
-12. [Appendix C — Build from source (developer-only)](#12-appendix-c--build-from-source-developer-only)
-13. [Appendix D — Where to file bugs](#13-appendix-d--where-to-file-bugs)
+- [Installation guide — `nexus-edge-ai-core-next`](#installation-guide--nexus-edge-ai-core-next)
+  - [Table of contents](#table-of-contents)
+  - [1. Decide the hardware tier](#1-decide-the-hardware-tier)
+  - [2. BIOS + firmware pre-install](#2-bios--firmware-pre-install)
+    - [Universal (every tier)](#universal-every-tier)
+    - [T10 / T24 (Intel mini PCs — Beelink, GMKtec)](#t10--t24-intel-mini-pcs--beelink-gmktec)
+    - [T36 (Intel Arc A380 dGPU)](#t36-intel-arc-a380-dgpu)
+    - [T36-S (Lunar Lake — GMKtec K13 / EVO-X1)](#t36-s-lunar-lake--gmktec-k13--evo-x1)
+    - [T64 (NVIDIA RTX 4060)](#t64-nvidia-rtx-4060)
+  - [3. Install Ubuntu 24.04 LTS Server](#3-install-ubuntu-2404-lts-server)
+    - [3.1 Download + verify the ISO](#31-download--verify-the-iso)
+    - [3.2 Write the ISO to USB](#32-write-the-iso-to-usb)
+    - [3.3 Boot from USB](#33-boot-from-usb)
+    - [3.4 Installer choices](#34-installer-choices)
+    - [3.5 First boot housekeeping](#35-first-boot-housekeeping)
+    - [3.6 HWE kernel — T36-S only](#36-hwe-kernel--t36-s-only)
+  - [4. What `install.sh` does for you](#4-what-installsh-does-for-you)
+  - [5. Tier-specific accelerator drivers](#5-tier-specific-accelerator-drivers)
+    - [5.1 T10 / T24 — Intel UHD / Iris Xe iGPU](#51-t10--t24--intel-uhd--iris-xe-igpu)
+    - [5.2 T36 — Intel Arc A380 dGPU](#52-t36--intel-arc-a380-dgpu)
+    - [5.3 T36-S — Lunar Lake (Arc 140V iGPU + NPU 4)](#53-t36-s--lunar-lake-arc-140v-igpu--npu-4)
+    - [5.4 T64 — NVIDIA RTX 4060](#54-t64--nvidia-rtx-4060)
+  - [6. Install the engine](#6-install-the-engine)
+    - [6.1 One-liner from GitHub Releases](#61-one-liner-from-github-releases)
+    - [6.2 What the installer does, step by step](#62-what-the-installer-does-step-by-step)
+    - [6.3 On-disk layout](#63-on-disk-layout)
+    - [6.4 Configure cameras + first boot](#64-configure-cameras--first-boot)
+      - [Confirm the tier the engine actually picked](#confirm-the-tier-the-engine-actually-picked)
+    - [6.5 OS-level network manager (optional)](#65-os-level-network-manager-optional)
+    - [6.6 Authentication](#66-authentication)
+    - [6.7 Upgrades + rollback](#67-upgrades--rollback)
+    - [6.8 Uninstall](#68-uninstall)
+  - [7. Verification — smoke test](#7-verification--smoke-test)
+    - [7.1 Engine answers HTTP](#71-engine-answers-http)
+    - [7.2 UI loads in a browser](#72-ui-loads-in-a-browser)
+    - [7.3 Cameras connect](#73-cameras-connect)
+    - [7.4 Snapshot from each camera](#74-snapshot-from-each-camera)
+    - [7.5 Inference backends are ready](#75-inference-backends-are-ready)
+    - [7.6 Storage safety floor reports healthy](#76-storage-safety-floor-reports-healthy)
+    - [7.7 Motion → clip → Timeline](#77-motion--clip--timeline)
+    - [7.8 Alert end-to-end](#78-alert-end-to-end)
+  - [8. Operating + day-2 essentials](#8-operating--day-2-essentials)
+    - [8.0 Admin UI tour](#80-admin-ui-tour)
+    - [8.1 Logs](#81-logs)
+    - [8.2 Backups](#82-backups)
+    - [8.3 Forward-looking](#83-forward-looking)
+  - [9. Troubleshooting](#9-troubleshooting)
+  - [10. Appendix A — End-to-end T24 transcript](#10-appendix-a--end-to-end-t24-transcript)
+  - [11. Appendix B — End-to-end T36-S transcript](#11-appendix-b--end-to-end-t36-s-transcript)
+  - [12. Appendix C — Build from source (developer-only)](#12-appendix-c--build-from-source-developer-only)
+    - [12.1 Regenerate ONNX models with custom prompts](#121-regenerate-onnx-models-with-custom-prompts)
+  - [13. Appendix D — Where to file bugs](#13-appendix-d--where-to-file-bugs)
+  - [See also](#see-also)
 
 ---
 
@@ -605,24 +633,29 @@ is healthy before proceeding.
 ### 6.1 One-liner from GitHub Releases
 
 Same command does first install **and** every subsequent upgrade —
-it's idempotent. The `--tier` flag is only consulted on first
-install, so re-running with the wrong tier won't clobber a tuned
-`/etc/nexus/nexus.toml`. Omit `--tier` on a first install and the
-script runs `nexus-probe` from the staged release and auto-selects
-the recommended tier; pass `--tier` explicitly to override.
+it's idempotent. On first install the script runs `nexus-probe`
+from the staged release and auto-selects the matching tier from §1,
+so the minimum invocation is zero flags:
 
 ```bash
-curl -fsSL https://github.com/Keystone-Infrastructure-Corp/nexus-edge-ai-core-next/releases/latest/download/install.sh \
-  | sudo bash -s -- --tier t24      # swap t24 for your tier from §1, or omit for auto
+curl -fsSL https://github.com/Keystone-Infrastructure-Corp/nexus-edge-ai-core-next/releases/latest/download/bootstrap.sh \
+  | sudo bash
 ```
+
+Pass `--tier <name>` only to override the probe — e.g. forcing
+`t10` on a box that probes as `t24` for low-power soak testing, or
+on hardware the probe doesn't recognise. `--tier` is consulted only
+on first install, so re-running with the wrong tier on an existing
+box won't clobber a tuned `/etc/nexus/nexus.toml` (use
+`--force-tier` to opt in).
 
 Useful flag combinations:
 
 | Flags                                      | When                                                                                  |
 | ------------------------------------------ | ------------------------------------------------------------------------------------- |
-| `--tier t24`                               | Fresh install, tier known.                                                            |
-| (no flags)                                 | Fresh install, let `nexus-probe` pick the tier.                                       |
-| `--enable-auto-updates`                    | Plus the above — opts into apt's `unattended-upgrades` for security patches (auto-reboot stays OFF). |
+| (no flags)                                 | Fresh install — let `nexus-probe` auto-select the tier. **This is the default path.** |
+| `--tier t24`                               | Fresh install on hardware the probe doesn't recognise, or forcing a non-default tier. |
+| `--enable-auto-updates`                    | Plus any of the above — opts into apt's `unattended-upgrades` for security patches (auto-reboot stays OFF). |
 | `--skip-system-prep`                       | Upgrade on a hardened base image where the operator manages apt prereqs themselves.   |
 | `--no-firewall`                            | Cluster-edge box already behind a perimeter firewall; don't add ufw rules.            |
 | `--no-swap`                                | Box already has a swap partition / dedicated swap LVM volume.                         |
@@ -902,14 +935,14 @@ client_id = "nexus-engine"
 `/etc/nexus/nexus.toml` is preserved:
 
 ```bash
-curl -fsSL https://github.com/Keystone-Infrastructure-Corp/nexus-edge-ai-core-next/releases/latest/download/install.sh \
+curl -fsSL https://github.com/Keystone-Infrastructure-Corp/nexus-edge-ai-core-next/releases/latest/download/bootstrap.sh \
   | sudo bash -s --
 ```
 
 **Pin a specific version:**
 
 ```bash
-curl -fsSL https://github.com/Keystone-Infrastructure-Corp/nexus-edge-ai-core-next/releases/download/v0.2.0/install.sh \
+curl -fsSL https://github.com/Keystone-Infrastructure-Corp/nexus-edge-ai-core-next/releases/download/v0.2.0/bootstrap.sh \
   | sudo bash -s -- --version v0.2.0
 ```
 
@@ -1208,7 +1241,7 @@ sudo reboot
 #   - adds `nexus` to render + video groups
 #   - downloads + verifies the release tarball
 #   - stages tier config, installs systemd unit, starts engine
-curl -fsSL https://github.com/Keystone-Infrastructure-Corp/nexus-edge-ai-core-next/releases/latest/download/install.sh \
+curl -fsSL https://github.com/Keystone-Infrastructure-Corp/nexus-edge-ai-core-next/releases/latest/download/bootstrap.sh \
   | sudo bash -s -- --tier t24
 
 # (Optional) verify the iGPU stack came up cleanly.
@@ -1267,7 +1300,7 @@ sudo reboot
 # without the required >=6.10 kernel, apt-installs
 # linux-generic-hwe-24.04, and exits with a REBOOT REQUIRED banner.
 # Re-running the same one-liner after reboot does the rest.
-curl -fsSL https://github.com/Keystone-Infrastructure-Corp/nexus-edge-ai-core-next/releases/latest/download/install.sh \
+curl -fsSL https://github.com/Keystone-Infrastructure-Corp/nexus-edge-ai-core-next/releases/latest/download/bootstrap.sh \
   | sudo bash -s -- --tier t36s
 
 sudo reboot
@@ -1282,7 +1315,7 @@ uname -r                       # expect 6.10.x or newer
 #   - downloads + installs the NPU driver v1.32.1 (4 .deb files)
 #   - creates the `nexus` user, dirs, group memberships
 #   - stages tier config, installs systemd unit, starts engine
-curl -fsSL https://github.com/Keystone-Infrastructure-Corp/nexus-edge-ai-core-next/releases/latest/download/install.sh \
+curl -fsSL https://github.com/Keystone-Infrastructure-Corp/nexus-edge-ai-core-next/releases/latest/download/bootstrap.sh \
   | sudo bash -s -- --tier t36s
 
 # (Optional) verify both accelerators came up.

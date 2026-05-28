@@ -11,11 +11,11 @@
 #
 # Or, against a release that's already cut:
 #
-#     curl -fsSL https://github.com/Keystone-Infrastructure-Corp/nexus-edge-ai-core-next/releases/download/v0.2.0/install.sh \
+#     curl -fsSL https://github.com/Keystone-Infrastructure-Corp/nexus-edge-ai-core-next/releases/download/v0.2.0/bootstrap.sh \
 #         | sudo bash -s -- --tier t24
 #
-# (The release workflow uploads this file as `install.sh` alongside the
-# tarball so the second URL works without specifying --version.)
+# (The release workflow uploads this file as `bootstrap.sh` alongside
+# the tarball so the second URL works without specifying --version.)
 #
 # bootstrap.sh stays tiny and parameter-driven on purpose so that the
 # verifier and tier-staging logic live in install.sh + install-common.sh

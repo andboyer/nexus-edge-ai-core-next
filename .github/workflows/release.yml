@@ -76,7 +76,7 @@ jobs:
   #   * <tarball>.tar.gz
   #   * <tarball>.tar.gz.sha256
   #   * <tarball>.tar.gz.manifest.sig    (when signing key configured)
-  #   * install.sh                       (= scripts/bootstrap.sh)
+  #   * bootstrap.sh                     (= scripts/bootstrap.sh; one-liner entrypoint)
   #   * yolo26n_dynamic.onnx             (also embedded in tarball)
   #   * yolo_world_v2_s.onnx
   #   * yoloe26_s.onnx
@@ -344,9 +344,8 @@ jobs:
         run: |
           set -euo pipefail
           # --clobber so a workflow re-run replaces existing assets
-          # instead of failing. install.sh asset (renamed from
-          # scripts/bootstrap.sh on upload) is what operators curl
-          # for the bootstrap one-liner.
+          # instead of failing. bootstrap.sh is what operators curl
+          # for the one-liner install (see docs/INSTALL.md §6.1).
           gh release upload "$TAG" \
             --repo "${{ github.repository }}" \
             --clobber \
@@ -361,7 +360,7 @@ jobs:
           gh release upload "$TAG" \
             --repo "${{ github.repository }}" \
             --clobber \
-            "scripts/bootstrap.sh#install.sh"
+            "scripts/bootstrap.sh"
           # Also attach the four standalone model files so external
           # tooling can grab them without unpacking the tarball.
           # Same content as share/models/ inside the tarball.

@@ -204,6 +204,12 @@ if [[ -n "$TARBALL" ]]; then
         tar -xzf "$TARBALL" -C "$tmpdir" --strip-components=1
         mv "$tmpdir" "$RELEASE_DIR"
         chown -R root:root "$RELEASE_DIR"
+        # `mktemp -d` creates the dir with mode 0700, and `mv`
+        # preserves that mode. Without this chmod the `nexus` system
+        # user can't traverse $RELEASE_DIR to reach bin/nexus-engine
+        # and systemd reports status=203/EXEC ("Permission denied")
+        # on every start. Inner files keep the 0755 the CI staged.
+        chmod 0755 "$RELEASE_DIR"
     fi
 else
     if [[ -r "$SCRIPT_DIR/../VERSION" ]]; then
