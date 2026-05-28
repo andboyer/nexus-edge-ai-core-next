@@ -219,18 +219,42 @@ mod intel {
         // Path to `gt/gt0/rps_cur_freq_mhz` if present; we read
         // it per-snapshot so the operator sees current clock.
         freq_path: Option<PathBuf>,
-        // i915 PMU state. `None` when perf_event_open returned
-        // `EACCES` / `ENOSYS` at init, or when the kernel
-        // doesn't expose the `i915` event source at all. The
-        // failure reason is carried in `pmu_init_error` so the
-        // System page can show it inline.
-        pmu: Option<Mutex<IntelPmu>>,
+        // GPU PMU state. `None` when neither the legacy `i915`
+        // PMU nor the newer per-device `xe_<bdf>` PMU could be
+        // opened (kernel too old, missing CAP_PERFMON, iGPU
+        // unbound, etc). The failure reason is carried in
+        // `pmu_init_error` so the System page can show it
+        // inline.
+        pmu: Option<Mutex<IntelPmuBackend>>,
         // Operator-facing reason when `pmu` is `None`. Mirrored
         // into `GpuInfo::utilization_status` on every snapshot
         // so the UI can render a specific hint ("missing
         // CAP_PERFMON", "i915 PMU not exposed by this kernel",
         // …) instead of a generic "not available" line.
         pmu_init_error: Option<String>,
+    }
+
+    /// Either of the two Intel GPU PMU surfaces. `i915` is the
+    /// historical one (one event per engine, returning busy-ns
+    /// directly); `xe` is the Lunar-Lake / Battlemage successor
+    /// that exposes a per-device PMU (e.g.
+    /// `xe_0000_00_02.0`) with two events (`engine-active-ticks`,
+    /// `engine-total-ticks`) and an engine-class/instance encoded
+    /// into `config`. We sample either with the same
+    /// `snapshot()` signature so callers don't care which one
+    /// is alive.
+    pub(super) enum IntelPmuBackend {
+        I915(IntelPmu),
+        Xe(XePmu),
+    }
+
+    impl IntelPmuBackend {
+        fn snapshot(&mut self) -> Option<f32> {
+            match self {
+                IntelPmuBackend::I915(p) => p.snapshot(),
+                IntelPmuBackend::Xe(p) => p.snapshot(),
+            }
+        }
     }
 
     pub(super) fn try_init() -> Option<IntelSysfs> {
@@ -257,12 +281,33 @@ mod intel {
                 .map(|p| base.join(p))
                 .find(|p| p.exists());
 
+            // PCI BDF (`0000:00:02.0`) from the symlink target;
+            // the xe PMU is namespaced per-device as
+            // `xe_<bdf-with-underscores>`.
+            let pci_bdf = std::fs::read_link(&base).ok().and_then(|target| {
+                target
+                    .file_name()
+                    .and_then(|f| f.to_str())
+                    .map(str::to_string)
+            });
+
+            // Try the legacy i915 PMU first (covers Alder Lake-N,
+            // Raptor Lake, Tiger Lake, Arc A-series); fall back
+            // to the per-device xe PMU for Lunar Lake /
+            // Battlemage / anything booted with the xe driver.
             let (pmu, pmu_init_error) = match IntelPmu::try_open() {
-                Ok(p) => (Some(Mutex::new(p)), None),
-                Err(reason) => {
-                    tracing::warn!(reason = %reason, "i915 PMU init failed; GPU utilization will be unavailable");
-                    (None, Some(reason))
-                }
+                Ok(p) => (Some(Mutex::new(IntelPmuBackend::I915(p))), None),
+                Err(i915_reason) => match XePmu::try_open(pci_bdf.as_deref()) {
+                    Ok(p) => (Some(Mutex::new(IntelPmuBackend::Xe(p))), None),
+                    Err(xe_reason) => {
+                        let combined = format!("i915 PMU: {i915_reason}; xe PMU: {xe_reason}");
+                        tracing::warn!(
+                            reason = %combined,
+                            "neither i915 nor xe PMU could be opened; GPU utilization will be unavailable",
+                        );
+                        (None, Some(combined))
+                    }
+                },
             };
 
             tracing::info!(
@@ -303,7 +348,7 @@ mod intel {
                         None => (
                             None,
                             Some(
-                                "i915 PMU baseline warming up \u{2014} \
+                                "GPU PMU baseline warming up \u{2014} \
                                  a reading will appear after the next snapshot"
                                     .to_string(),
                             ),
@@ -480,6 +525,295 @@ mod intel {
             self.last_sample = Some((now, values));
             result
         }
+    }
+
+    // -----------------------------------------------------------------
+    // xe PMU backend (Lunar Lake / Battlemage and any future Intel
+    // GPU booted under the new `xe` driver instead of `i915`). The
+    // shape is intentionally different from `IntelPmu`:
+    //
+    //   * the PMU is per-device (e.g. `xe_0000_00_02.0`), not
+    //     shared across all Intel cards;
+    //   * the kernel exposes ONE event for active ticks and ONE
+    //     for total ticks (`engine-active-ticks`, `engine-total-ticks`),
+    //     with the engine identity packed into `config`:
+    //       bits  0..11  event id (0x02 = active, 0x03 = total)
+    //       bits 12..19  engine instance
+    //       bits 20..27  engine class (0=render, 1=copy,
+    //                    2=video-decode, 3=video-enhance, 4=compute)
+    //       bits 60..63  gt (always 0 on consumer iGPUs)
+    //
+    // We probe (class, instance) pairs against the kernel via
+    // `perf_event_open`: kernels reject unknown engines with
+    // `ENOENT`, so we open one (active, total) pair per engine
+    // the device actually exposes. Utilization per snapshot is
+    // `sum(\u0394active) / sum(\u0394total) * 100`.
+    // -----------------------------------------------------------------
+
+    /// Each open xe engine — one (active, total) fd pair plus a
+    /// short label kept for tracing.
+    struct XeEngine {
+        active_fd: OwnedFd,
+        total_fd: OwnedFd,
+        label: String,
+    }
+
+    pub(super) struct XePmu {
+        engines: Vec<XeEngine>,
+        // Wall clock + per-engine (active, total) reading from
+        // the previous snapshot. `None` until the first sample
+        // warms the baseline (same contract as `IntelPmu`).
+        last_sample: Option<(Instant, Vec<(u64, u64)>)>,
+    }
+
+    impl XePmu {
+        fn try_open(pci_bdf: Option<&str>) -> Result<Self, String> {
+            let devices_root = Path::new("/sys/bus/event_source/devices");
+
+            // Pick the `xe_<bdf>` PMU entry. If the caller knew
+            // which PCI device we care about, prefer the matching
+            // one; otherwise the first xe entry wins (single-iGPU
+            // boxes are the common case).
+            let wanted = pci_bdf.map(|bdf| format!("xe_{}", bdf.replace(':', "_")));
+            let mut chosen: Option<PathBuf> = None;
+            let mut all_xe: Vec<String> = Vec::new();
+            match std::fs::read_dir(devices_root) {
+                Ok(rd) => {
+                    for e in rd.flatten() {
+                        let name = e.file_name().to_string_lossy().to_string();
+                        if !name.starts_with("xe_") {
+                            continue;
+                        }
+                        all_xe.push(name.clone());
+                        if let Some(w) = wanted.as_deref() {
+                            if name == w {
+                                chosen = Some(e.path());
+                                break;
+                            }
+                        } else if chosen.is_none() {
+                            chosen = Some(e.path());
+                        }
+                    }
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "could not enumerate {}: {e}",
+                        devices_root.display()
+                    ));
+                }
+            }
+            let base = chosen.ok_or_else(|| {
+                if all_xe.is_empty() {
+                    "no xe_<bdf> PMU entries under \
+                     /sys/bus/event_source/devices/ (kernel may use \
+                     the legacy i915 driver, which the i915 path \
+                     above handles)"
+                        .to_string()
+                } else {
+                    format!("no xe_<bdf> entry matches this card; saw {all_xe:?}")
+                }
+            })?;
+
+            let type_id: u32 = read_sysfs_u32(&base.join("type"))
+                .ok_or_else(|| format!("could not read {}/type", base.display()))?;
+
+            // Confirm the two events we rely on are actually
+            // present. We don't trust hard-coded 0x02/0x03 values
+            // \u2014 read them from the sysfs `events/` files so the
+            // backend keeps working if a future xe revision
+            // shuffles event IDs.
+            let events_dir = base.join("events");
+            let active_event = read_event_config(&events_dir.join("engine-active-ticks"))
+                .ok_or_else(|| {
+                    format!(
+                        "{} missing the `engine-active-ticks` event \
+                         (kernel xe PMU layout changed?)",
+                        events_dir.display()
+                    )
+                })?;
+            let total_event = read_event_config(&events_dir.join("engine-total-ticks"))
+                .ok_or_else(|| {
+                    format!(
+                        "{} missing the `engine-total-ticks` event \
+                         (kernel xe PMU layout changed?)",
+                        events_dir.display()
+                    )
+                })?;
+
+            // The xe PMU is rooted on a single CPU (cpumask = "0"
+            // on Lunar Lake, may differ on multi-socket gear). We
+            // honour whatever the kernel says so we don't get
+            // EINVAL when opening on the wrong CPU.
+            let cpu = read_sysfs_string(&base.join("cpumask"))
+                .ok()
+                .and_then(|s| {
+                    s.trim()
+                        .split(&[',', '-'][..])
+                        .next()
+                        .and_then(|t| t.parse::<i32>().ok())
+                })
+                .unwrap_or(0);
+
+            // Probe (class, instance) pairs against the kernel.
+            // Engine classes from `include/uapi/drm/xe_drm.h`:
+            //   0 = DRM_XE_ENGINE_CLASS_RENDER
+            //   1 = DRM_XE_ENGINE_CLASS_COPY
+            //   2 = DRM_XE_ENGINE_CLASS_VIDEO_DECODE
+            //   3 = DRM_XE_ENGINE_CLASS_VIDEO_ENHANCE
+            //   4 = DRM_XE_ENGINE_CLASS_COMPUTE
+            // gt=0 covers every single-tile consumer iGPU. We
+            // walk instances 0..16 per class \u2014 the kernel returns
+            // ENOENT/EINVAL for absent instances which we silently
+            // skip.
+            let class_labels = [
+                (0u64, "render"),
+                (1, "copy"),
+                (2, "video-decode"),
+                (3, "video-enhance"),
+                (4, "compute"),
+            ];
+            let mut engines: Vec<XeEngine> = Vec::new();
+            let mut first_unexpected_errno: Option<i32> = None;
+            for &(class, label_class) in &class_labels {
+                for instance in 0u64..16 {
+                    let cfg_base = (class << 20) | (instance << 12);
+                    let cfg_active = cfg_base | active_event;
+                    let cfg_total = cfg_base | total_event;
+                    let active_fd = match open_pmu_event(type_id, cfg_active, cpu) {
+                        Ok(fd) => fd,
+                        Err(e) => {
+                            if e == libc::EACCES || e == libc::EPERM {
+                                return Err(format!(
+                                    "perf_event_open returned {} on xe PMU \u{2014} the \
+                                     engine process is missing CAP_PERFMON. \
+                                     Grant it via the systemd unit \
+                                     (AmbientCapabilities=CAP_PERFMON; this is \
+                                     the default in v0.1.14+). Check \
+                                     `grep CapEff /proc/$(pgrep nexus-engine)/status` \
+                                     \u{2014} CAP_PERFMON is bit 38 (0x4000000000).",
+                                    errno_name(e),
+                                ));
+                            }
+                            // ENOENT / EINVAL just mean this
+                            // (class, instance) pair isn't an
+                            // engine on this chip \u2014 keep walking.
+                            if e != libc::ENOENT && e != libc::EINVAL {
+                                first_unexpected_errno.get_or_insert(e);
+                            }
+                            continue;
+                        }
+                    };
+                    let total_fd = match open_pmu_event(type_id, cfg_total, cpu) {
+                        Ok(fd) => fd,
+                        Err(e) => {
+                            tracing::warn!(
+                                errno = e,
+                                class = label_class,
+                                instance,
+                                "xe PMU active event opened but total event did not; skipping engine",
+                            );
+                            // Drop active_fd by letting it go
+                            // out of scope (OwnedFd closes on
+                            // Drop).
+                            drop(active_fd);
+                            continue;
+                        }
+                    };
+                    engines.push(XeEngine {
+                        active_fd,
+                        total_fd,
+                        label: format!("{label_class}{instance}"),
+                    });
+                }
+            }
+            if engines.is_empty() {
+                return Err(format!(
+                    "no xe engines could be opened under {} (last unexpected errno: {:?})",
+                    base.display(),
+                    first_unexpected_errno.map(errno_name),
+                ));
+            }
+            let labels: Vec<&str> = engines.iter().map(|e| e.label.as_str()).collect();
+            tracing::info!(
+                pmu = %base.display(),
+                engines = engines.len(),
+                engine_list = ?labels,
+                "xe PMU opened; sampling utilization on each /system/metrics call",
+            );
+            Ok(XePmu {
+                engines,
+                last_sample: None,
+            })
+        }
+
+        fn snapshot(&mut self) -> Option<f32> {
+            let now = Instant::now();
+            let mut values = Vec::with_capacity(self.engines.len());
+            for eng in &self.engines {
+                let mut a = [0u8; 8];
+                let mut t = [0u8; 8];
+                // SAFETY: perf event fds always return exactly
+                // 8 bytes for the default read_format (a single
+                // u64 counter value).
+                let na = unsafe { libc::read(eng.active_fd.as_raw_fd(), a.as_mut_ptr().cast(), 8) };
+                let nt = unsafe { libc::read(eng.total_fd.as_raw_fd(), t.as_mut_ptr().cast(), 8) };
+                if na != 8 || nt != 8 {
+                    return None;
+                }
+                values.push((u64::from_ne_bytes(a), u64::from_ne_bytes(t)));
+            }
+            let result = match &self.last_sample {
+                Some((prev_t, prev_v)) if prev_v.len() == values.len() => {
+                    let elapsed_ns = now.duration_since(*prev_t).as_nanos() as u64;
+                    if elapsed_ns < 100_000_000 {
+                        None
+                    } else {
+                        let mut active_delta: u64 = 0;
+                        let mut total_delta: u64 = 0;
+                        for ((a, t), (pa, pt)) in values.iter().zip(prev_v.iter()) {
+                            active_delta = active_delta.saturating_add(a.saturating_sub(*pa));
+                            total_delta = total_delta.saturating_add(t.saturating_sub(*pt));
+                        }
+                        if total_delta == 0 {
+                            None
+                        } else {
+                            let pct = (active_delta as f64 / total_delta as f64) * 100.0;
+                            Some(pct.clamp(0.0, 100.0) as f32)
+                        }
+                    }
+                }
+                _ => None,
+            };
+            self.last_sample = Some((now, values));
+            result
+        }
+    }
+
+    /// Variant of `open_i915_event` that takes an explicit CPU
+    /// argument. The xe PMU's `cpumask` may be non-zero on
+    /// multi-socket systems, so the caller resolves it from
+    /// sysfs and passes it through here.
+    fn open_pmu_event(type_id: u32, config: u64, cpu: i32) -> Result<OwnedFd, i32> {
+        use perf_event_open_sys as pes;
+        // SAFETY: zero-init is the documented baseline for
+        // `perf_event_attr`. All bitfields default to 0 which
+        // matches "start enabled, count kernel + hv".
+        let mut attr: pes::bindings::perf_event_attr = unsafe { std::mem::zeroed() };
+        attr.size = std::mem::size_of::<pes::bindings::perf_event_attr>() as u32;
+        attr.type_ = type_id;
+        attr.config = config;
+        // SAFETY: `attr` populated above; pid=-1 (system-wide),
+        // group_fd=-1, flags=0 \u2014 standard uncore PMU call.
+        let raw = unsafe { pes::perf_event_open(&mut attr, -1, cpu, -1, 0) };
+        if raw < 0 {
+            // SAFETY: glibc/musl TLS pointer, valid on a live
+            // thread.
+            let errno = unsafe { *libc::__errno_location() };
+            return Err(errno);
+        }
+        // SAFETY: fresh fd from syscall, OwnedFd transfers
+        // close-on-drop ownership.
+        Ok(unsafe { OwnedFd::from_raw_fd(raw as i32) })
     }
 
     /// Read a sysfs file and parse a single `u32`.

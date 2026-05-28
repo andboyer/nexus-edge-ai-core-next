@@ -509,6 +509,22 @@ _drivers_intel_graphics() {
         warn "Intel graphics installed but vainfo did not report iHD;"
         warn "a reboot may be required. Re-run install.sh after reboot."
     fi
+
+    # GPU PMU exposure check — without one of these sysfs nodes
+    # the engine can't report GPU utilization on the System page.
+    # Most boxes will have `i915` (Alder Lake-N, Raptor Lake,
+    # Iris Xe, Arc A-series) or `xe_<bdf>` (Lunar Lake / Battlemage
+    # on kernel 6.8+). We only warn — a missing PMU does not break
+    # detection or recording, it just hides one telemetry field.
+    if ! ls /sys/bus/event_source/devices/i915 \
+              /sys/bus/event_source/devices/xe_* \
+              >/dev/null 2>&1; then
+        warn "no Intel GPU PMU exposed (neither /sys/bus/event_source/devices/i915"
+        warn "nor xe_<bdf> present); the System page will show 'utilization unavailable'."
+        warn "Check 'lsmod | grep -E ^i915\\|^xe' and 'dmesg | grep -iE i915\\|xe'"
+        warn "for binding errors. CAP_PERFMON is required by nexus-engine and is"
+        warn "set by the systemd unit in v0.1.14+."
+    fi
 }
 
 # Install Intel NPU driver from upstream GitHub release. Pinned to
