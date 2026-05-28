@@ -161,6 +161,11 @@ mod nvidia {
                 .temperature(nvml_wrapper::enum_wrappers::device::TemperatureSensor::Gpu)
                 .ok()
                 .map(|t| t as f32);
+            let utilization_status = if util.is_none() {
+                Some("NVML utilization_rates() returned an error".to_string())
+            } else {
+                None
+            };
             Some(GpuInfo {
                 kind: "nvidia".to_string(),
                 name: self.name.clone(),
@@ -168,6 +173,7 @@ mod nvidia {
                 mem_used_bytes: mem.map(|m| m.used),
                 utilization_pct: util,
                 temp_c: temp,
+                utilization_status,
             })
         }
     }
@@ -215,8 +221,16 @@ mod intel {
         freq_path: Option<PathBuf>,
         // i915 PMU state. `None` when perf_event_open returned
         // `EACCES` / `ENOSYS` at init, or when the kernel
-        // doesn't expose the `i915` event source at all.
+        // doesn't expose the `i915` event source at all. The
+        // failure reason is carried in `pmu_init_error` so the
+        // System page can show it inline.
         pmu: Option<Mutex<IntelPmu>>,
+        // Operator-facing reason when `pmu` is `None`. Mirrored
+        // into `GpuInfo::utilization_status` on every snapshot
+        // so the UI can render a specific hint ("missing
+        // CAP_PERFMON", "i915 PMU not exposed by this kernel",
+        // …) instead of a generic "not available" line.
+        pmu_init_error: Option<String>,
     }
 
     pub(super) fn try_init() -> Option<IntelSysfs> {
@@ -243,7 +257,13 @@ mod intel {
                 .map(|p| base.join(p))
                 .find(|p| p.exists());
 
-            let pmu = IntelPmu::try_open().map(Mutex::new);
+            let (pmu, pmu_init_error) = match IntelPmu::try_open() {
+                Ok(p) => (Some(Mutex::new(p)), None),
+                Err(reason) => {
+                    tracing::warn!(reason = %reason, "i915 PMU init failed; GPU utilization will be unavailable");
+                    (None, Some(reason))
+                }
+            };
 
             tracing::info!(
                 name = %name,
@@ -254,6 +274,7 @@ mod intel {
                 name,
                 freq_path,
                 pmu,
+                pmu_init_error,
             });
         }
         None
@@ -273,10 +294,23 @@ mod intel {
                     }
                 }
             }
-            let utilization_pct = self.pmu.as_ref().and_then(|m| {
-                let mut guard = m.lock().ok()?;
-                guard.snapshot()
-            });
+            let (utilization_pct, utilization_status) = match &self.pmu {
+                None => (None, self.pmu_init_error.clone()),
+                Some(m) => match m.lock() {
+                    Err(_) => (None, Some("PMU mutex poisoned".to_string())),
+                    Ok(mut guard) => match guard.snapshot() {
+                        Some(pct) => (Some(pct), None),
+                        None => (
+                            None,
+                            Some(
+                                "i915 PMU baseline warming up \u{2014} \
+                                 a reading will appear after the next snapshot"
+                                    .to_string(),
+                            ),
+                        ),
+                    },
+                },
+            };
             GpuInfo {
                 kind: "intel".to_string(),
                 name: display,
@@ -284,6 +318,7 @@ mod intel {
                 mem_used_bytes: None,
                 utilization_pct,
                 temp_c: None,
+                utilization_status,
             }
         }
     }
@@ -304,16 +339,18 @@ mod intel {
     }
 
     impl IntelPmu {
-        fn try_open() -> Option<Self> {
+        fn try_open() -> Result<Self, String> {
             let base = Path::new("/sys/bus/event_source/devices/i915");
             if !base.exists() {
-                tracing::debug!(
-                    "i915 PMU not exposed at /sys/bus/event_source/devices/i915 \
-                     (no kernel module or pre-4.14 kernel); skipping",
-                );
-                return None;
+                return Err("/sys/bus/event_source/devices/i915 not present \u{2014} \
+                     the kernel may use the newer `xe` driver (kernel \
+                     6.8+ on Battlemage/Lunar Lake) or no DRM driver is \
+                     bound to the iGPU"
+                    .to_string());
             }
-            let type_id: u32 = read_sysfs_u32(&base.join("type"))?;
+            let type_id: u32 = read_sysfs_u32(&base.join("type")).ok_or_else(|| {
+                "could not read /sys/bus/event_source/devices/i915/type".to_string()
+            })?;
 
             // Enumerate engine-busy events. Each event file
             // (e.g. `rcs0-busy`, `bcs0-busy`, `vcs0-busy`,
@@ -323,7 +360,7 @@ mod intel {
             // VEnh = 5 engines; Lunar Lake has different counts.
             let events_dir = base.join("events");
             let mut event_files: Vec<PathBuf> = std::fs::read_dir(&events_dir)
-                .ok()?
+                .map_err(|e| format!("could not enumerate {}: {e}", events_dir.display()))?
                 .filter_map(|e| e.ok())
                 .map(|e| e.path())
                 .filter(|p| {
@@ -339,40 +376,66 @@ mod intel {
             // across samples even if readdir order shifts.
             event_files.sort();
 
-            let mut engine_fds = Vec::with_capacity(event_files.len());
+            if event_files.is_empty() {
+                return Err(format!(
+                    "no per-engine busy events under {} (kernel exposes the \
+                     i915 PMU but with no `<engine>-busy` counters \u{2014} \
+                     try a newer kernel)",
+                    events_dir.display()
+                ));
+            }
+
+            let total_events = event_files.len();
+            let mut engine_fds = Vec::with_capacity(total_events);
+            let mut skipped: Vec<(String, i32)> = Vec::new();
             for path in &event_files {
                 let Some(config) = read_event_config(path) else {
+                    skipped.push((short_name(path), -1));
                     continue;
                 };
                 match open_i915_event(type_id, config) {
                     Ok(fd) => engine_fds.push(fd),
                     Err(e) => {
-                        if e == nix_eaccess() {
-                            tracing::info!(
-                                "i915 PMU open returned EACCES; the engine \
-                                 process lacks CAP_PERFMON. GPU utilization will \
-                                 be unavailable. Grant the cap via the systemd \
-                                 unit (AmbientCapabilities=CAP_PERFMON) or run \
-                                 with `--cap-add=PERFMON` under Docker.",
-                            );
-                            return None;
+                        if e == nix_eaccess() || e == libc::EPERM {
+                            // First EACCES/EPERM is decisive — the
+                            // kernel rejected the open because the
+                            // process lacks CAP_PERFMON (or
+                            // perf_event_paranoid ≥ 3 on a stock
+                            // Ubuntu kernel). Bail with a specific
+                            // reason; no further events will succeed.
+                            return Err(format!(
+                                "perf_event_open returned {} on {} \u{2014} the \
+                                 engine process is missing CAP_PERFMON. \
+                                 Grant it via the systemd unit \
+                                 (AmbientCapabilities=CAP_PERFMON; this is \
+                                 the default in v0.1.14+) or run with \
+                                 `--cap-add=PERFMON` under Docker. Check \
+                                 `grep CapEff /proc/$(pgrep nexus-engine)/status` \
+                                 \u{2014} CAP_PERFMON is bit 38 (0x4000000000).",
+                                errno_name(e),
+                                short_name(path),
+                            ));
                         }
-                        tracing::debug!(
-                            error = e,
+                        tracing::warn!(
+                            errno = e,
                             event = %path.display(),
                             "i915 PMU event open failed; skipping engine",
                         );
+                        skipped.push((short_name(path), e));
                     }
                 }
             }
             if engine_fds.is_empty() {
-                return None;
+                return Err(format!(
+                    "all {total_events} i915 PMU event opens failed (errnos: {skipped:?})",
+                ));
             }
             tracing::info!(
                 engines = engine_fds.len(),
+                total = total_events,
                 "i915 PMU opened; sampling utilization on each /system/metrics call",
             );
-            Some(IntelPmu {
+            Ok(IntelPmu {
                 engine_fds,
                 last_sample: None,
             })
@@ -487,6 +550,33 @@ mod intel {
 
     use std::os::fd::FromRawFd;
 
+    /// Best-effort short label for an event sysfs path
+    /// (e.g. `/sys/bus/event_source/devices/i915/events/rcs0-busy`
+    /// → `rcs0-busy`). Falls back to the full display path when
+    /// the basename is missing for some reason.
+    fn short_name(p: &Path) -> String {
+        p.file_name()
+            .and_then(|n| n.to_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| p.display().to_string())
+    }
+
+    /// Render a small set of operator-visible errno values
+    /// (everything we expect to see from `perf_event_open` on
+    /// the iGPU PMU) into a short string. Anything else falls
+    /// back to the numeric value.
+    fn errno_name(e: i32) -> String {
+        match e {
+            libc::EACCES => "EACCES".to_string(),
+            libc::EPERM => "EPERM".to_string(),
+            libc::ENOENT => "ENOENT".to_string(),
+            libc::ENODEV => "ENODEV".to_string(),
+            libc::ENOSYS => "ENOSYS".to_string(),
+            libc::EINVAL => "EINVAL".to_string(),
+            other => format!("errno {other}"),
+        }
+    }
+
     /// Map a handful of common Intel iGPU PCI device IDs to
     /// friendly names. Anything unknown falls back to "Intel
     /// integrated graphics" + the raw ID for support tickets.
@@ -573,6 +663,12 @@ mod apple {
                 mem_used_bytes: None,
                 utilization_pct: None,
                 temp_c: None,
+                utilization_status: Some(
+                    "live utilization requires Apple's private IOReport \
+                     framework (not implemented in this build); device \
+                     name is detected via system_profiler"
+                        .to_string(),
+                ),
             }
         }
     }

@@ -94,6 +94,14 @@ pub struct GpuInfo {
     pub mem_used_bytes: Option<u64>,
     pub utilization_pct: Option<f32>,
     pub temp_c: Option<f32>,
+    /// Operator-facing explanation when `utilization_pct` is `None`.
+    /// `Some("...")` describes which PMU init / sampling step
+    /// failed; `None` means utilization is being reported normally.
+    /// Populated by `gpu::IntelSysfs::snapshot` and the macOS /
+    /// NVIDIA paths so the System page can show the reason inline
+    /// instead of a generic "not available" hint.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub utilization_status: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

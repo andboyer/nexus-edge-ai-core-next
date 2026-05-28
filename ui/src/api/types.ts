@@ -427,6 +427,11 @@ export interface SystemGpuInfo {
   mem_used_bytes: number | null;
   utilization_pct: number | null;
   temp_c: number | null;
+  /// Operator-facing reason when `utilization_pct` is `null`.
+  /// Populated by the engine when PMU init or sampling failed
+  /// (e.g. "missing CAP_PERFMON", "i915 PMU not exposed");
+  /// `null` when utilization is being reported normally.
+  utilization_status?: string | null;
 }
 
 export interface SystemDiskInfo {

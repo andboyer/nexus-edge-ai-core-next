@@ -226,6 +226,13 @@ export function SystemPage() {
                   }
                 />
               </div>
+              {(m.gpu.utilization_pct === null ||
+                m.gpu.utilization_pct === undefined) &&
+              m.gpu.utilization_status ? (
+                <p className="mt-3 text-xs text-muted-foreground">
+                  {m.gpu.utilization_status}
+                </p>
+              ) : null}
             </div>
           ) : (
             <p className="text-sm text-muted-foreground">
