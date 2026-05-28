@@ -19,9 +19,13 @@ Thumbs.db
 # models/ contents are large binaries staged out-of-band (CI bake or
 # operator scp); track the directory itself via models/.gitkeep so
 # from-source `docker build` doesn't fail on a missing path, but
-# never commit the .onnx / manifest files.
+# never commit the .onnx files. The lightweight manifest IS tracked
+# (~3 KB) — it's the canonical per-release source of truth for which
+# artifacts ship, their preset → file mapping, and per-file sha256
+# checksums (patched in place by tools/models/gen_yolo26n.py).
 /models/*
 !/models/.gitkeep
+!/models/models-manifest.json
 # Upstream model checkpoints / torchscript dumps occasionally land at
 # the repo root from `tools/models/gen_*.py` runs. They are large
 # binaries — keep them out of git, same rationale as /models/*.
