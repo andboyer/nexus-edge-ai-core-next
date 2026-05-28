@@ -15,6 +15,7 @@ use nexus_tracker::build_tracker;
 use tracing::{info, warn};
 
 mod admin_auth;
+mod admin_cli;
 mod admin_network;
 mod admin_runtime;
 mod api;
@@ -119,9 +120,11 @@ struct Cli {
     command: Option<Cmd>,
 }
 
-/// Subcommand verbs. Currently just `enroll` (one-shot cloud
-/// onboarding); future entries will add `rotate-cert`, `factory-reset`,
-/// etc.
+/// Subcommand verbs. `enroll` is the one-shot cloud onboarding
+/// flow; `set-admin-password` lets the installer (and the
+/// forgot-password recovery path) write the local `admin`
+/// password from stdin without spinning up the full pipeline.
+/// Future entries will add `rotate-cert`, `factory-reset`, etc.
 #[derive(Debug, Subcommand)]
 enum Cmd {
     /// Enroll this core against a cloud console using a one-shot code
@@ -129,6 +132,14 @@ enum Cmd {
     /// bundle into the local store; the next `nexus-engine` boot picks
     /// up the row and starts the WSS tunnel.
     Enroll(cloud_enroll::EnrollArgs),
+
+    /// Set (or create) the local admin password from stdin. Used by
+    /// `scripts/install.sh` on first install so the operator picks
+    /// the password instead of grepping a one-time OTP out of a
+    /// sentinel file, and as the forgot-password recovery path.
+    /// Reads the plaintext from stdin (one line) or from
+    /// `--password-file <PATH>`.
+    SetAdminPassword(admin_cli::SetAdminPasswordArgs),
 }
 
 impl Cli {
@@ -209,6 +220,7 @@ fn main() -> Result<()> {
     if let Some(cmd) = cli.command.as_ref() {
         return match cmd {
             Cmd::Enroll(args) => runtime.block_on(cloud_enroll::run_enroll(&cfg, args)),
+            Cmd::SetAdminPassword(args) => runtime.block_on(admin_cli::run(&cfg, args)),
         };
     }
 
