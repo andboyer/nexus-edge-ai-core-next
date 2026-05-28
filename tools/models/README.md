@@ -26,7 +26,7 @@ repo's `models/` directory by absolute path.
 
 | Script | Output | Used by |
 |---|---|---|
-| `gen_yolo26n.py` | `models/yolo26n_dynamic.onnx` (~10 MB) | M1 closed-vocab detector (`YoloOrtDetector`). |
+| `gen_yolo26n.py` | `models/yolo26n_{640,960,1280}.onnx` (~10 MB each) | M1 closed-vocab detector (`YoloOrtDetector`); ships three static-shape sizes per release. |
 | `gen_yolo_world.py` | `models/yolo_world_v2_s.onnx` (~50–80 MB) | M3 open-vocab detector (`YoloWorldDetector`). Embeds the text encoder into the graph and bakes the operator-supplied prompt vocabulary as fixed text inputs. |
 | `gen_yoloe.py` | `models/yoloe26_s.onnx` (~25–35 MB) | M3.1 text-mode YOLOE detector (`YoloeDetector`). Mirrors `gen_yolo_world.py` against the upstream `ultralytics.YOLOE` checkpoint. |
 | `gen_yoloe_visual.py` | `models/yoloe26_s_image_encoder.onnx` (~15–20 MB) | M3.1 visual-prompt encoder for `YoloeVisualDetector`. Run AFTER `gen_yoloe.py`; produces the standalone image-embedding ONNX the engine's admin upload path uses to encode reference crops. |

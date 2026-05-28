@@ -20,7 +20,7 @@ Output:
 
 The prompt file lives under `tools/models/` (tracked) so the prompt
 vocabulary is reproducible; the ONNX itself stays under `models/`
-(gitignored) per the same policy as `yolo26n_dynamic.onnx`.
+(gitignored) per the same policy as `yolo26n_{640,960,1280}.onnx`.
 """
 
 from __future__ import annotations

@@ -1459,9 +1459,13 @@ python3.11 -m venv .venv-modelgen
 source .venv-modelgen/bin/activate
 pip install -r tools/models/requirements.txt
 
-# Closed-vocab base detector.
-python tools/models/gen_yolo26n.py \
-    --output /var/lib/nexus/models/yolo26n_dynamic.onnx
+# Closed-vocab base detector. Ships three static-shape sizes;
+# generate all of them so per-camera UI overrides work.
+python tools/models/gen_yolo26n.py --all-static
+# Files written to models/yolo26n_640.onnx, _960.onnx, _1280.onnx.
+# Copy them into the engine's pack dir if not already running from
+# the repo tree:
+sudo install -m 0644 models/yolo26n_*.onnx /var/lib/nexus/models/
 
 # Open-vocab YOLO-World.
 mkdir -p models/.cache
