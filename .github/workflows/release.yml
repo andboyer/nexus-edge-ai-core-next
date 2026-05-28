@@ -11,14 +11,17 @@
 #   gh release create vX.Y.Z --target main \
 #     --title "vX.Y.Z" --generate-notes
 #
-# The workflow generates the default model pack from
+# The workflow generates the open-vocab model pack from
 # `tools/models/gen_*.py` on cache miss (cached by script + requirements +
 # prompt-file hash, so re-runs against the same generation logic hit gha
-# cache in <30s; cold runs take ~5-10 min). The four model files
-# (`yolo26n_dynamic.onnx`, `yolo_world_v2_s.onnx`, `yoloe26_s.onnx`,
-# `models-manifest.json`) are baked into the tarball AND also attached as
-# standalone release assets so external tooling can download them
-# individually without unpacking.
+# cache in <30s; cold runs take ~5-10 min). The closed-vocab `yolo26n_*`
+# files cannot be generated here — `yolov26n.pt` is not a public
+# ultralytics checkpoint — so the operator must `gh release upload $TAG
+# models/yolo26n_640.onnx models/yolo26n_960.onnx models/yolo26n_1280.onnx`
+# before triggering this workflow. The six files (yolo26n_{640,960,1280},
+# yolo_world_v2_s, yoloe26_s, models-manifest.json) are baked into the
+# tarball AND also attached as standalone release assets so external
+# tooling can download them individually without unpacking.
 #
 # Docker / GHCR publishing was removed when the LAN-management feature
 # replaced the docker-compose install path with bare-metal systemd. The
@@ -77,7 +80,9 @@ jobs:
   #   * <tarball>.tar.gz.sha256
   #   * <tarball>.tar.gz.manifest.sig    (when signing key configured)
   #   * bootstrap.sh                     (= scripts/bootstrap.sh; one-liner entrypoint)
-  #   * yolo26n_dynamic.onnx             (also embedded in tarball)
+  #   * yolo26n_640.onnx                 (also embedded in tarball; T10/T24 default)
+  #   * yolo26n_960.onnx                 (also embedded in tarball; T36/T36-S default)
+  #   * yolo26n_1280.onnx                (also embedded in tarball; per-camera UI opt-in)
   #   * yolo_world_v2_s.onnx
   #   * yoloe26_s.onnx
   #   * models-manifest.json
@@ -116,14 +121,27 @@ jobs:
           mkdir -p models
           gh release download "$TAG" \
             --repo "${{ github.repository }}" \
-            --pattern 'yolo26n_dynamic.onnx' \
+            --pattern 'yolo26n_640.onnx' \
+            --pattern 'yolo26n_960.onnx' \
+            --pattern 'yolo26n_1280.onnx' \
             --pattern 'yolo_world_v2_s.onnx' \
             --pattern 'yoloe26_s.onnx' \
             --pattern 'models-manifest.json' \
             --dir models/
           echo "Staged model pack:"
           ls -la models/
-          for f in yolo26n_dynamic.onnx yolo_world_v2_s.onnx yoloe26_s.onnx models-manifest.json; do
+          # yolo26n now ships as three per-size static-shape exports (640/960/1280).
+          # Each is required for its per-tier default (T10/T24=640, T36/T36-S=960)
+          # and the 1280 file backs the per-camera UI override for plate/face work.
+          # The legacy yolo26n_dynamic.onnx is no longer shipped — Intel NPU plugin
+          # silently falls back to CPU on dynamic-shape models (observed on Lunar
+          # Lake k13 under v0.1.18), and the OpenVINO blob cache only hits on
+          # static shapes. Operator must `python tools/models/gen_yolo26n.py
+          # --all-static` and `gh release upload $TAG models/yolo26n_640.onnx
+          # models/yolo26n_960.onnx models/yolo26n_1280.onnx` before this workflow
+          # can run — GH-hosted runners cannot generate these themselves because
+          # yolov26n.pt is not a public ultralytics checkpoint.
+          for f in yolo26n_640.onnx yolo26n_960.onnx yolo26n_1280.onnx yolo_world_v2_s.onnx yoloe26_s.onnx models-manifest.json; do
             if [ ! -s "models/$f" ]; then
               echo "::error::Required model asset 'models/$f' missing from release $TAG. Upload via 'gh release upload $TAG models/$f' then re-run this workflow."
               exit 1
@@ -212,7 +230,9 @@ jobs:
           install -m 0755 target/release/nexus-doctor "$R/bin/"
 
           cp -a ui/dist/. "$R/share/ui/"
-          cp -a models/yolo26n_dynamic.onnx \
+          cp -a models/yolo26n_640.onnx \
+                models/yolo26n_960.onnx \
+                models/yolo26n_1280.onnx \
                 models/yolo_world_v2_s.onnx \
                 models/yoloe26_s.onnx \
                 models/models-manifest.json "$R/share/models/"
@@ -361,13 +381,20 @@ jobs:
             --repo "${{ github.repository }}" \
             --clobber \
             "scripts/bootstrap.sh"
-          # Also attach the four standalone model files so external
+          # Also attach the standalone model files so external
           # tooling can grab them without unpacking the tarball.
           # Same content as share/models/ inside the tarball.
+          # The three yolo26n_<size>.onnx files were already required
+          # to be present before the workflow started (see "stage model
+          # pack from release assets" above); re-uploading with
+          # --clobber keeps the release surface consistent if the
+          # operator regenerated mid-run.
           gh release upload "$TAG" \
             --repo "${{ github.repository }}" \
             --clobber \
-            models/yolo26n_dynamic.onnx \
+            models/yolo26n_640.onnx \
+            models/yolo26n_960.onnx \
+            models/yolo26n_1280.onnx \
             models/yolo_world_v2_s.onnx \
             models/yoloe26_s.onnx \
             models/models-manifest.json
