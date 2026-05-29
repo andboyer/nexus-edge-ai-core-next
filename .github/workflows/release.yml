@@ -293,7 +293,7 @@ jobs:
       # filters the whole 1.24.x line out as "no matching distribution"
       # (looks identical to the version having been yanked). Pin Python
       # 3.11 here so pip can resolve the cp311 manylinux wheel.
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
       - name: stage ONNX Runtime + OpenVINO libs
