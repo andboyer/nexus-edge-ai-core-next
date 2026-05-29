@@ -475,28 +475,36 @@ _ensure_kobuk_ppa() {
 }
 
 # Ensure libze1 (oneAPI Level Zero loader, libze_loader.so.1) is
-# installed. Required by the OpenVINO NPU and GPU plugins to
-# enumerate devices. Without it, OV reports "wrong configuration
-# value for the key 'device_type'" at session-create time and ORT
-# silently falls back to CPU while still reporting the NPU EP as
-# registered — a difficult-to-diagnose regression seen on T36-S
-# Lunar Lake boxes provisioned before this helper existed.
+# installed FROM the kobuk-team PPA (NOT the Ubuntu archive). The
+# Ubuntu noble archive ships libze1 1.16.1, which the OpenVINO
+# 2025.4.x NPU plugin (bundled in onnxruntime-openvino ≥ 1.24.x)
+# cannot drive: enumeration succeeds at the OV layer but device
+# init fails with `[OpenVINO] Device NPU is not available`. The
+# kobuk-team PPA ships a newer libze1 that matches the
+# intel-level-zero-npu 1.32.x ABI.
 #
-# Idempotent. Called from both `_drivers_intel_graphics` and
-# `_drivers_intel_npu` so a box with only an NPU (no display iGPU
-# path through OV) still gets the loader.
+# Idempotent: when libze1 is already at the PPA-pinned version
+# apt-get install is a no-op. When it's the archive 1.16.1 the
+# install upgrades it. Called from both `_drivers_intel_graphics`
+# and `_drivers_intel_npu` so a box with only an NPU (no display
+# iGPU path through OV) still gets the loader.
+#
+# Why we DON'T early-return when libze1 is already present: an
+# earlier version of this helper checked `dpkg-query -W libze1`
+# first and short-circuited, which left boxes provisioned with
+# the Ubuntu archive 1.16.1 stuck at the wrong ABI version even
+# after the PPA-add helper landed. The check still happens
+# implicitly inside apt-get (it'll skip work when nothing to do).
 _ensure_libze1() {
-    if dpkg-query -W -f='${Status}' libze1 2>/dev/null \
-        | grep -q 'install ok installed'; then
-        return 0
-    fi
-    log "installing libze1 (oneAPI Level Zero loader)"
     _ensure_kobuk_ppa || return 1
+    log "installing/upgrading libze1 (oneAPI Level Zero loader) from kobuk-team PPA"
     if ! DEBIAN_FRONTEND=noninteractive apt-get install -y -qq libze1; then
         warn "libze1 install failed; OpenVINO NPU/GPU plugins will fail to enumerate devices"
         return 1
     fi
-    log "libze1 installed"
+    local ver
+    ver=$(dpkg-query -W -f='${Version}' libze1 2>/dev/null || echo unknown)
+    log "libze1 installed (version=$ver)"
 }
 
 # Install Intel iGPU / Arc dGPU stack from the kobuk-team PPA.
@@ -572,11 +580,11 @@ _drivers_intel_graphics() {
 _drivers_intel_npu() {
     # The OpenVINO NPU plugin (libopenvino_intel_npu_plugin.so) needs
     # the oneAPI Level Zero loader (libze1 → libze_loader.so.1) to
-    # enumerate the NPU device. Without it, OV reports "wrong
-    # configuration value for device_type" at session-create time and
-    # silently falls back to CPU — even though the back-end driver
-    # (intel-level-zero-npu) IS installed. Ensure it first; rest of
-    # this function depends on the loader being present.
+    # enumerate the NPU device. The kobuk-team PPA libze1 — NOT the
+    # Ubuntu archive's 1.16.1 — is required for OV 2025.4.x NPU
+    # plugin ABI. `_ensure_libze1` always runs (and is idempotent)
+    # so an upgrade-from-archive happens BEFORE the early-return on
+    # an already-installed NPU driver below.
     _ensure_libze1
 
     if [[ -e /dev/accel/accel0 ]] \

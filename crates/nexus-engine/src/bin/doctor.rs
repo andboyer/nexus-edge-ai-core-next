@@ -938,6 +938,15 @@ fn check_npu_runtime() -> Outcome {
             );
         }
         if libze_loader_present() {
+            if !kobuk_ppa_configured() {
+                return Outcome::fail(
+                    "9.9",
+                    "npu_runtime",
+                    "libze1 sourced from kobuk-team PPA (OV 2025.4.x NPU ABI)",
+                    "libze1 installed but kobuk-team PPA missing — libze1 is the Ubuntu archive's 1.16.1, OV 2025.4.x NPU plugin reports 'Device NPU is not available'".into(),
+                    "sudo add-apt-repository -y ppa:kobuk-team/intel-graphics && sudo apt update && sudo apt install -y libze1 && sudo systemctl restart nexus-engine — see INSTALL.md §5.3.",
+                );
+            }
             if let Some(missing) = openvino_npu_registry_problem() {
                 return Outcome::fail(
                     "9.9",
@@ -951,7 +960,7 @@ fn check_npu_runtime() -> Outcome {
                 "9.9",
                 "npu_runtime",
                 "libze1 installed AND OV plugins.xml registers NPU",
-                "libze_loader.so.1 resolvable, plugins.xml present and references libopenvino_intel_npu_plugin.so".into(),
+                "libze_loader.so.1 resolvable, kobuk-team PPA configured, plugins.xml present and references libopenvino_intel_npu_plugin.so".into(),
             )
         } else {
             Outcome::fail(
@@ -1039,6 +1048,43 @@ fn libze_loader_present() -> bool {
     ]
     .iter()
     .any(|p| std::path::Path::new(p).exists())
+}
+
+/// True when `ppa:kobuk-team/intel-graphics` (or its private mirror)
+/// is configured as an apt source. The Ubuntu noble archive ships
+/// `libze1` 1.16.1, which the OpenVINO 2025.4.x NPU plugin (bundled
+/// in `onnxruntime-openvino` ≥ 1.24.x) cannot drive — OV reports
+/// `Device NPU is not available` at session create. The kobuk-team
+/// PPA ships a newer `libze1` matched to `intel-level-zero-npu`
+/// 1.32.x. When `libze1` is installed but the PPA is absent, the
+/// loader is almost certainly the stale archive build.
+#[cfg(target_os = "linux")]
+fn kobuk_ppa_configured() -> bool {
+    for dir in ["/etc/apt/sources.list.d", "/etc/apt"] {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if !p.is_file() {
+                continue;
+            }
+            let ext_ok = p
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| matches!(e, "list" | "sources"));
+            let name_ok = p.file_name().and_then(|n| n.to_str()) == Some("sources.list");
+            if !ext_ok && !name_ok {
+                continue;
+            }
+            if let Ok(body) = std::fs::read_to_string(&p) {
+                if body.contains("kobuk-team/intel-graphics") {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 // ---------------------------------------------------------------------------
