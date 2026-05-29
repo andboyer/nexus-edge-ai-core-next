@@ -239,12 +239,49 @@ jobs:
             "onnxruntime-openvino==${ORT_VERSION}"
           mkdir -p stage/lib/onnxruntime
           cp -aP /tmp/ovwheel/onnxruntime/capi/*.so* stage/lib/onnxruntime/
+          # `plugins.xml` is OpenVINO Core's device registry — without it,
+          # `Core::get_available_devices()` returns an empty list and
+          # `ParseDeviceType("NPU")` rejects with `[OpenVINO] You have
+          # selected wrong configuration value for the key 'device_type'`,
+          # silently falling back to CPU. The wheel ships it alongside the
+          # plugin .so files in capi/, but it's not matched by `*.so*`.
+          if [ -f /tmp/ovwheel/onnxruntime/capi/plugins.xml ]; then
+            cp /tmp/ovwheel/onnxruntime/capi/plugins.xml \
+               stage/lib/onnxruntime/plugins.xml
+          else
+            # Wheel layout changed? Fall back to writing the canonical
+            # OV 2025.x plugin registry directly so the release isn't
+            # silently broken.
+            cat > stage/lib/onnxruntime/plugins.xml <<'PLUGINS_XML'
+          <ie>
+              <plugins>
+                  <plugin location="libopenvino_intel_cpu_plugin.so" name="CPU"/>
+                  <plugin location="libopenvino_intel_gpu_plugin.so" name="GPU"/>
+                  <plugin location="libopenvino_intel_npu_plugin.so" name="NPU"/>
+                  <plugin location="libopenvino_auto_plugin.so" name="AUTO"/>
+                  <plugin location="libopenvino_auto_plugin.so" name="MULTI"/>
+                  <plugin location="libopenvino_auto_plugin.so" name="BATCH"/>
+                  <plugin location="libopenvino_hetero_plugin.so" name="HETERO"/>
+              </plugins>
+          </ie>
+          PLUGINS_XML
+          fi
           # The ort crate dlopens libonnxruntime.so (unversioned);
           # the wheel only ships the .so.${ORT_VERSION} soname.
           if [ ! -e "stage/lib/onnxruntime/libonnxruntime.so" ]; then
             ln -s "libonnxruntime.so.${ORT_VERSION}" \
                   "stage/lib/onnxruntime/libonnxruntime.so"
           fi
+          # Sanity: every plugin referenced in plugins.xml must exist.
+          # Fails the release loudly rather than shipping a broken tarball.
+          missing=0
+          for so in $(grep -oE 'location="[^"]+"' stage/lib/onnxruntime/plugins.xml | sed 's/location="//;s/"//'); do
+            if [ ! -e "stage/lib/onnxruntime/$so" ]; then
+              echo "::error::plugins.xml references $so but it is not in stage/"
+              missing=1
+            fi
+          done
+          [ $missing -eq 0 ] || exit 1
 
       - name: assemble release tree
         run: |

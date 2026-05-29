@@ -938,11 +938,20 @@ fn check_npu_runtime() -> Outcome {
             );
         }
         if libze_loader_present() {
+            if let Some(missing) = openvino_npu_registry_problem() {
+                return Outcome::fail(
+                    "9.9",
+                    "npu_runtime",
+                    "OpenVINO plugins.xml registers NPU plugin",
+                    missing,
+                    "Re-stage the OpenVINO libs (release tarball >= the libze1 fix) or write /opt/nexus/current/lib/onnxruntime/plugins.xml referencing libopenvino_intel_npu_plugin.so — see INSTALL.md §5.3.",
+                );
+            }
             Outcome::pass(
                 "9.9",
                 "npu_runtime",
-                "libze1 (Level Zero loader) installed",
-                "libze_loader.so.1 resolvable".into(),
+                "libze1 installed AND OV plugins.xml registers NPU",
+                "libze_loader.so.1 resolvable, plugins.xml present and references libopenvino_intel_npu_plugin.so".into(),
             )
         } else {
             Outcome::fail(
@@ -954,6 +963,47 @@ fn check_npu_runtime() -> Outcome {
             )
         }
     }
+}
+
+/// Best-effort probe for the "OV libs present but plugins.xml missing"
+/// failure mode. Returns `None` when everything checks out, or
+/// `Some(actual)` describing the problem.
+///
+/// We probe both the release-staged path (`/opt/nexus/current/lib/
+/// onnxruntime/`) and the dev path (`./lib/onnxruntime/` relative to
+/// the running engine, in case the operator launched out of a build
+/// tree). If neither directory exists, we skip — this check is only
+/// meaningful when the engine binary is the release layout.
+#[cfg(target_os = "linux")]
+fn openvino_npu_registry_problem() -> Option<String> {
+    use std::path::PathBuf;
+    let candidates = [
+        PathBuf::from("/opt/nexus/current/lib/onnxruntime"),
+        PathBuf::from("/opt/nexus/lib/onnxruntime"),
+    ];
+    let dir = candidates.iter().find(|p| p.is_dir())?;
+    let plugin_so = dir.join("libopenvino_intel_npu_plugin.so");
+    let plugins_xml = dir.join("plugins.xml");
+    if !plugin_so.exists() {
+        return Some(format!(
+            "{} missing (re-stage OV libs from release tarball)",
+            plugin_so.display()
+        ));
+    }
+    if !plugins_xml.exists() {
+        return Some(format!(
+            "{} missing (OV Core cannot enumerate NPU without it)",
+            plugins_xml.display()
+        ));
+    }
+    let body = std::fs::read_to_string(&plugins_xml).ok()?;
+    if !body.contains("libopenvino_intel_npu_plugin.so") {
+        return Some(format!(
+            "{} present but does not reference libopenvino_intel_npu_plugin.so",
+            plugins_xml.display()
+        ));
+    }
+    None
 }
 
 #[cfg(target_os = "linux")]
