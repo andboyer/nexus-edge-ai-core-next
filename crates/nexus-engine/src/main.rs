@@ -886,6 +886,18 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
     // `storage_cold_replica` to it if still NULL, and kick the
     // replicator immediately.
     let cloud_enrollment_changed = std::sync::Arc::new(tokio::sync::Notify::new());
+    // Phase A Step 5 — the cloud-tunnel admin passthrough
+    // (`engine_rpc::EngineRpcHandler::handle_admin_passthrough`)
+    // needs to know which port the engine's own admin API ended up
+    // listening on so it can `POST http://127.0.0.1:<port>/api/v1
+    // /admin/...` for every forwarded cloud→edge envelope. We
+    // bootstrap from `cfg.server.api_bind` here so the supervisor
+    // has a non-`None` value to capture into the handler, then
+    // overwrite below (alongside the `current_bind` thread) after
+    // the runtime-setting override resolves.
+    let loopback_admin_base = std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(
+        crate::engine_rpc::loopback_admin_url_from_bind(&cfg.server.api_bind),
+    ));
     let (cloud_tunnel_shutdown_tx, cloud_tunnel_handle) = cloud_tunnel::spawn_tunnel(
         store.clone(),
         registry.clone(),
@@ -893,6 +905,7 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
         cloud_enrollment_changed.clone(),
         cloud_outbox.clone(),
         Some(trace_rx),
+        loopback_admin_base.clone(),
     );
 
     let cache_jobs = cold_read_cache::CacheJobs::new(
@@ -1069,6 +1082,14 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
         };
         let mut api_state = api_state;
         api_state.current_bind = bind.clone();
+        // Sync the cloud-tunnel admin passthrough's loopback URL
+        // with the effective bind so a runtime-setting override
+        // (e.g. operator persisted `api_bind` to a non-default
+        // port via `PUT /v1/admin/server/bind`) propagates to the
+        // cloud→edge proxy without an engine restart.
+        loopback_admin_base.store(std::sync::Arc::new(
+            crate::engine_rpc::loopback_admin_url_from_bind(&bind),
+        ));
         // Resolve the optional UI alias listener with three-state
         // override semantics that diverge from `api_bind` above —
         // `Ok(Some(None))` (row exists, value is SQL NULL) means

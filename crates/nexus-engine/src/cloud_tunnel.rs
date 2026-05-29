@@ -100,9 +100,25 @@ pub fn spawn_tunnel(
     enrollment_changed: Arc<Notify>,
     cloud_outbox: Arc<nexus_cloud_client::TunnelOutbox>,
     trace_rx: Option<mpsc::Receiver<Span>>,
+    loopback_admin_base: Arc<arc_swap::ArcSwap<String>>,
 ) -> (oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
     let (tx, mut rx) = oneshot::channel::<()>();
     let handle = tokio::spawn(async move {
+        // Shared HTTP client for the admin-passthrough RPC handler.
+        // Cheap to clone (internal `Arc`); reusing one client keeps
+        // the connection pool alive across every cloud→edge admin
+        // call so we're not re-establishing a TCP socket per
+        // envelope.
+        let admin_http_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .unwrap_or_else(|e| {
+                warn!(
+                    error = %e,
+                    "failed to build admin-passthrough http client; using default",
+                );
+                reqwest::Client::new()
+            });
         // Outer wait-for-enrollment loop. The Phase 1.8 supervisor
         // exited immediately when no row was present, forcing the
         // operator to restart the engine after enrolling. Phase 1.16:
@@ -143,7 +159,13 @@ pub fn spawn_tunnel(
         if let Some(trace_rx) = trace_rx {
             spawn_trace_uploader(&enrollment, trace_rx);
         }
-        let dispatcher = build_rpc_dispatcher(&enrollment, &store, &replicator_kick);
+        let dispatcher = build_rpc_dispatcher(
+            &enrollment,
+            &store,
+            &replicator_kick,
+            &loopback_admin_base,
+            &admin_http_client,
+        );
         run(enrollment, dispatcher, cloud_outbox, rx).await;
     });
     (tx, handle)
@@ -164,6 +186,8 @@ fn build_rpc_dispatcher(
     enrollment: &CloudEnrollment,
     store: &Arc<Store>,
     replicator_kick: &Arc<Notify>,
+    loopback_admin_base: &Arc<arc_swap::ArcSwap<String>>,
+    http_client: &reqwest::Client,
 ) -> Option<Arc<RpcDispatcher<EngineRpcHandler>>> {
     let signing_pem = enrollment.signing_key_pem.as_deref().or_else(|| {
         warn!(
@@ -212,6 +236,8 @@ fn build_rpc_dispatcher(
     let handler = EngineRpcHandler {
         store: store.clone(),
         replicator_kick: replicator_kick.clone(),
+        loopback_admin_base: loopback_admin_base.clone(),
+        http_client: http_client.clone(),
     };
     let dispatcher = RpcDispatcher::new(verifier, policy, handler)
         .with_audit_sink(Arc::new(EngineAuditSink {
