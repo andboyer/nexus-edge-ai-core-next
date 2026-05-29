@@ -26,6 +26,7 @@ import { useNavigate } from "@tanstack/react-router";
 import {
   CheckCircle2,
   ChevronRight,
+  Cloud,
   KeyRound,
   Loader2,
   ShieldCheck,
@@ -34,6 +35,8 @@ import {
 } from "lucide-react";
 import { useState } from "react";
 
+import { getCloudEnrollment, postCloudEnroll } from "@/api/admin";
+import type { PostCloudEnrollReq } from "@/api/admin";
 import { authApi } from "@/api/auth";
 import { ApiError } from "@/api/client";
 import { setupApi } from "@/api/setup";
@@ -49,11 +52,12 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { useAuth } from "@/lib/auth";
 
-type Step = "welcome" | "password" | "cameras" | "rules" | "finish";
+type Step = "welcome" | "password" | "cloud" | "cameras" | "rules" | "finish";
 
 const STEP_LABELS: Record<Step, string> = {
   welcome: "Welcome",
   password: "Password",
+  cloud: "Cloud",
   cameras: "Cameras",
   rules: "Rules",
   finish: "Finish",
@@ -86,8 +90,8 @@ export function SetupPage() {
   // a permanent one — asking them to "change" it immediately
   // after creation is just busywork.
   const stepOrder: Step[] = mustChangePassword
-    ? ["welcome", "password", "cameras", "rules", "finish"]
-    : ["welcome", "cameras", "rules", "finish"];
+    ? ["welcome", "password", "cloud", "cameras", "rules", "finish"]
+    : ["welcome", "cloud", "cameras", "rules", "finish"];
 
   const [step, setStep] = useState<Step>("welcome");
 
@@ -163,6 +167,8 @@ export function SetupPage() {
             }}
             onBack={goBack}
           />
+        ) : step === "cloud" ? (
+          <CloudStep onDone={goNext} onBack={goBack} />
         ) : step === "cameras" ? (
           <CountStep
             icon={<Video className="h-5 w-5" />}
@@ -445,6 +451,206 @@ function PasswordStep({
             </div>
           </div>
         </form>
+      </CardContent>
+    </Card>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Cloud (optional — connect to the cloud console, fully skippable)
+// ---------------------------------------------------------------------------
+
+function CloudStep({
+  onDone,
+  onBack,
+}: {
+  onDone: () => void;
+  onBack: () => void;
+}) {
+  const queryClient = useQueryClient();
+
+  // Status probe. The card switches into a compact "already enrolled"
+  // mode if a prior `nexus-engine enroll` CLI run (or a previous wizard
+  // pass) already wrote a row.
+  const cloudStatus = useQuery({
+    queryKey: ["admin", "cloud", "enrollment"],
+    queryFn: () => getCloudEnrollment(),
+  });
+
+  const [code, setCode] = useState("");
+  const [host, setHost] = useState("");
+  const [error, setError] = useState<string | null>(null);
+
+  const enroll = useMutation({
+    mutationFn: (req: PostCloudEnrollReq) => postCloudEnroll(req),
+    onSuccess: () => {
+      setError(null);
+      queryClient.invalidateQueries({
+        queryKey: ["admin", "cloud", "enrollment"],
+      });
+      onDone();
+    },
+    onError: (e: unknown) => {
+      if (e instanceof ApiError) {
+        setError(e.message);
+      } else {
+        setError(String(e));
+      }
+    },
+  });
+
+  const submit = (e: React.FormEvent) => {
+    e.preventDefault();
+    setError(null);
+    const c = code.trim();
+    const h = host.trim();
+    if (!c) {
+      setError("Enrollment key is required.");
+      return;
+    }
+    if (!h) {
+      setError("Cloud host URL is required.");
+      return;
+    }
+    if (
+      !h.startsWith("https://")
+      && !h.startsWith("http://127.0.0.1")
+      && !h.startsWith("http://localhost")
+    ) {
+      setError(
+        "Cloud host must start with https:// (or http://localhost for dev).",
+      );
+      return;
+    }
+    enroll.mutate({ code: c, cloud_host: h });
+  };
+
+  if (cloudStatus.isLoading) {
+    return (
+      <Card>
+        <CardContent className="flex items-center justify-center py-12">
+          <Loader2 className="h-5 w-5 animate-spin text-muted-foreground" />
+        </CardContent>
+      </Card>
+    );
+  }
+
+  if (cloudStatus.data?.enrolled) {
+    return (
+      <Card>
+        <CardHeader>
+          <div className="flex items-center gap-2">
+            <Cloud className="h-5 w-5 text-emerald-500" />
+            <CardTitle>Cloud connected</CardTitle>
+          </div>
+          <CardDescription>
+            This core is already enrolled with the cloud console. You can
+            re-enroll any time from Settings → Server.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-2 text-sm">
+            <dt className="text-muted-foreground">Core ID</dt>
+            <dd className="font-mono">{cloudStatus.data.core_id}</dd>
+            <dt className="text-muted-foreground">Gateway</dt>
+            <dd className="font-mono">{cloudStatus.data.gateway_url}</dd>
+          </dl>
+          <div className="flex justify-between">
+            <Button type="button" variant="ghost" onClick={onBack}>
+              Back
+            </Button>
+            <Button type="button" onClick={onDone}>
+              Continue
+            </Button>
+          </div>
+        </CardContent>
+      </Card>
+    );
+  }
+
+  return (
+    <Card>
+      <CardHeader>
+        <div className="flex items-center gap-2">
+          <Cloud className="h-5 w-5 text-primary" />
+          <CardTitle>Connect to the cloud (optional)</CardTitle>
+        </div>
+        <CardDescription>
+          Paste the enrollment key from your cloud console&rsquo;s
+          &ldquo;Add Core&rdquo; flow to enable remote control,
+          central monitoring, and clip replication. Skip if this
+          appliance will run fully offline &mdash; you can enroll
+          later from <strong>Settings &rarr; Server</strong>.
+        </CardDescription>
+      </CardHeader>
+      <CardContent>
+        <form className="space-y-3" onSubmit={submit}>
+          <div className="space-y-1.5">
+            <Label htmlFor="cloud-code">Enrollment key</Label>
+            <Input
+              id="cloud-code"
+              type="text"
+              placeholder="XJ4K-PMQ7-9NAB"
+              autoComplete="off"
+              spellCheck={false}
+              value={code}
+              onChange={(e) => setCode(e.target.value)}
+            />
+          </div>
+          <div className="space-y-1.5">
+            <Label htmlFor="cloud-host">Cloud host URL</Label>
+            <Input
+              id="cloud-host"
+              type="url"
+              placeholder="https://cloud.example"
+              autoComplete="off"
+              spellCheck={false}
+              value={host}
+              onChange={(e) => setHost(e.target.value)}
+            />
+            <p className="text-xs text-muted-foreground">
+              The base URL of your cloud console (no trailing path).
+            </p>
+          </div>
+          {error ? (
+            <div className="rounded-md border border-destructive/40 bg-destructive/10 p-2 text-xs text-destructive">
+              {error}
+            </div>
+          ) : null}
+          <div className="flex justify-between">
+            <Button
+              type="button"
+              variant="ghost"
+              onClick={onBack}
+              disabled={enroll.isPending}
+            >
+              Back
+            </Button>
+            <div className="flex gap-2">
+              <Button
+                type="button"
+                variant="outline"
+                onClick={onDone}
+                disabled={enroll.isPending}
+              >
+                Skip for now
+              </Button>
+              <Button type="submit" disabled={enroll.isPending}>
+                {enroll.isPending ? (
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                ) : (
+                  "Connect to cloud"
+                )}
+              </Button>
+            </div>
+          </div>
+        </form>
+        <p className="mt-3 text-xs text-muted-foreground">
+          The WSS tunnel becomes active on the next engine restart.
+          The wizard will continue to the next step after a successful
+          enrollment so you can finish setup, then restart from
+          Settings &rarr; Server when you&rsquo;re ready.
+        </p>
       </CardContent>
     </Card>
   );

@@ -68,6 +68,52 @@ pub struct EnrollArgs {
 /// Run the enrollment subcommand. Loads the store from `cfg.store`,
 /// hits enrollment-svc, persists, exits.
 pub async fn run_enroll(cfg: &Config, args: &EnrollArgs) -> Result<()> {
+    let store = Store::open(&cfg.store).await.context("open local store")?;
+    let enrolled = perform_enrollment(
+        &store,
+        &args.code,
+        &args.cloud_host,
+        args.label.as_deref(),
+        args.keep_history,
+        args.history_days,
+    )
+    .await?;
+    // Banner. Use eprintln so it shows up even if telemetry is
+    // routed to a file.
+    eprintln!(
+        "nexus-engine: enrolled as core_id={} gateway_url={}",
+        enrolled.core_id, enrolled.gateway_url,
+    );
+    Ok(())
+}
+
+/// Engine-side enrollment flow shared between the
+/// `nexus-engine enroll` CLI subcommand and the
+/// `POST /v1/admin/cloud/enroll` HTTP handler.
+///
+/// Generates a fresh per-core Ed25519 keypair + CSR, derives a stable
+/// hardware fingerprint, POSTs the enrollment request to
+/// `<cloud_host>/v1/enroll`, and persists the response into the local
+/// `cloud_enrollment` row (replacing any previous enrollment).
+///
+/// The returned [`CloudEnrollment`] is the persisted row, useful for
+/// the HTTP handler that wants to echo `core_id`/`gateway_url`/
+/// `enrolled_at` back to the operator without a follow-up SELECT.
+///
+/// # Errors
+///
+/// * Time-sync gate fails (clock not synced, no `NEXUS_TIME_SYNC_OVERRIDE`).
+/// * CSR generation fails.
+/// * Cloud-side `/v1/enroll` returns a non-2xx status or a malformed body.
+/// * Persisting the `cloud_enrollment` row fails.
+pub async fn perform_enrollment(
+    store: &Store,
+    code: &str,
+    cloud_host: &str,
+    label: Option<&str>,
+    keep_history: bool,
+    history_days: u32,
+) -> Result<CloudEnrollment> {
     // Phase 1.15 — refuse to enroll a box whose clock isn't synced.
     // The actor_token verifier has a ±30 s skew window; a freshly
     // imaged appliance with a stale RTC will mint tokens the cloud
@@ -81,9 +127,8 @@ pub async fn run_enroll(cfg: &Config, args: &EnrollArgs) -> Result<()> {
         "clock sync verified — proceeding with enrollment"
     );
 
-    let label = args
-        .label
-        .clone()
+    let label = label
+        .map(str::to_string)
         .unwrap_or_else(|| hostname_or("nexus-edge"));
 
     // 1. Local keypair + CSR.
@@ -98,9 +143,9 @@ pub async fn run_enroll(cfg: &Config, args: &EnrollArgs) -> Result<()> {
     info!(fingerprint = %fingerprint, "derived hardware fingerprint");
 
     // 3. POST.
-    let client = EnrollmentClient::new(&args.cloud_host);
+    let client = EnrollmentClient::new(cloud_host);
     let req = EnrollmentRequest {
-        code: args.code.clone(),
+        code: code.to_string(),
         csr_pem: csr.csr_pem.clone(),
         fingerprint,
     };
@@ -114,24 +159,21 @@ pub async fn run_enroll(cfg: &Config, args: &EnrollArgs) -> Result<()> {
         "enrollment accepted by cloud",
     );
 
-    // 4. Persist.
-    let store = Store::open(&cfg.store).await.context("open local store")?;
-
-    // Phase 2 · Step 2.9 — if `--keep-history` was passed, record the
-    // replay cutoff alongside the enrollment so the next `serve`
-    // boot's attach-replay task knows to drain the local backlog
-    // through the cloud outbox. The JWT's `iat` is approximately
-    // `now()` (the cloud just minted it), so we don't bother
-    // parsing the JWT — `Utc::now() - history_days` is within
-    // milliseconds of `iat - history_days` and the cloud-side
-    // `ON CONFLICT (core_id, edge_clip_id) DO UPDATE` upsert
-    // tolerates any minor over-replay.
-    let attach_replay_after = if args.keep_history {
-        let mut days = args.history_days;
+    // 4. Persist. Phase 2 · Step 2.9 — when `keep_history` is set,
+    //    record the replay cutoff alongside the enrollment so the
+    //    next `serve` boot's attach-replay task knows to drain the
+    //    local backlog through the cloud outbox. The JWT's `iat` is
+    //    approximately `now()` (the cloud just minted it), so we
+    //    don't bother parsing the JWT — `Utc::now() - history_days`
+    //    is within milliseconds of `iat - history_days` and the
+    //    cloud-side `ON CONFLICT (core_id, edge_clip_id) DO UPDATE`
+    //    upsert tolerates any minor over-replay.
+    let attach_replay_after = if keep_history {
+        let mut days = history_days;
         if days > 365 {
             tracing::warn!(
                 history_days = days,
-                "--history-days capped at 365; clamping"
+                "history_days capped at 365; clamping"
             );
             days = 365;
         }
@@ -139,36 +181,30 @@ pub async fn run_enroll(cfg: &Config, args: &EnrollArgs) -> Result<()> {
         info!(
             history_days = days,
             cutoff = %cutoff.to_rfc3339(),
-            "--keep-history set: local clip backlog since cutoff will be replayed on next serve"
+            "keep_history set: local clip backlog since cutoff will be replayed on next serve"
         );
         Some(cutoff)
     } else {
         None
     };
 
+    let persisted = CloudEnrollment {
+        core_id: resp.core_id.clone(),
+        gateway_url: resp.gateway_url.clone(),
+        cert_pem: resp.cert_pem,
+        private_key_pem: csr.private_key_pem,
+        ca_chain_pem: resp.ca_chain_pem,
+        entitlement_jwt: resp.entitlement_jwt,
+        signing_key_pem: resp.entitlement_signing_key_pem,
+        signing_kid: resp.entitlement_signing_kid,
+        enrolled_at: chrono::Utc::now(),
+        attach_replay_after,
+    };
     store
-        .set_cloud_enrollment(&CloudEnrollment {
-            core_id: resp.core_id.clone(),
-            gateway_url: resp.gateway_url.clone(),
-            cert_pem: resp.cert_pem,
-            private_key_pem: csr.private_key_pem,
-            ca_chain_pem: resp.ca_chain_pem,
-            entitlement_jwt: resp.entitlement_jwt,
-            signing_key_pem: resp.entitlement_signing_key_pem,
-            signing_kid: resp.entitlement_signing_kid,
-            enrolled_at: chrono::Utc::now(),
-            attach_replay_after,
-        })
+        .set_cloud_enrollment(&persisted)
         .await
         .context("persist cloud_enrollment row")?;
-
-    // 5. Banner. Use eprintln so it shows up even if telemetry is
-    //    routed to a file.
-    eprintln!(
-        "nexus-engine: enrolled as core_id={} gateway_url={}",
-        resp.core_id, resp.gateway_url,
-    );
-    Ok(())
+    Ok(persisted)
 }
 
 fn hostname_or(default: &str) -> String {

@@ -443,6 +443,20 @@ pub fn router(state: ApiState) -> Router {
             get(crate::admin_runtime::get_inference_model)
                 .put(crate::admin_runtime::put_inference_model),
         )
+        // M-Cloud Phase 1 — UI-driven cloud enrollment. GET returns
+        // a redacted status view (no PEMs, no JWT); POST runs the
+        // same `cloud_enroll::perform_enrollment` flow as the
+        // `nexus-engine enroll` CLI subcommand. Restart-required:
+        // the WSS tunnel is spawned once at boot from the persisted
+        // `cloud_enrollment` row.
+        .route(
+            "/v1/admin/cloud/enrollment",
+            get(crate::admin_cloud::get_cloud_enrollment),
+        )
+        .route(
+            "/v1/admin/cloud/enroll",
+            axum::routing::post(crate::admin_cloud::post_cloud_enroll),
+        )
         // M-Admin Phase 0 follow-up — graceful self-restart.
         // Returns 202 immediately, then `execv()`s a fresh
         // copy of the same binary (preserving PID + argv) so

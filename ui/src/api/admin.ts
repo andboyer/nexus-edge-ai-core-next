@@ -312,6 +312,59 @@ export function putInferenceModel(patch: InferenceModelPatch) {
 }
 
 
+// --- Cloud enrollment (M-Cloud Phase 1) -----------------------------------
+//
+// Engine contract:
+//   GET  /api/v1/admin/cloud/enrollment  → CloudEnrollmentStatus
+//   POST /api/v1/admin/cloud/enroll      → CloudEnrollmentStatus
+//
+// Both endpoints are AdminContext-gated. POST runs the same
+// `cloud_enroll::perform_enrollment` flow as the
+// `nexus-engine enroll` CLI subcommand and persists the result into the
+// local `cloud_enrollment` SQLite row (overwriting any prior
+// enrollment). Restart-required: the WSS tunnel is spawned exactly once
+// at boot from the persisted row, so a successful enroll surfaces in
+// the UI as a "Restart engine to activate the tunnel" affordance.
+//
+// The status response is intentionally redacted — never includes the
+// mTLS private key or the entitlement JWT, so it's safe to ship to the
+// browser.
+
+export interface CloudEnrollmentStatus {
+  enrolled: boolean;
+  core_id?: string;
+  gateway_url?: string;
+  /** RFC3339 timestamp of the last successful enrollment round-trip. */
+  enrolled_at?: string;
+}
+
+export interface PostCloudEnrollReq {
+  /** Short single-use enrollment code from the cloud console's "Add Core" flow. */
+  code: string;
+  /** Base URL of the cloud console (must be https:// in production). */
+  cloud_host: string;
+  /** Human-friendly label baked into the CSR's CommonName. Defaults to hostname. */
+  label?: string;
+  /**
+   * When true, the local motion-clip backlog from the past
+   * `history_days` days will be replayed into the cloud on the next
+   * engine boot. Defaults to false so most operators don't end up with
+   * pre-cloud noise in their fresh console.
+   */
+  keep_history?: boolean;
+  /** 1..=365 days. Defaults to 30. Ignored when `keep_history` is false. */
+  history_days?: number;
+}
+
+export function getCloudEnrollment() {
+  return api.get<CloudEnrollmentStatus>("/v1/admin/cloud/enrollment");
+}
+
+export function postCloudEnroll(req: PostCloudEnrollReq) {
+  return api.post<CloudEnrollmentStatus>("/v1/admin/cloud/enroll", req);
+}
+
+
 // --- Engine self-restart (M-Admin Phase 0 follow-up) ----------------------
 
 export interface RestartOut {

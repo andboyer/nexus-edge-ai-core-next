@@ -16,6 +16,7 @@ use tracing::{info, warn};
 
 mod admin_auth;
 mod admin_cli;
+mod admin_cloud;
 mod admin_network;
 mod admin_runtime;
 mod api;

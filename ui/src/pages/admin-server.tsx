@@ -15,6 +15,9 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Brain,
+  CheckCircle2,
+  Cloud,
+  CloudOff,
   Database,
   HardDrive,
   Network,
@@ -26,15 +29,17 @@ import { useEffect, useState } from "react";
 import { toast } from "sonner";
 
 import {
+  getCloudEnrollment,
   getInferenceModel,
   getServerBind,
   getWatermarks,
+  postCloudEnroll,
   putInferenceModel,
   putServerBind,
   putWatermarks,
   restartEngine,
 } from "@/api/admin";
-import type { InferenceModelPatch } from "@/api/admin";
+import type { InferenceModelPatch, PostCloudEnrollReq } from "@/api/admin";
 import type { UiBindUpdate } from "@/api/admin";
 import { authApi } from "@/api/auth";
 import { getStorage } from "@/api/storage";
@@ -256,6 +261,57 @@ export function AdminServerPage() {
   const modelPendingDiffers =
     modelQuery.data?.pending !== null
     && modelQuery.data?.pending !== undefined;
+
+  // Cloud enrollment -------------------------------------------------------
+  //
+  // Single round-trip surface: the GET query reports the enrolled /
+  // unenrolled state, and the POST mutation runs the same
+  // `cloud_enroll::perform_enrollment` flow as the
+  // `nexus-engine enroll` CLI subcommand. Restart-required: the WSS
+  // tunnel is spawned exactly once at boot from the persisted row.
+  // We track an in-session `cloudJustEnrolled` flag so the operator
+  // sees the change in the restart summary even though the server-side
+  // status query reports the same `enrolled: true` it would have shown
+  // before this mutation.
+  const cloudQuery = useQuery({
+    queryKey: ["admin", "cloud", "enrollment"],
+    queryFn: () => getCloudEnrollment(),
+  });
+
+  const [cloudJustEnrolled, setCloudJustEnrolled] = useState(false);
+
+  type CloudDraft = {
+    code: string;
+    cloud_host: string;
+    label: string;
+    keep_history: boolean;
+    history_days: string;
+  };
+  const emptyCloudDraft: CloudDraft = {
+    code: "",
+    cloud_host: "",
+    label: "",
+    keep_history: false,
+    history_days: "30",
+  };
+  const [cloudDraft, setCloudDraft] = useState<CloudDraft>(emptyCloudDraft);
+  const [cloudShowAdvanced, setCloudShowAdvanced] = useState(false);
+
+  const cloudMutation = useMutation({
+    mutationFn: (req: PostCloudEnrollReq) => postCloudEnroll(req),
+    onSuccess: (res) => {
+      toast.success(
+        `Connected to cloud as ${res.core_id}. Restart engine to activate the tunnel.`,
+      );
+      setCloudJustEnrolled(true);
+      setCloudDraft(emptyCloudDraft);
+      qc.invalidateQueries({ queryKey: ["admin", "cloud", "enrollment"] });
+    },
+    onError: (e: unknown) => {
+      const msg = e instanceof Error ? e.message : String(e);
+      toast.error(`Failed to enroll: ${msg}`);
+    },
+  });
 
   // Engine restart ---------------------------------------------------------
   const restartMutation = useMutation({
@@ -902,6 +958,267 @@ export function AdminServerPage() {
         </CardContent>
       </Card>
 
+      <Card data-testid="cloud-enrollment-card">
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2 text-base">
+            {cloudQuery.data?.enrolled ? (
+              <Cloud className="h-4 w-4 text-emerald-500" />
+            ) : (
+              <CloudOff className="h-4 w-4 text-muted-foreground" />
+            )}
+            Cloud connection
+            {cloudQuery.isLoading ? (
+              <Skeleton className="ml-2 h-5 w-20" />
+            ) : cloudQuery.data?.enrolled ? (
+              <Badge
+                variant="outline"
+                className="ml-2 border-emerald-500/40 text-emerald-500"
+                data-testid="cloud-status-enrolled"
+              >
+                <CheckCircle2 className="mr-1 h-3 w-3" />
+                Enrolled
+              </Badge>
+            ) : (
+              <Badge
+                variant="outline"
+                className="ml-2 border-warning/40 text-warning"
+                data-testid="cloud-status-unenrolled"
+              >
+                Not enrolled
+              </Badge>
+            )}
+          </CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-3 text-sm">
+          {cloudQuery.data?.enrolled ? (
+            <>
+              <Row
+                k="Core ID"
+                v={
+                  <code className="font-mono text-xs">
+                    {cloudQuery.data.core_id}
+                  </code>
+                }
+              />
+              <Row
+                k="Gateway"
+                v={
+                  <code className="font-mono text-xs">
+                    {cloudQuery.data.gateway_url}
+                  </code>
+                }
+              />
+              {cloudQuery.data.enrolled_at ? (
+                <Row
+                  k="Enrolled at"
+                  v={
+                    <span className="text-xs text-muted-foreground">
+                      {new Date(cloudQuery.data.enrolled_at).toLocaleString()}
+                    </span>
+                  }
+                />
+              ) : null}
+              <p className="text-xs text-muted-foreground">
+                Re-enroll below to point this core at a different cloud
+                console or to refresh the mTLS certificate. The current
+                enrollment row will be replaced atomically.
+              </p>
+            </>
+          ) : (
+            <div
+              className="rounded-md border border-warning/40 bg-warning/10 p-3 text-xs"
+              data-testid="cloud-prompt-unenrolled"
+            >
+              <p className="font-medium text-warning">
+                This core is not connected to a cloud console.
+              </p>
+              <p className="mt-0.5 text-muted-foreground">
+                Enter an enrollment key from your cloud console's
+                "Add Core" flow to enable remote control, central
+                monitoring, and clip replication. The engine runs
+                fully offline without this step.
+              </p>
+            </div>
+          )}
+
+          <form
+            className="grid grid-cols-1 gap-3 pt-2 sm:grid-cols-2"
+            onSubmit={(e) => {
+              e.preventDefault();
+              const code = cloudDraft.code.trim();
+              const host = cloudDraft.cloud_host.trim();
+              if (!code) {
+                toast.error("Enrollment key is required");
+                return;
+              }
+              if (!host) {
+                toast.error("Cloud host URL is required");
+                return;
+              }
+              if (
+                !host.startsWith("https://")
+                && !host.startsWith("http://127.0.0.1")
+                && !host.startsWith("http://localhost")
+              ) {
+                toast.error(
+                  "Cloud host must start with https:// (or http://localhost for dev)",
+                );
+                return;
+              }
+              const req: PostCloudEnrollReq = {
+                code,
+                cloud_host: host,
+              };
+              const label = cloudDraft.label.trim();
+              if (label) req.label = label;
+              if (cloudDraft.keep_history) {
+                req.keep_history = true;
+                const days = Number(cloudDraft.history_days);
+                if (Number.isFinite(days) && days >= 1 && days <= 365) {
+                  req.history_days = Math.floor(days);
+                } else {
+                  toast.error("History days must be in 1..=365");
+                  return;
+                }
+              }
+              cloudMutation.mutate(req);
+            }}
+          >
+            <div className="flex flex-col gap-1">
+              <Label htmlFor="cloud-code">Enrollment key</Label>
+              <Input
+                id="cloud-code"
+                type="text"
+                placeholder="XJ4K-PMQ7-9NAB"
+                value={cloudDraft.code}
+                onChange={(e) =>
+                  setCloudDraft({ ...cloudDraft, code: e.target.value })
+                }
+                disabled={cloudMutation.isPending}
+                data-testid="cloud-code-input"
+                autoComplete="off"
+                spellCheck={false}
+              />
+            </div>
+            <div className="flex flex-col gap-1">
+              <Label htmlFor="cloud-host">Cloud host URL</Label>
+              <Input
+                id="cloud-host"
+                type="url"
+                placeholder="https://cloud.example"
+                value={cloudDraft.cloud_host}
+                onChange={(e) =>
+                  setCloudDraft({
+                    ...cloudDraft,
+                    cloud_host: e.target.value,
+                  })
+                }
+                disabled={cloudMutation.isPending}
+                data-testid="cloud-host-input"
+                autoComplete="off"
+                spellCheck={false}
+              />
+            </div>
+
+            <div className="sm:col-span-2">
+              <button
+                type="button"
+                className="text-xs text-muted-foreground underline-offset-2 hover:underline"
+                onClick={() => setCloudShowAdvanced((v) => !v)}
+                data-testid="cloud-advanced-toggle"
+              >
+                {cloudShowAdvanced ? "Hide" : "Show"} advanced options
+              </button>
+            </div>
+            {cloudShowAdvanced ? (
+              <>
+                <div className="flex flex-col gap-1 sm:col-span-2">
+                  <Label htmlFor="cloud-label">
+                    Label (optional — defaults to hostname)
+                  </Label>
+                  <Input
+                    id="cloud-label"
+                    type="text"
+                    placeholder="reception-rack-01"
+                    value={cloudDraft.label}
+                    onChange={(e) =>
+                      setCloudDraft({ ...cloudDraft, label: e.target.value })
+                    }
+                    disabled={cloudMutation.isPending}
+                    data-testid="cloud-label-input"
+                  />
+                </div>
+                <div className="flex items-center gap-2 sm:col-span-2">
+                  <input
+                    id="cloud-keep-history"
+                    type="checkbox"
+                    className="h-4 w-4 rounded border-input"
+                    checked={cloudDraft.keep_history}
+                    onChange={(e) =>
+                      setCloudDraft({
+                        ...cloudDraft,
+                        keep_history: e.target.checked,
+                      })
+                    }
+                    disabled={cloudMutation.isPending}
+                    data-testid="cloud-keep-history-input"
+                  />
+                  <Label
+                    htmlFor="cloud-keep-history"
+                    className="text-xs font-normal text-muted-foreground"
+                  >
+                    Replay local clip backlog to the cloud after enrollment
+                  </Label>
+                </div>
+                {cloudDraft.keep_history ? (
+                  <div className="flex flex-col gap-1">
+                    <Label htmlFor="cloud-history-days">
+                      History days (1..=365)
+                    </Label>
+                    <Input
+                      id="cloud-history-days"
+                      type="number"
+                      min={1}
+                      max={365}
+                      value={cloudDraft.history_days}
+                      onChange={(e) =>
+                        setCloudDraft({
+                          ...cloudDraft,
+                          history_days: e.target.value,
+                        })
+                      }
+                      disabled={cloudMutation.isPending}
+                      data-testid="cloud-history-days-input"
+                    />
+                  </div>
+                ) : null}
+              </>
+            ) : null}
+
+            <div className="sm:col-span-2">
+              <Button
+                type="submit"
+                disabled={cloudMutation.isPending}
+                data-testid="cloud-enroll-save"
+              >
+                <Cloud className="mr-2 h-4 w-4" />
+                {cloudMutation.isPending
+                  ? "Connecting…"
+                  : cloudQuery.data?.enrolled
+                    ? "Re-enroll"
+                    : "Connect to cloud"}
+              </Button>
+            </div>
+          </form>
+          <p className="text-xs text-muted-foreground">
+            The enrollment round-trip mints a fresh mTLS certificate
+            and entitlement token. The WSS tunnel is spawned once at
+            boot from the persisted enrollment, so a successful
+            connection requires an engine restart to activate.
+          </p>
+        </CardContent>
+      </Card>
+
       <Card>
         <CardHeader>
           <CardTitle className="flex items-center gap-2 text-base">
@@ -959,7 +1276,7 @@ export function AdminServerPage() {
             supervisor needed. The page will reload automatically
             once the new image is listening.
           </p>
-          {(pendingDiffers || uiPendingDiffers || wmPendingDiffers || modelPendingDiffers) ? (
+          {(pendingDiffers || uiPendingDiffers || wmPendingDiffers || modelPendingDiffers || cloudJustEnrolled) ? (
             <div
               className="rounded-md border border-warning/40 bg-warning/10 p-3 text-xs"
               data-testid="restart-pending-summary"
@@ -970,6 +1287,7 @@ export function AdminServerPage() {
                 {uiPendingDiffers ? <li>UI alias listener</li> : null}
                 {wmPendingDiffers ? <li>Storage watermarks</li> : null}
                 {modelPendingDiffers ? <li>Default inference model</li> : null}
+                {cloudJustEnrolled ? <li>Cloud enrollment (tunnel not active until restart)</li> : null}
               </ul>
             </div>
           ) : (
