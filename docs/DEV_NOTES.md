@@ -38,9 +38,12 @@ future automated agents who need to skip the same potholes we already hit.
 
   Burning a CI cycle for any of these is wasted iteration.
 
-- ORT brew formula ≥ 1.22.x works at runtime against the `ort = "=2.0.0-rc.10"`
-  crate via `load-dynamic`, matching the 1.22.0 pin in the system-libs
-  job. Set `ORT_DYLIB_PATH=/opt/homebrew/lib/libonnxruntime.dylib`.
+- ORT brew formula ≥ 1.22.x works at runtime against the `ort = "=2.0.0-rc.12"`
+  crate (api-24 feature) via `load-dynamic`. The crate compiles against the
+  1.24.x C API but the runtime ABI is forward-compatible — brew's current
+  1.22.x dylib still loads fine on macOS for dev work. The Linux production
+  path pins the matched 1.24.0 tarball; see `.github/workflows/ci.yml` and
+  `docs/INSTALL.md §7.4`. Set `ORT_DYLIB_PATH=/opt/homebrew/lib/libonnxruntime.dylib`.
 
 ## Cargo / Rust
 

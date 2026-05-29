@@ -89,16 +89,20 @@ sqlx = { version = "0.8", default-features = false, features = [
 cel-interpreter = "0.10"
 
 # Inference + image
-# Pinned to =2.0.0-rc.10 because rc.11 / rc.12 reference an OrtApi field
-# (`SessionOptionsAppendExecutionProvider_VitisAI`) that doesn't exist in the
-# corresponding `ort-sys` build, even when no Vitis feature is selected.
-# Revisit once upstream ships a working post-rc.10 release.
-ort = { version = "=2.0.0-rc.10", default-features = false, features = [
+# ort 2.0.0-rc.12 supports the ONNX Runtime 1.17–1.24 ABI via the
+# `api-NN` feature flags (rc.12 release notes, Mar 2026). We pin to
+# `api-24` so the bundled libonnxruntime.so.1.24.x ABI is the one the
+# crate compiles against; the runtime is loaded dynamically via
+# `load-dynamic` (ORT_DYLIB_PATH). The matched runtime version is
+# tracked in `.github/workflows/{ci,release}.yml::ORT_VERSION` and in
+# `docs/INSTALL.md §7.4`.
+ort = { version = "=2.0.0-rc.12", default-features = false, features = [
     "std",
     "load-dynamic",
     "ndarray",
+    "api-24",
 ] }
-ndarray = "0.16"
+ndarray = "0.17"
 image = { version = "0.25", default-features = false, features = [
     "jpeg",
     "png",

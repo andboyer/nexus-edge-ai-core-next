@@ -1418,9 +1418,10 @@ sudo apt install -y \
     gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
     gstreamer1.0-libav gstreamer1.0-tools gstreamer1.0-vaapi
 
-# ONNX Runtime 1.22.0 (must match the workspace `ort` crate pin —
-# the crate panics at session creation if it isn't 1.22.x).
-ORT_VER=1.22.0
+# ONNX Runtime 1.24.1 (must match the workspace `ort` crate pin —
+# `ort = "=2.0.0-rc.12"` with feature `api-24` binds to the 1.24.x ABI;
+# the crate panics at session creation if the dylib isn't 1.24.x).
+ORT_VER=1.24.1
 curl -fsSL "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VER}/onnxruntime-linux-x64-${ORT_VER}.tgz" \
   | sudo tar -xz -C /opt
 sudo mv "/opt/onnxruntime-linux-x64-${ORT_VER}" /opt/onnxruntime
