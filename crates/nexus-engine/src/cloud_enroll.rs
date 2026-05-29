@@ -2,7 +2,7 @@
 //! cloud-side `enrollment-svc /v1/enroll`.
 //!
 //! Sequence:
-//! 1. Generate a per-core Ed25519 keypair + PKCS#10 CSR locally.
+//! 1. Generate a per-core ECDSA P-256 keypair + PKCS#10 CSR locally.
 //! 2. Derive a stable hardware fingerprint.
 //! 3. POST `EnrollmentRequest { code, csr_pem, fingerprint }` to the
 //!    configured `--cloud-host`.
@@ -91,7 +91,7 @@ pub async fn run_enroll(cfg: &Config, args: &EnrollArgs) -> Result<()> {
 /// `nexus-engine enroll` CLI subcommand and the
 /// `POST /v1/admin/cloud/enroll` HTTP handler.
 ///
-/// Generates a fresh per-core Ed25519 keypair + CSR, derives a stable
+/// Generates a fresh per-core ECDSA P-256 keypair + CSR, derives a stable
 /// hardware fingerprint, POSTs the enrollment request to
 /// `<cloud_host>/v1/enroll`, and persists the response into the local
 /// `cloud_enrollment` row (replacing any previous enrollment).
@@ -133,7 +133,7 @@ pub async fn perform_enrollment(
 
     // 1. Local keypair + CSR.
     let csr = generate_keypair_and_csr(&label).context("generate CSR")?;
-    info!(label = %label, "generated local Ed25519 keypair + CSR");
+    info!(label = %label, "generated local ECDSA P-256 keypair + CSR");
 
     // 2. Hardware fingerprint. Best-effort; the cloud accepts any
     //    stable opaque string today. Salt with the CSR's public key

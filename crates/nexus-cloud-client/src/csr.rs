@@ -1,7 +1,7 @@
 //! CSR generation for the `enroll` flow.
 //!
 //! The edge engine calls [`generate_keypair_and_csr`] once per
-//! enrollment: it mints a fresh Ed25519 keypair, builds a PKCS#10
+//! enrollment: it mints a fresh ECDSA P-256 keypair, builds a PKCS#10
 //! Certificate Signing Request whose Common Name is the operator-
 //! supplied label, and returns the PEM-encoded CSR + the matching
 //! private key (also PEM, PKCS#8). The engine then:
@@ -17,11 +17,23 @@
 //! and writes its own based on the resolved (org_id, site_id,
 //! core_id) tuple. The Common Name here is informational only.
 //!
-//! Algorithm: Ed25519 (`rcgen::PKCS_ED25519`). Matches the wider edge
-//! crypto posture — actor_token verifier, entitlement JWT verifier,
-//! and now the mTLS keypair are all Ed25519.
+//! Algorithm: **ECDSA P-256** (`rcgen::PKCS_ECDSA_P256_SHA256`).
+//! Previously Ed25519, but Azure Container Apps' Envoy front door
+//! advertises a `signature_algorithms` extension in its TLS 1.3
+//! `CertificateRequest` that does NOT include `ed25519` (0x0807).
+//! Per RFC 8446 §4.4.2.2 rustls then refuses to send the cert and
+//! the handshake dies with `CertificateRequired`. ECDSA P-256
+//! (`ecdsa_secp256r1_sha256` = 0x0403) is in every Envoy build's
+//! default list. The CA itself stays Ed25519 (cert signature algs
+//! can mix freely with the cert's public-key alg); only the leaf
+//! public key + the matching client private key change.
+//!
+//! The unrelated Ed25519 keys elsewhere in the edge crypto posture
+//! (actor_token verifier, entitlement JWT verifier, the optional
+//! per-core signing key from enrollment) are untouched — those
+//! never participate in a TLS handshake.
 
-use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, PKCS_ED25519};
+use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, PKCS_ECDSA_P256_SHA256};
 
 /// Successful CSR build — PEMs the engine persists + POSTs.
 #[derive(Debug, Clone)]
@@ -44,7 +56,7 @@ pub enum CsrError {
     Rcgen(#[from] rcgen::Error),
 }
 
-/// Generate a fresh Ed25519 keypair + matching PKCS#10 CSR with
+/// Generate a fresh ECDSA P-256 keypair + matching PKCS#10 CSR with
 /// `common_name` set in the subject DN.
 ///
 /// `common_name` is purely informational — enrollment-svc rewrites the
@@ -54,11 +66,11 @@ pub enum CsrError {
 ///
 /// # Errors
 ///
-/// Returns [`CsrError::Rcgen`] when the Ed25519 keypair cannot be
+/// Returns [`CsrError::Rcgen`] when the P-256 keypair cannot be
 /// generated (rare — only happens if the system RNG is unavailable)
 /// or when CSR serialisation fails.
 pub fn generate_keypair_and_csr(common_name: &str) -> Result<CsrBundle, CsrError> {
-    let key_pair = KeyPair::generate_for(&PKCS_ED25519)?;
+    let key_pair = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)?;
     let mut params = CertificateParams::new(Vec::<String>::new())?;
     let mut dn = DistinguishedName::new();
     dn.push(DnType::CommonName, common_name.to_string());
