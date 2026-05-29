@@ -1,5 +1,7 @@
 {
   "version": "v2",
+  "pack_version": "v1",
+  "_pack_version_comment": "Bumped only when ONNX bytes change. Engine release workflow pulls model assets from the `models-${pack_version}` GitHub Release (cut once, reused by every engine cut). Workflow: regenerate ONNX -> bump this field -> commit -> `gh release create models-v2 --prerelease ...` -> upload models there. Bumping this WITHOUT cutting the matching `models-vN` release breaks the next engine release build.",
   "_comment": "Model pack v2 manifest. See models/MODEL_PACK_V2.md for the schema reference. Paths are resolved relative to this file. sha256 is verified at engine load time when artifact verification is wired up (W-DETECT D5).",
   "_generated_by": "models/tools/generate_model_pack.py (or hand-edited at the repo root for the ship-in-tree models below)",
   "models": [
