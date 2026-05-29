@@ -37,6 +37,12 @@ tokio-tungstenite = { workspace = true }
 tokio-rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
 rustls-pki-types = { workspace = true }
+# Public CA roots for verifying the WSS server cert when the cloud
+# edge-gateway is fronted by Azure Container Apps (or any other
+# managed ingress that terminates TLS with a public-CA-issued leaf).
+# Used in addition to the internal CA chain from enrollment, never
+# instead of it.
+webpki-roots = "0.26"
 futures-util = { workspace = true }
 
 [dev-dependencies]

@@ -7,15 +7,22 @@
 //!
 //! ## Trust posture
 //!
-//! * **Server identity** — verified against the CA chain returned by
-//!   enrollment-svc (`ca_chain_pem`). The gateway's leaf cert is signed
-//!   by the same internal CA that issued the edge's client cert; we do
-//!   NOT use webpki roots for the gateway.
+//! * **Server identity** — verified against a *union* of (a) the
+//!   internal CA chain returned by enrollment-svc (`ca_chain_pem`)
+//!   and (b) Mozilla's public CA root store (`webpki-roots`). The
+//!   internal CA path covers production deployments where the
+//!   gateway terminates TLS itself with an internal-CA-issued leaf;
+//!   the public-root path covers managed-ingress deployments where
+//!   TLS terminates at e.g. Azure Container Apps' front door with a
+//!   public-CA-issued leaf (Microsoft → DigiCert). Both paths are
+//!   acceptable because client identity (mTLS) is what authenticates
+//!   the core to the gateway; server identity here just confirms
+//!   we're talking to a host the DNS owner authorised TLS for.
 //! * **Client identity** — the leaf cert + private key written by the
 //!   `enroll` subcommand are presented during the TLS handshake; the
 //!   gateway pins `(org_id, site_id, core_id)` from the cert's URI
 //!   SANs.
-//! * **No fallback** — if the CA chain doesn't validate, the connect
+//! * **No fallback** — if neither root store validates, the connect
 //!   fails closed. There is no `--insecure-skip-verify` knob anywhere
 //!   in this crate; testing uses a locally-trusted CA instead.
 
@@ -263,7 +270,12 @@ impl<T: TunnelHandle + ?Sized> TunnelHandle for Arc<T> {
 }
 
 /// Build a [`ClientConfig`] with mTLS identity + a root store seeded
-/// from `ca_chain_pem` (the internal CA we trust the gateway against).
+/// from a union of `ca_chain_pem` (the internal CA we trust the gateway
+/// against when it terminates TLS itself) and Mozilla's public CA
+/// roots (`webpki-roots`, for the managed-ingress case where the
+/// gateway sits behind Azure Container Apps and TLS terminates at
+/// Microsoft's edge with a DigiCert-issued leaf). See the crate-level
+/// trust posture docs for the rationale.
 fn build_client_config(
     cert_pem: &[u8],
     key_pem: &[u8],
@@ -285,6 +297,11 @@ fn build_client_config(
     for c in ca_certs {
         roots.add(c).map_err(|e| format!("trust ca cert: {e}"))?;
     }
+    // Augment with Mozilla's public CA roots. `webpki_roots::TLS_SERVER_ROOTS`
+    // is a static slice of `TrustAnchor`s; extending a `RootCertStore` with
+    // them is the rustls-recommended pattern. `extend` returns nothing — it
+    // can't fail since the anchors are pre-validated at the crate level.
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
     let leaf_chain: Vec<CertificateDer<'static>> =
         rustls_pemfile::certs(&mut std::io::Cursor::new(cert_pem))
