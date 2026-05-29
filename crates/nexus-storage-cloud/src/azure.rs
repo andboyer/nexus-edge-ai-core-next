@@ -379,6 +379,25 @@ impl ColdBackend for AzureBlobBackend {
             .header("x-ms-version", AZURE_API_VERSION)
             .header(format!("x-ms-meta-{AZURE_SHA256_META}"), expected_sha256)
             .header("x-ms-blob-content-md5", &content_md5)
+            // Pin the blob's `Content-Type` to `video/mp4` at upload
+            // time. Without this Azure stamps the blob with
+            // `application/octet-stream` (the storage service has no
+            // sniffing) and Chromium's `<video src=...>` element
+            // silently refuses to engage the MP4 demuxer — the user
+            // sees a black rectangle with controls, no error in the
+            // page, only a `MEDIA_ERR_SRC_NOT_SUPPORTED` on the
+            // element's `error` event. `x-ms-blob-content-type`
+            // sets the value that Azure persists into the blob's
+            // properties (returned on HEAD as `Content-Type` and on
+            // GET via SAS); the SAS issuer doesn't need to override
+            // it via the `rsct=` response-header param.
+            //
+            // Pinned to `video/mp4` because every clip we write
+            // through this backend is a fragmented MP4 produced by
+            // mp4mux. If we ever start uploading other media kinds
+            // through the same path, plumb a content-type field
+            // through the PutOptions instead.
+            .header("x-ms-blob-content-type", "video/mp4")
             .header("content-length", bytes.len().to_string())
             .body(bytes.to_vec())
             .send()
@@ -818,6 +837,7 @@ mod tests {
                 .and(header("x-ms-blob-type", "BlockBlob"))
                 .and(header("x-ms-version", AZURE_API_VERSION))
                 .and(header_exists(format!("x-ms-meta-{AZURE_SHA256_META}")))
+                .and(header("x-ms-blob-content-type", "video/mp4"))
                 .respond_with(ResponseTemplate::new(201))
                 .mount(&mock)
                 .await;
