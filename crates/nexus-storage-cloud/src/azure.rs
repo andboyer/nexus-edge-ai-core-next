@@ -29,14 +29,18 @@
 //! ## Path semantics
 //!
 //! [`ColdBackend::put`] takes `path` of the form
-//! `cam<id>/<timestamp>_<dur_ms>.mp4`. We extract `edge_clip_id`
-//! as the path basename minus `.mp4` and forward that to the
-//! SAS-issuance endpoint, which validates it against the safe-
-//! segment allow-list (`[A-Za-z0-9_.-]+`, no `..`). The returned
-//! `blob_path` (something like
+//! `cam<id>/<edge_clip_id>.mp4` (the cold replicator computes the
+//! basename from `motion_clips.id` so it matches the
+//! `edge_clip_id` field on the `clip_replicated` envelope). We
+//! extract `edge_clip_id` as the path basename minus `.mp4` and
+//! forward that to the SAS-issuance endpoint, which validates it
+//! against the safe-segment allow-list (`[A-Za-z0-9_.-]+`, no
+//! `..`). The returned `blob_path` (something like
 //! `org-<uuid>/core-<uuid>/<edge_clip_id>.mp4`) becomes the
 //! [`PutReceipt::cold_path`] — that's what the engine writes into
-//! `motion_clips.cold_path`.
+//! `motion_clips.cold_path`. The cloud's api-gateway recomputes
+//! this exact path on playback, so any drift between the basename
+//! used here and the wire `edge_clip_id` yields silent 404s.
 //!
 //! ## sha256 verification
 //!

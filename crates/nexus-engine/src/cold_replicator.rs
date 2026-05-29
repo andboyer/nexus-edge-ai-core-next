@@ -426,10 +426,24 @@ async fn upload_one(
         .ok_or(UploadError::MissingHotPath)?;
     let sha256 = clip.sha256.as_deref().ok_or(UploadError::MissingSha256)?;
 
-    // Cold path mirrors hot path verbatim so a future "rescan
-    // cold" can cross-reference by relative path without an extra
-    // mapping table.
-    let cold_path = hot_path_rel.to_string();
+    // Cold path basename MUST equal `clip.id.to_string()` — the
+    // value we send as `edge_clip_id` in the `clip_replicated`
+    // envelope below. The cloud's api-gateway recomputes the
+    // playback SAS path as `org-.../core-.../{edge_clip_id}.mp4`
+    // and reads back what we wrote, so any drift between the PUT
+    // basename and the wire `edge_clip_id` yields silent 404s on
+    // every playback attempt. We preserve the hot path's parent
+    // directory (typically `cam<camera_id>`) so non-Azure backends
+    // (gdrive / onedrive, where the operator may navigate the
+    // drive by hand) keep human-navigable organisation. For the
+    // Azure backend the prefix is ignored — only the basename
+    // becomes the blob name.
+    let cold_path = match std::path::Path::new(hot_path_rel).parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => {
+            format!("{}/{}.mp4", parent.display(), clip.id)
+        }
+        _ => format!("{}.mp4", clip.id),
+    };
 
     // Idempotent fast-path: if the backend already has a complete
     // copy (sha256 spot-check passes), skip the read+upload and
@@ -928,10 +942,9 @@ mod tests {
         let bus: Arc<dyn Bus> = Arc::new(BroadcastBus::new(64));
         let backend = MockBackend::new("mock", HealthStatus::Ok);
         // Pre-mark the clip as already-on-cold so exists() returns true.
-        backend
-            .existing
-            .lock()
-            .insert("1/clip_0001.mp4".to_string());
+        // Cold path is `<parent_of_hot>/<clip.id>.mp4` — see
+        // `upload_one` comment for why the basename is the row id.
+        backend.existing.lock().insert(format!("1/{}.mp4", clip_id));
 
         let registry = Registry::new();
         registry.replace_all([backend.clone() as Arc<dyn ColdBackend>]);
