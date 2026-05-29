@@ -98,14 +98,16 @@ export function BackendsPage() {
 }
 
 function StateBadge({ state }: { state: BackendStatus["state"] }) {
+  // Engine emits one of: initializing | ready | restarting | failed
+  // (see BackendState in crates/nexus-inference/src/backends.rs).
   const s = String(state).toLowerCase();
   const variant: "success" | "warning" | "destructive" | "secondary" =
-    s === "idle"
-      ? "secondary"
-      : s === "busy"
-        ? "success"
-        : s === "degraded"
-          ? "warning"
-          : "destructive";
+    s === "ready"
+      ? "success"
+      : s === "initializing" || s === "restarting"
+        ? "warning"
+        : s === "failed"
+          ? "destructive"
+          : "secondary";
   return <Badge variant={variant}>{s}</Badge>;
 }

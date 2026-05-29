@@ -270,7 +270,7 @@ export function AdminNetworkPage() {
     applyStatusQuery.data?.session ?? planQuery.data?.apply_pending;
 
   return (
-    <div className="space-y-6 p-6">
+    <div className="space-y-6">
       <header>
         <h1 className="text-2xl font-semibold">Network</h1>
         <p className="text-sm text-muted-foreground">

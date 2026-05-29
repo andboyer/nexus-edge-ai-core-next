@@ -69,7 +69,7 @@ export function AdminDiagnosticsPage() {
   });
 
   return (
-    <div className="space-y-6 p-6">
+    <div className="space-y-6">
       <header className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
         <div>
           <h1 className="text-2xl font-semibold">Diagnostics</h1>
@@ -211,7 +211,7 @@ export function AdminDiagnosticsPage() {
             Field diagnostics
           </CardTitle>
         </CardHeader>
-        <CardContent className="space-y-3 text-sm text-muted-foreground">
+        <CardContent className="text-sm text-muted-foreground">
           <p>
             The <strong>Download bundle</strong> button at the top of the
             page generates a redacted{" "}
@@ -222,14 +222,6 @@ export function AdminDiagnosticsPage() {
             (API keys, RTSP passwords, OIDC client secrets) are stripped
             before the bundle hits the wire.
           </p>
-          <p>
-            For a local-only bundle that doesn't require an authenticated
-            HTTP request, the <code className="font-mono">nexus-doctor</code>{" "}
-            CLI is still available on the box:
-          </p>
-          <pre className="overflow-x-auto rounded-md border border-border/40 bg-muted/30 p-3 font-mono text-xs">
-            <code>$ nexus-doctor bundle --output /tmp/nexus-diag.tar.gz</code>
-          </pre>
         </CardContent>
       </Card>
     </div>

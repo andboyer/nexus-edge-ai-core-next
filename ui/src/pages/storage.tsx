@@ -66,7 +66,7 @@ export function StoragePage() {
   };
 
   return (
-    <div className="space-y-6 p-6">
+    <div className="space-y-6">
       <header className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <div>
           <h1 className="text-2xl font-semibold">Storage</h1>
@@ -300,6 +300,15 @@ function ColdReplicaCard({ data }: { data: StorageResponse }) {
             <Badge variant="secondary">disabled</Badge>
           )}
         </div>
+
+        {cold?.health.reason ? (
+          <p
+            className="text-xs text-muted-foreground"
+            data-testid="cold-health-reason"
+          >
+            {cold.health.reason}
+          </p>
+        ) : null}
 
         {error ? (
           <p className="text-xs text-destructive">{error}</p>

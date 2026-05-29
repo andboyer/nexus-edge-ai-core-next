@@ -124,7 +124,7 @@ export function RulesPage() {
   }, [deepLinkId, rules.length]);
 
   return (
-    <div className="space-y-6 p-6">
+    <div className="space-y-6">
       <header className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <div>
           <h1 className="text-2xl font-semibold">Rules</h1>

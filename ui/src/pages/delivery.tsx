@@ -61,7 +61,7 @@ export function DeliveryPage() {
   });
 
   return (
-    <div className="space-y-6 p-6">
+    <div className="space-y-6">
       <header>
         <h1 className="text-2xl font-semibold">Delivery</h1>
         <p className="text-sm text-muted-foreground">
