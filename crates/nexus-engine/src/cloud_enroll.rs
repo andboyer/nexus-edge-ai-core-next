@@ -171,10 +171,7 @@ pub async fn perform_enrollment(
     let attach_replay_after = if keep_history {
         let mut days = history_days;
         if days > 365 {
-            tracing::warn!(
-                history_days = days,
-                "history_days capped at 365; clamping"
-            );
+            tracing::warn!(history_days = days, "history_days capped at 365; clamping");
             days = 365;
         }
         let cutoff = chrono::Utc::now() - chrono::Duration::days(i64::from(days));
