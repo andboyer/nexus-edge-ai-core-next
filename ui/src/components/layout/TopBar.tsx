@@ -1,5 +1,8 @@
-// Top bar: brand + system-health pill + user menu + sign-out button.
-// System-health pill polls /api/health every 10s.
+// Top bar: brand + system-health pill + cloud-tunnel pill + user
+// menu + sign-out button. Both pills poll their respective
+// /api endpoints every 10s. The cloud pill is unauthenticated
+// (the underlying engine route is too) so it renders correctly
+// even on the login overlay.
 
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { LogOut, ShieldCheck, User } from "lucide-react";
@@ -17,6 +20,11 @@ interface HealthResponse {
   version?: string;
 }
 
+interface CloudStatusResponse {
+  enrolled: boolean;
+  connected: boolean;
+}
+
 export function TopBar() {
   const session = useSession();
   const { clearSession } = useAuth();
@@ -25,6 +33,13 @@ export function TopBar() {
   const health = useQuery({
     queryKey: ["health"],
     queryFn: () => api.get<HealthResponse>("/health"),
+    refetchInterval: 10_000,
+    retry: 1,
+  });
+
+  const cloud = useQuery({
+    queryKey: ["cloud-status"],
+    queryFn: () => api.get<CloudStatusResponse>("/cloud/status"),
     refetchInterval: 10_000,
     retry: 1,
   });
@@ -50,6 +65,24 @@ export function TopBar() {
       ? `online \u2022 ${health.data?.version ?? "?"}`
       : "starting\u2026";
 
+  // Cloud-tunnel pill — three observable states (plus a fourth for
+  // transient errors), mapped to the same Badge variants used by
+  // the health pill so the two read as a unit.
+  const cloudVariant: "secondary" | "success" | "warning" = cloud.isError
+    ? "secondary"
+    : !cloud.data?.enrolled
+      ? "secondary"
+      : cloud.data.connected
+        ? "success"
+        : "warning";
+  const cloudLabel = cloud.isError
+    ? "cloud: ?"
+    : !cloud.data?.enrolled
+      ? "cloud: not enrolled"
+      : cloud.data.connected
+        ? "cloud: connected"
+        : "cloud: reconnecting\u2026";
+
   return (
     <header className="flex h-12 shrink-0 items-center justify-between border-b border-border bg-card px-4">
       <div className="flex items-center gap-3">
@@ -59,6 +92,9 @@ export function TopBar() {
         <div className="text-sm font-semibold tracking-tight">Nexus Edge AI</div>
         <Badge variant={healthVariant} className="ml-2">
           {healthLabel}
+        </Badge>
+        <Badge variant={cloudVariant} className="ml-2">
+          {cloudLabel}
         </Badge>
       </div>
 

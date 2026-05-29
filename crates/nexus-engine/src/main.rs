@@ -1012,6 +1012,13 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
         // above so a post-boot admin enrollment hot-activates
         // the WSS tunnel without an engine restart.
         cloud_enrollment_changed: cloud_enrollment_changed.clone(),
+        // Shared with the tunnel supervisor so the unauthenticated
+        // `GET /api/cloud/status` handler can report whether the
+        // WSS session is currently up. The supervisor calls
+        // `set_handle(Some(...))` on connect and `set_handle(None)`
+        // on every disconnect path, so `is_connected()` tracks the
+        // live state without any extra plumbing.
+        cloud_outbox: cloud_outbox.clone(),
     };
 
     // M-Admin Phase 1B — start the registry eviction sweep. Holds

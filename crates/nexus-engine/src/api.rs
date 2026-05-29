@@ -259,6 +259,14 @@ pub struct ApiState {
     /// the Notify is only consulted in the supervisor's
     /// pre-connection wait state.
     pub cloud_enrollment_changed: Arc<tokio::sync::Notify>,
+    /// Shared handle on the outbound tunnel session — held by the
+    /// cloud_tunnel supervisor and used here only for the
+    /// read-only `is_connected()` probe surfaced by
+    /// `GET /api/cloud/status`. When the engine is built without
+    /// any enrollment, the outbox lives but `is_connected()` stays
+    /// `false` forever — that's what powers the "cloud:
+    /// unenrolled / disconnected / connected" pill in the topbar.
+    pub cloud_outbox: Arc<nexus_cloud_client::TunnelOutbox>,
 }
 
 pub fn router(state: ApiState) -> Router {
@@ -518,6 +526,13 @@ pub fn router(state: ApiState) -> Router {
 
     let api = Router::new()
         .route("/health", get(health))
+        // Unauthenticated cloud-tunnel liveness probe. Returns
+        // `{enrolled, connected}` so the TopBar can render a
+        // "cloud: unenrolled / disconnected / connected" pill
+        // next to the engine-health pill. Deliberately minimal:
+        // no gateway URL, no core_id (those stay behind the
+        // admin gate at `/v1/admin/cloud/enrollment`).
+        .route("/cloud/status", get(cloud_status))
         .route("/cameras", get(list_cameras).post(create_camera))
         .route("/cameras/{id}", put(upsert_camera).delete(delete_camera))
         .route("/cameras/{id}/frames/latest", get(get_latest_frame_jpeg))
@@ -746,6 +761,42 @@ async fn health() -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "status": "ok",
         "version": env!("CARGO_PKG_VERSION"),
+    }))
+}
+
+/// `GET /api/cloud/status` — unauthenticated liveness probe for the
+/// cloud tunnel, used by the UI TopBar to render a status pill
+/// next to the engine-health pill.
+///
+/// Wire shape:
+///
+/// ```json
+/// {
+///   "enrolled": true,
+///   "connected": true
+/// }
+/// ```
+///
+/// Three observable states:
+///   * `{enrolled: false, connected: false}` — no enrollment row
+///     persisted; the tunnel supervisor is parked waiting for an
+///     admin `POST /v1/admin/cloud/enroll`.
+///   * `{enrolled: true,  connected: false}` — enrolled but the
+///     WSS session is not currently established (initial connect
+///     in progress, transient backoff, edge-gateway down, etc.).
+///   * `{enrolled: true,  connected: true}` — WSS session is up
+///     and heartbeats are flowing.
+///
+/// On a transient store error (very rare — the read is a single
+/// SELECT on a tiny table) we surface `enrolled: false` instead of
+/// returning 500, because the UI's job is to show "are we cloudy
+/// right now" not to surface infrastructure errors.
+async fn cloud_status(State(s): State<ApiState>) -> Json<serde_json::Value> {
+    let enrolled = matches!(s.store.get_cloud_enrollment().await, Ok(Some(_)));
+    let connected = s.cloud_outbox.is_connected();
+    Json(serde_json::json!({
+        "enrolled": enrolled,
+        "connected": connected,
     }))
 }
 
@@ -5595,6 +5646,10 @@ mod tests {
             // tunnel supervisor; a stand-alone Notify is the
             // satisfied-dependency form (nothing observes it).
             cloud_enrollment_changed: Arc::new(tokio::sync::Notify::new()),
+            // Same shape — unit tests never connect a real
+            // tunnel, so a fresh outbox just reports
+            // `is_connected() == false` forever.
+            cloud_outbox: Arc::new(nexus_cloud_client::TunnelOutbox::new()),
         };
         let app = super::router(state);
         (app, store, dir)
