@@ -232,10 +232,19 @@ jobs:
 
       # Pull the OpenVINO-enabled libonnxruntime.so (and the intel
       # CPU/GPU/NPU plugins + TBB) out of the matching-ABI Python wheel.
+      #
+      # onnxruntime-openvino >= 1.24 ships only cp311/cp312/cp313 wheels;
+      # ubuntu-22.04's default `python3` is 3.10 and `pip install` quietly
+      # filters the whole 1.24.x line out as "no matching distribution"
+      # (looks identical to the version having been yanked). Pin Python
+      # 3.11 here so pip can resolve the cp311 manylinux wheel.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
       - name: stage ONNX Runtime + OpenVINO libs
         run: |
           set -euo pipefail
-          python3 -m pip install --target /tmp/ovwheel \
+          python -m pip install --target /tmp/ovwheel \
             "onnxruntime-openvino==${ORT_VERSION}"
           mkdir -p stage/lib/onnxruntime
           cp -aP /tmp/ovwheel/onnxruntime/capi/*.so* stage/lib/onnxruntime/
