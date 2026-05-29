@@ -422,8 +422,20 @@ impl ClipRecorder for GstClipRecorder {
                     out.push(flushed);
                 }
             }
+            // Drain any tail. If it's a header-only stub (no slice
+            // NAL), drop it — pushing it would just create the
+            // 35-byte "missing picture" pathology we're guarding
+            // against.
             if let Some(last) = pending.take() {
-                out.push(last);
+                if contains_slice_nal(&last.data) {
+                    out.push(last);
+                } else {
+                    debug!(
+                        camera_id = args.camera_id,
+                        size = last.data.len(),
+                        "dropping snapshot tail: header-only stub (no slice NAL)"
+                    );
+                }
             }
             out
         };
@@ -916,13 +928,33 @@ fn coalesce_same_pts(pending: &mut Option<NalSample>, incoming: NalSample) -> Op
             None
         }
         Some(prev) => {
-            // Only merge when BOTH carry the same Some(pts). Two
-            // None-PTS samples are NOT considered a match — the
-            // PTS-synthesis path in push_sample handles those
-            // individually, and merging by accident would lose
-            // frames if the source ever legitimately emits
-            // multiple PTS-less samples in a row.
-            if prev.pts.is_some() && prev.pts == incoming.pts {
+            // Two reasons to merge:
+            //  (a) Both samples carry the same Some(pts) — classic
+            //      InSight split where h264parse emits an AU as two
+            //      callbacks sharing one PTS.
+            //  (b) `prev` does NOT contain a slice NAL (only AUD/
+            //      SEI/SPS/PPS) — it's an incomplete access unit
+            //      that MUST be glued onto the next sample
+            //      regardless of PTS, because mp4mux cannot mux a
+            //      header-only buffer (it lands as a 35–60 byte
+            //      "missing picture in access unit" stub that
+            //      Chrome's decoder drops along with the *next*
+            //      real slice, smearing motion macroblocks across
+            //      every P-frame until the next IDR). This catches
+            //      firmware revisions where the second half of the
+            //      split AU arrives with a synthesized-different
+            //      PTS (e.g. ingester-side `last + 33 ms` fallback)
+            //      OR with no PTS at all.
+            //
+            // Two None-PTS samples that BOTH contain a slice are
+            // NOT considered a match — the PTS-synthesis path in
+            // push_sample handles them individually, and merging
+            // by accident would lose frames if a source ever
+            // legitimately emits multiple PTS-less complete
+            // frames in a row.
+            let same_pts = prev.pts.is_some() && prev.pts == incoming.pts;
+            let prev_incomplete = !contains_slice_nal(&prev.data);
+            if same_pts || prev_incomplete {
                 let mut merged = prev;
                 merged.data.extend_from_slice(&incoming.data);
                 merged.is_keyframe = merged.is_keyframe || incoming.is_keyframe;
@@ -934,6 +966,13 @@ fn coalesce_same_pts(pending: &mut Option<NalSample>, incoming: NalSample) -> Op
                     (None, Some(b)) => Some(b),
                     (None, None) => None,
                 };
+                // If `prev` was a header-only stub and we just
+                // glued the slice on, inherit incoming's PTS
+                // when prev had none (otherwise mp4mux still
+                // wouldn't have a usable timestamp).
+                if merged.pts.is_none() {
+                    merged.pts = incoming.pts;
+                }
                 *pending = Some(merged);
                 None
             } else {
@@ -942,6 +981,41 @@ fn coalesce_same_pts(pending: &mut Option<NalSample>, incoming: NalSample) -> Op
             }
         }
     }
+}
+
+/// Scan an annex-B byte-stream for at least one VCL slice NAL
+/// (type 1 = non-IDR slice, type 5 = IDR slice). Returns `true` if
+/// any slice NAL is present, `false` if the buffer carries only
+/// non-VCL units (AUD=9, SEI=6, SPS=7, PPS=8, etc.). A buffer
+/// without a slice is by definition NOT a complete access unit
+/// and must not be muxed on its own — see [`coalesce_same_pts`]
+/// for the rationale.
+fn contains_slice_nal(data: &[u8]) -> bool {
+    let mut i = 0;
+    while i + 3 < data.len() {
+        let four = data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 0 && data[i + 3] == 1;
+        let three = data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1;
+        if four {
+            if i + 4 < data.len() {
+                let nal_type = data[i + 4] & 0x1f;
+                if nal_type == 1 || nal_type == 5 {
+                    return true;
+                }
+            }
+            i += 4;
+        } else if three {
+            if i + 3 < data.len() {
+                let nal_type = data[i + 3] & 0x1f;
+                if nal_type == 1 || nal_type == 5 {
+                    return true;
+                }
+            }
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    false
 }
 
 /// Push one [`NalSample`] into appsrc, rebasing PTS/DTS so the
@@ -1128,19 +1202,39 @@ async fn run_live_pump(
             _ = &mut stop => {
                 debug!(camera_id, clip_id, "live pump received stop signal");
                 if let Some(last) = pending.take() {
-                    let _ = push_one(
-                        camera_id, clip_id, &appsrc, last, base_pts,
-                        &mut last_pushed_pts, &mut last_written_pts_ns,
-                    ).await;
+                    if contains_slice_nal(&last.data) {
+                        let _ = push_one(
+                            camera_id, clip_id, &appsrc, last, base_pts,
+                            &mut last_pushed_pts, &mut last_written_pts_ns,
+                        ).await;
+                    } else {
+                        debug!(
+                            camera_id, clip_id,
+                            size = last.data.len(),
+                            "dropping pending tail at stop: header-only stub (no slice NAL)"
+                        );
+                    }
                 }
                 return;
             }
             _ = tokio::time::sleep(LIVE_PUMP_FLUSH_AFTER), if pending.is_some() => {
                 // Inactivity flush — the pending AU has been
                 // sitting here longer than a reasonable inter-
-                // frame interval, so push it as-is and clear.
+                // frame interval. If it carries a slice, push it
+                // as-is. If it's a header-only stub waiting for
+                // its slice that never came, drop it rather than
+                // letting mp4mux land a "missing picture" 35-byte
+                // stub (visible decoder error, smears motion
+                // macroblocks in downstream playback until the
+                // next IDR).
                 if let Some(last) = pending.take() {
-                    if push_one(
+                    if !contains_slice_nal(&last.data) {
+                        debug!(
+                            camera_id, clip_id,
+                            size = last.data.len(),
+                            "dropping pending tail at inactivity flush: header-only stub (no slice NAL)"
+                        );
+                    } else if push_one(
                         camera_id, clip_id, &appsrc, last, base_pts,
                         &mut last_pushed_pts, &mut last_written_pts_ns,
                     ).await.is_err() {
@@ -1197,61 +1291,161 @@ mod tests {
         }
     }
 
+    /// Header-only AU: `[AUD, SEI]` byte-stream with no slice NAL.
+    /// Mirrors the InSight 192.168.1.66 firmware that emits this as
+    /// its own appsink callback before the slice arrives.
+    fn header_only_au() -> Vec<u8> {
+        // start code, NAL type 9 (AUD), AUD payload byte,
+        // start code, NAL type 6 (SEI), SEI payload+RBSP trailing.
+        vec![
+            0, 0, 0, 1, 9, 0xF0, // AUD
+            0, 0, 0, 1, 6, 5, 0x10, 0x20, 0x80, // SEI
+        ]
+    }
+
+    /// Slice-bearing AU: a non-IDR slice NAL (type 1) with a few
+    /// bytes of payload. Sufficient to trigger `contains_slice_nal`.
+    fn slice_au(payload_size: usize) -> Vec<u8> {
+        let mut v = vec![0, 0, 0, 1, 0x41]; // start code + NAL type 1 (non-IDR slice)
+        v.extend(std::iter::repeat_n(0xAB, payload_size));
+        v
+    }
+
+    /// IDR slice (NAL type 5).
+    fn idr_au(payload_size: usize) -> Vec<u8> {
+        let mut v = vec![0, 0, 0, 1, 0x65]; // start code + NAL type 5 (IDR slice)
+        v.extend(std::iter::repeat_n(0xCD, payload_size));
+        v
+    }
+
+    #[test]
+    fn contains_slice_nal_detects_type_1_and_5() {
+        assert!(!contains_slice_nal(&header_only_au()));
+        assert!(contains_slice_nal(&slice_au(10)));
+        assert!(contains_slice_nal(&idr_au(10)));
+        // Mixed: header + slice → has slice.
+        let mut mixed = header_only_au();
+        mixed.extend_from_slice(&slice_au(10));
+        assert!(contains_slice_nal(&mixed));
+        // Empty / too short → no slice.
+        assert!(!contains_slice_nal(&[]));
+        assert!(!contains_slice_nal(&[0, 0, 0, 1]));
+    }
+
     #[test]
     fn coalesce_merges_same_pts_pair() {
         // Two samples sharing pts=66ms — the exact InSight 192.168.1.66
         // pathology: an [AUD, SEI] tiny buffer followed by [slice ...].
         let mut pending: Option<NalSample> = None;
         // First arrival: just buffered, nothing to flush yet.
-        assert!(coalesce_same_pts(&mut pending, sample(Some(66), &[9, 0, 6, 25], false)).is_none());
+        let header = sample(Some(66), &header_only_au(), false);
+        assert!(coalesce_same_pts(&mut pending, header).is_none());
         assert!(pending.is_some());
         // Second arrival with the same pts: merges into pending, still
         // nothing to flush.
-        assert!(
-            coalesce_same_pts(&mut pending, sample(Some(66), &[5, 0, 0, 0, 0], true)).is_none()
-        );
+        let slice = sample(Some(66), &slice_au(20), true);
+        assert!(coalesce_same_pts(&mut pending, slice).is_none());
         let merged = pending.as_ref().unwrap();
         assert_eq!(merged.pts, Some(Duration::from_millis(66)));
-        assert_eq!(merged.data, vec![9, 0, 6, 25, 5, 0, 0, 0, 0]);
+        assert!(contains_slice_nal(&merged.data));
         assert!(merged.is_keyframe, "keyframe flag must OR-combine");
     }
 
     #[test]
-    fn coalesce_different_pts_flushes_previous() {
+    fn coalesce_different_pts_flushes_previous_when_both_have_slices() {
         let mut pending: Option<NalSample> = None;
-        assert!(coalesce_same_pts(&mut pending, sample(Some(33), b"first", false)).is_none());
+        let first = sample(Some(33), &slice_au(10), false);
+        assert!(coalesce_same_pts(&mut pending, first).is_none());
         // Different PTS — previous gets flushed, new one buffered.
-        let flushed = coalesce_same_pts(&mut pending, sample(Some(66), b"second", false))
-            .expect("must flush previous on PTS change");
+        // Both have slices so the header-only-merge path doesn't fire.
+        let second = sample(Some(66), &slice_au(10), false);
+        let flushed = coalesce_same_pts(&mut pending, second)
+            .expect("must flush previous slice on PTS change");
         assert_eq!(flushed.pts, Some(Duration::from_millis(33)));
-        assert_eq!(flushed.data, b"first".to_vec());
         let still_pending = pending.as_ref().unwrap();
         assert_eq!(still_pending.pts, Some(Duration::from_millis(66)));
-        assert_eq!(still_pending.data, b"second".to_vec());
     }
 
     #[test]
-    fn coalesce_none_pts_never_merges() {
-        // Two PTS-less samples in a row — must NOT merge (would lose
-        // frames if a source ever legitimately emits two PTS-less
-        // samples back to back; the synthesis path in push_sample
-        // handles them individually instead).
+    fn coalesce_none_pts_never_merges_when_both_have_slices() {
+        // Two PTS-less complete frames in a row — must NOT merge
+        // (would lose frames if a source ever legitimately emits two
+        // PTS-less complete frames back to back). The synthesis path
+        // in push_sample handles them individually.
         let mut pending: Option<NalSample> = None;
-        assert!(coalesce_same_pts(&mut pending, sample(None, b"a", false)).is_none());
-        let flushed = coalesce_same_pts(&mut pending, sample(None, b"b", false))
-            .expect("two None-PTS samples must NOT merge");
-        assert_eq!(flushed.data, b"a".to_vec());
-        assert_eq!(pending.as_ref().unwrap().data, b"b".to_vec());
+        let a = sample(None, &slice_au(10), false);
+        assert!(coalesce_same_pts(&mut pending, a).is_none());
+        let b = sample(None, &slice_au(15), false);
+        let flushed =
+            coalesce_same_pts(&mut pending, b).expect("two None-PTS slice samples must NOT merge");
+        assert_eq!(flushed.data.len(), 15); // first one was 10+5 header
+        assert!(pending.is_some());
+    }
+
+    #[test]
+    fn coalesce_header_only_then_slice_different_pts_still_merges() {
+        // The regression case: ingester synthesizes
+        // last_pts + 33ms on the slice half because gst h264parse
+        // didn't restamp it, so the two halves arrive with DIFFERENT
+        // Some(pts) — but `prev` is a header-only stub so the new
+        // rule must still merge them.
+        let mut pending: Option<NalSample> = None;
+        let header = sample(Some(66), &header_only_au(), false);
+        assert!(coalesce_same_pts(&mut pending, header).is_none());
+        let slice = sample(Some(99), &slice_au(20), false);
+        assert!(
+            coalesce_same_pts(&mut pending, slice).is_none(),
+            "header-only stub MUST be merged with following slice regardless of PTS"
+        );
+        let merged = pending.as_ref().unwrap();
+        assert!(contains_slice_nal(&merged.data));
+        // PTS should still be the original Some(66) (prev's), not
+        // overwritten by incoming's — earlier PTS is the source's
+        // truth for this AU.
+        assert_eq!(merged.pts, Some(Duration::from_millis(66)));
+    }
+
+    #[test]
+    fn coalesce_header_only_then_slice_pts_none_inherits_pts() {
+        // Variation: prev is header-only with Some(pts), slice
+        // arrives PTS-less. Merged buffer should keep Some(pts).
+        let mut pending: Option<NalSample> = None;
+        let header = sample(Some(66), &header_only_au(), false);
+        coalesce_same_pts(&mut pending, header);
+        let slice = sample(None, &slice_au(20), false);
+        assert!(coalesce_same_pts(&mut pending, slice).is_none());
+        let merged = pending.as_ref().unwrap();
+        assert_eq!(merged.pts, Some(Duration::from_millis(66)));
+        assert!(contains_slice_nal(&merged.data));
+    }
+
+    #[test]
+    fn coalesce_pts_none_header_then_slice_inherits_incoming_pts() {
+        // Variation: prev is header-only WITHOUT pts (rare but
+        // possible), slice arrives with Some(pts). The merged buffer
+        // must adopt incoming's pts so mp4mux can mux it.
+        let mut pending: Option<NalSample> = None;
+        let header = sample(None, &header_only_au(), false);
+        coalesce_same_pts(&mut pending, header);
+        let slice = sample(Some(66), &slice_au(20), false);
+        assert!(coalesce_same_pts(&mut pending, slice).is_none());
+        let merged = pending.as_ref().unwrap();
+        assert_eq!(
+            merged.pts,
+            Some(Duration::from_millis(66)),
+            "merged AU must inherit slice's PTS when header had none"
+        );
     }
 
     #[test]
     fn coalesce_dts_keeps_earlier() {
-        // When merging, dts should keep the earlier (smaller) value so
-        // downstream monotonic expectations still hold.
+        // When merging same-pts samples, dts should keep the earlier
+        // (smaller) value so downstream monotonic expectations still
+        // hold.
         let mut pending: Option<NalSample> = None;
-        let mut a = sample(Some(66), b"x", false);
+        let mut a = sample(Some(66), &header_only_au(), false);
         a.dts = Some(Duration::from_millis(60));
-        let mut b = sample(Some(66), b"y", false);
+        let mut b = sample(Some(66), &slice_au(10), false);
         b.dts = Some(Duration::from_millis(70));
         coalesce_same_pts(&mut pending, a);
         coalesce_same_pts(&mut pending, b);
