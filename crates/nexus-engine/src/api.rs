@@ -345,6 +345,10 @@ pub fn router(state: ApiState) -> Router {
             "/v1/admin/discovery/sessions/{session_id}/onvif-streams",
             axum::routing::post(discovery::post_probe_onvif),
         )
+        .route(
+            "/v1/admin/discovery/sessions/{session_id}/cancel",
+            axum::routing::post(discovery::post_cancel_session),
+        )
         // M6 Phase 2 Step 2.8 — local-user roster admin. Lives
         // behind both the admin_auth gate AND the per-handler
         // `AdminContext` extractor: a valid HS256 JWT signed

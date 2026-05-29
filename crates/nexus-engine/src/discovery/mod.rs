@@ -182,6 +182,23 @@ pub struct DiscoverySessionView {
     pub found: Vec<DiscoveredDevice>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// `true` when the session was terminated by an explicit
+    /// `POST .../sessions/:id/cancel` rather than running to
+    /// completion. Distinct from `state: error` (operator-driven,
+    /// not a fault). UI uses it to render an "operator cancelled"
+    /// affordance and skip the "No cameras matched" empty-state
+    /// copy. Always serialised so callers can do plain field reads.
+    #[serde(default)]
+    pub cancelled: bool,
+}
+
+/// Response body for `POST /api/v1/admin/discovery/sessions/:id/cancel`.
+#[derive(Debug, Clone, Serialize)]
+pub struct CancelSessionResp {
+    /// `true` when the cancel actually transitioned a Running
+    /// session to Done; `false` when the session was already
+    /// terminal (idempotent — second cancel is not an error).
+    pub cancelled: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -300,6 +317,14 @@ pub(crate) struct SessionInner {
     pub scanned: u32,
     pub found: Vec<DiscoveredDevice>,
     pub error: Option<String>,
+    /// Set to `true` by [`DiscoverySessions::cancel`] when the
+    /// operator hits `POST .../sessions/:id/cancel`. The spawned
+    /// scan/onvif task is NOT torn down (the work is already
+    /// bounded — onvif is a 5 s listen window, a /22 scan caps
+    /// at ~30 s at concurrency=64), but `mark_finished` is
+    /// idempotent so the task's terminal-state write is dropped
+    /// when it eventually runs.
+    pub cancelled: bool,
 }
 
 impl SessionInner {
@@ -313,6 +338,7 @@ impl SessionInner {
             scanned: self.scanned,
             found: self.found.clone(),
             error: self.error.clone(),
+            cancelled: self.cancelled,
         }
     }
 }
@@ -353,6 +379,7 @@ impl DiscoverySessions {
             scanned: 0,
             found: Vec::new(),
             error: None,
+            cancelled: false,
         }));
         self.inner.insert(id, inner.clone());
         (id, inner)
@@ -362,6 +389,28 @@ impl DiscoverySessions {
         let entry = self.inner.get(id)?;
         let snap = entry.value().lock().snapshot(*id);
         Some(snap)
+    }
+
+    /// Mark a Running session as cancelled. Returns:
+    /// * `Some(true)`  — the session existed AND was Running;
+    ///   state transitioned to `Done` with `cancelled = true`.
+    /// * `Some(false)` — the session existed but was already
+    ///   terminal (Done or Error); no-op, idempotent.
+    /// * `None`        — no such session (TTL-evicted or never
+    ///   existed); the HTTP handler maps this to 404.
+    pub fn cancel(&self, id: &Uuid) -> Option<bool> {
+        let entry = self.inner.get(id)?;
+        let mut guard = entry.value().lock();
+        if guard.state != DiscoveryState::Running {
+            return Some(false);
+        }
+        guard.state = DiscoveryState::Done;
+        guard.cancelled = true;
+        guard.finished_at = Some(Instant::now());
+        // Explicitly clear any prior error string — a cancelled
+        // session is operator-driven, not a fault.
+        guard.error = None;
+        Some(true)
     }
 
     /// Drop every session whose `finished_at` is older than
@@ -409,8 +458,18 @@ pub fn spawn_eviction_sweep(sessions: DiscoverySessions) {
 /// Helper used by the discovery tasks to mark a session terminal
 /// (Done or Error). Also stamps `finished_at` so the eviction
 /// sweep can drop it after `SESSION_TTL`.
+///
+/// **Idempotent**: a no-op when the session is already terminal.
+/// This lets [`DiscoverySessions::cancel`] flip a Running session
+/// to Done synchronously without racing the spawned task — when
+/// the task eventually finishes its bounded work and calls
+/// `mark_finished`, this branch drops the second write so the
+/// `cancelled: true` flag survives.
 pub(crate) fn mark_finished(inner: &Mutex<SessionInner>, error: Option<String>) {
     let mut guard = inner.lock();
+    if guard.state != DiscoveryState::Running {
+        return;
+    }
     guard.state = if error.is_some() {
         DiscoveryState::Error
     } else {
@@ -592,6 +651,45 @@ pub async fn post_probe_onvif(
             streams: Vec::new(),
             error: Some(err),
         })),
+    }
+}
+
+/// `POST /api/v1/admin/discovery/sessions/:session_id/cancel`
+///
+/// Operator-driven early termination. Marks a Running session as
+/// `Done` with `cancelled: true` so the UI's poll loop exits
+/// cleanly when the operator closes the discover dialog mid-scan.
+/// The spawned scan/onvif task itself is NOT torn down (the work
+/// is already bounded \u2014 onvif is a 5 s listen window, a /22 scan
+/// caps at ~30 s at concurrency=64); [`mark_finished`] is
+/// idempotent so the task's eventual terminal-state write is a
+/// no-op.
+///
+/// Idempotent: a second cancel against the same session returns
+/// `{ cancelled: false }` with HTTP 200, NOT a 4xx error \u2014 the
+/// operator may have double-clicked or two cloud-side requests
+/// may have raced.
+///
+/// Returns 404 only when the session id is unknown (TTL-evicted
+/// or never existed).
+pub async fn post_cancel_session(
+    State(s): State<ApiState>,
+    Path(session_id): Path<Uuid>,
+) -> Result<Json<CancelSessionResp>, ApiError> {
+    s.store
+        .write_audit(
+            "api",
+            "discovery_session_cancel",
+            &format!("session/{session_id}"),
+            &serde_json::json!({}),
+        )
+        .await?;
+    match s.discovery_sessions.cancel(&session_id) {
+        Some(cancelled) => Ok(Json(CancelSessionResp { cancelled })),
+        None => Err(ApiError(
+            StatusCode::NOT_FOUND,
+            format!("session {session_id} not found"),
+        )),
     }
 }
 
@@ -897,5 +995,73 @@ mod tests {
         );
         // Sanity check the evicted id really is gone.
         assert!(reg.get(&id).is_none());
+    }
+
+    #[tokio::test]
+    async fn cancel_transitions_running_to_done_with_flag() {
+        let reg = DiscoverySessions::new();
+        let (id, _inner) = reg.start(DiscoveryKind::Scan, Some(1024));
+
+        // First cancel: Running -> Done, cancelled = true.
+        assert_eq!(reg.cancel(&id), Some(true));
+        let view = reg.get(&id).expect("session still present");
+        assert_eq!(view.state, DiscoveryState::Done);
+        assert!(view.cancelled, "cancelled flag must be true");
+        assert!(view.error.is_none(), "cancel must clear error");
+
+        // Second cancel is idempotent: returns Some(false), no
+        // state change.
+        assert_eq!(reg.cancel(&id), Some(false));
+        let view2 = reg.get(&id).unwrap();
+        assert_eq!(view2.state, DiscoveryState::Done);
+        assert!(view2.cancelled);
+    }
+
+    #[tokio::test]
+    async fn cancel_unknown_session_returns_none() {
+        let reg = DiscoverySessions::new();
+        assert_eq!(reg.cancel(&Uuid::now_v7()), None);
+    }
+
+    #[tokio::test]
+    async fn mark_finished_is_idempotent_after_cancel() {
+        // Models the race: operator cancels mid-scan, then the
+        // spawned task eventually completes its bounded work and
+        // calls mark_finished. The cancelled flag must survive.
+        let reg = DiscoverySessions::new();
+        let (id, inner) = reg.start(DiscoveryKind::Scan, Some(1024));
+
+        assert_eq!(reg.cancel(&id), Some(true));
+        let view_before = reg.get(&id).unwrap();
+        let finished_before = view_before
+            .cancelled
+            .then_some(view_before.state)
+            .expect("must be cancelled");
+
+        // Task races in with its terminal-state write.
+        mark_finished(&inner, Some("network gone".to_string()));
+
+        let view_after = reg.get(&id).unwrap();
+        assert_eq!(
+            view_after.state, finished_before,
+            "post-cancel mark_finished must NOT overwrite state"
+        );
+        assert!(view_after.cancelled, "cancelled flag must survive race");
+        assert!(
+            view_after.error.is_none(),
+            "post-cancel mark_finished must NOT overwrite the cleared error"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_after_completion_returns_false() {
+        let reg = DiscoverySessions::new();
+        let (id, inner) = reg.start(DiscoveryKind::Onvif, None);
+        mark_finished(&inner, None);
+
+        assert_eq!(reg.cancel(&id), Some(false));
+        let view = reg.get(&id).unwrap();
+        assert!(!view.cancelled, "natural completion must NOT set cancelled");
+        assert_eq!(view.state, DiscoveryState::Done);
     }
 }
