@@ -45,6 +45,11 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Skeleton } from "@/components/ui/skeleton";
 import { formatBytes, formatPct } from "@/lib/format";
+import {
+  defaultSizeForKind,
+  describeSize,
+  sizesForKind,
+} from "@/lib/model-sizes";
 
 export function AdminServerPage() {
   const qc = useQueryClient();
@@ -184,16 +189,12 @@ export function AdminServerPage() {
   type ModelDraft = {
     kind: string;
     preset: string;
-    input_width: string;
-    input_height: string;
     score_threshold: string;
     pack_path: string;
   };
   const emptyModelDraft: ModelDraft = {
     kind: "",
     preset: "",
-    input_width: "",
-    input_height: "",
     score_threshold: "",
     pack_path: "",
   };
@@ -201,19 +202,42 @@ export function AdminServerPage() {
   const [modelSeeded, setModelSeeded] = useState(false);
   useEffect(() => {
     if (modelQuery.data && !modelSeeded) {
-      // Seed from pending if present, otherwise current.
+      // Seed from pending if present, otherwise current. Width/height
+      // are derived from preset (see the per-kind size table in
+      // `lib/model-sizes.ts`) — the engine treats `(input_width,
+      // input_height) = (Number(preset), Number(preset))` for every
+      // shipped square model.
       const src = modelQuery.data.pending ?? modelQuery.data.current;
       setModelDraft({
         kind: src.kind,
         preset: src.preset,
-        input_width: String(src.input_width),
-        input_height: String(src.input_height),
         score_threshold: String(src.score_threshold),
         pack_path: src.pack_path ?? "",
       });
       setModelSeeded(true);
     }
   }, [modelQuery.data, modelSeeded]);
+
+  // Snap preset when kind changes so we never persist a (kind, size)
+  // combo the engine doesn't ship a per-size ONNX for. If the current
+  // preset is still valid for the new kind, keep it; else pick the
+  // first option; else (no-size kind like mock / classifier_ensemble)
+  // clear the preset entirely and the engine applies its kind default.
+  const switchModelKind = (nextKind: string) => {
+    if (nextKind === modelDraft.kind) return;
+    const opts = sizesForKind(nextKind);
+    let nextPreset = modelDraft.preset;
+    if (opts.length === 0) {
+      nextPreset = "";
+    } else {
+      const cur = Number(modelDraft.preset);
+      const keep = Number.isFinite(cur) && opts.includes(cur)
+        ? cur
+        : defaultSizeForKind(nextKind);
+      nextPreset = keep === undefined ? "" : String(keep);
+    }
+    setModelDraft({ ...modelDraft, kind: nextKind, preset: nextPreset });
+  };
 
   const modelMutation = useMutation({
     mutationFn: (patch: InferenceModelPatch) => putInferenceModel(patch),
@@ -697,34 +721,46 @@ export function AdminServerPage() {
             className="grid grid-cols-1 gap-3 pt-2 sm:grid-cols-2"
             onSubmit={(e) => {
               e.preventDefault();
-              const w = Number(modelDraft.input_width);
-              const h = Number(modelDraft.input_height);
               const thr = Number(modelDraft.score_threshold);
               if (!modelDraft.kind.trim()) {
                 toast.error("Kind is required");
                 return;
               }
-              if (!modelDraft.preset.trim()) {
-                toast.error("Preset is required");
-                return;
-              }
-              if (!Number.isFinite(w) || w < 32 || w > 4096 || w % 32 !== 0) {
-                toast.error("Input width must be a multiple of 32 in 32..=4096");
-                return;
-              }
-              if (!Number.isFinite(h) || h < 32 || h > 4096 || h % 32 !== 0) {
-                toast.error(
-                  "Input height must be a multiple of 32 in 32..=4096",
-                );
-                return;
+              const presetOpts = sizesForKind(modelDraft.kind);
+              // For multi-size kinds the operator MUST pick a preset that the
+              // pack actually ships at — the engine resolver hard fails on
+              // missing per-size files (silent-CPU-fallback trap on Intel NPU).
+              if (presetOpts.length > 0) {
+                const p = Number(modelDraft.preset);
+                if (!presetOpts.includes(p)) {
+                  toast.error(
+                    `Preset must be one of ${presetOpts.join(" / ")} for kind ${modelDraft.kind}`,
+                  );
+                  return;
+                }
               }
               if (!Number.isFinite(thr) || thr < 0 || thr > 1) {
                 toast.error("Score threshold must be in 0.0..=1.0");
                 return;
               }
+              // Width/height are derived from preset — every shipped model is
+              // square (yolo26n_640/960/1280, yolo_world_v2_s_640/960, etc.).
+              // For kinds that ship a single fixed-size ONNX (yoloe*,
+              // classifier_ensemble, mock) we send the current engine
+              // dimensions back unchanged so the PUT contract stays satisfied;
+              // changing them on the wire is meaningless because the resolver
+              // ignores the request.
+              const current = modelQuery.data?.current;
+              const presetNum = modelDraft.preset.trim() === ""
+                ? null
+                : Number(modelDraft.preset);
+              const w = presetNum ?? current?.input_width ?? 0;
+              const h = presetNum ?? current?.input_height ?? 0;
               modelMutation.mutate({
                 kind: modelDraft.kind.trim(),
-                preset: modelDraft.preset.trim(),
+                preset: modelDraft.preset.trim() === ""
+                  ? (current?.preset ?? "")
+                  : modelDraft.preset.trim(),
                 input_width: w,
                 input_height: h,
                 score_threshold: thr,
@@ -743,9 +779,7 @@ export function AdminServerPage() {
                 id="model-kind"
                 className="flex h-9 w-full rounded-md border border-input bg-background px-3 py-1 text-sm shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
                 value={modelDraft.kind}
-                onChange={(e) =>
-                  setModelDraft({ ...modelDraft, kind: e.target.value })
-                }
+                onChange={(e) => switchModelKind(e.target.value)}
                 disabled={modelQuery.isLoading || modelMutation.isPending}
                 data-testid="model-kind-input"
               >
@@ -767,59 +801,52 @@ export function AdminServerPage() {
               </select>
             </div>
             <div className="flex flex-col gap-1">
-              <Label htmlFor="model-preset">Preset</Label>
-              <select
-                id="model-preset"
-                className="flex h-9 w-full rounded-md border border-input bg-background px-3 py-1 text-sm shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
-                value={modelDraft.preset}
-                onChange={(e) =>
-                  setModelDraft({ ...modelDraft, preset: e.target.value })
-                }
-                disabled={modelQuery.isLoading || modelMutation.isPending}
-                data-testid="model-preset-input"
-              >
-                {["320", "640", "1280"].map((p) => (
-                  <option key={p} value={p}>
-                    {p}
-                  </option>
-                ))}
-                {modelDraft.preset
-                  && !["320", "640", "1280"].includes(modelDraft.preset) ? (
-                  <option value={modelDraft.preset}>{modelDraft.preset}</option>
-                ) : null}
-              </select>
-            </div>
-            <div className="flex flex-col gap-1">
-              <Label htmlFor="model-width">Input width (px, ÷32)</Label>
-              <Input
-                id="model-width"
-                type="number"
-                min={32}
-                max={4096}
-                step={32}
-                value={modelDraft.input_width}
-                onChange={(e) =>
-                  setModelDraft({ ...modelDraft, input_width: e.target.value })
-                }
-                disabled={modelQuery.isLoading || modelMutation.isPending}
-                data-testid="model-width-input"
-              />
-            </div>
-            <div className="flex flex-col gap-1">
-              <Label htmlFor="model-height">Input height (px, ÷32)</Label>
-              <Input
-                id="model-height"
-                type="number"
-                min={32}
-                max={4096}
-                step={32}
-                value={modelDraft.input_height}
-                onChange={(e) =>
-                  setModelDraft({ ...modelDraft, input_height: e.target.value })
-                }
-                disabled={modelQuery.isLoading || modelMutation.isPending}
-                data-testid="model-height-input"
-              />
+              <Label htmlFor="model-preset">
+                Input size {sizesForKind(modelDraft.kind).length === 0 ? "(fixed)" : "(W × H)"}
+              </Label>
+              {sizesForKind(modelDraft.kind).length > 1 ? (
+                <select
+                  id="model-preset"
+                  className="flex h-9 w-full rounded-md border border-input bg-background px-3 py-1 text-sm shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
+                  value={modelDraft.preset}
+                  onChange={(e) =>
+                    setModelDraft({ ...modelDraft, preset: e.target.value })
+                  }
+                  disabled={modelQuery.isLoading || modelMutation.isPending}
+                  data-testid="model-preset-input"
+                >
+                  {sizesForKind(modelDraft.kind).map((sz) => (
+                    <option key={sz} value={String(sz)}>
+                      {describeSize(sz)}
+                    </option>
+                  ))}
+                  {/* Forward-compat: keep an unknown current preset selectable. */}
+                  {modelDraft.preset
+                    && !sizesForKind(modelDraft.kind).includes(
+                      Number(modelDraft.preset),
+                    ) ? (
+                    <option value={modelDraft.preset}>{modelDraft.preset}</option>
+                  ) : null}
+                </select>
+              ) : (
+                <div
+                  className="flex h-9 w-full items-center rounded-md border border-dashed border-input bg-muted/30 px-3 py-1 text-sm text-muted-foreground"
+                  data-testid="model-preset-input"
+                >
+                  <code className="font-mono">
+                    {modelDraft.preset
+                      ? `${modelDraft.preset} × ${modelDraft.preset}`
+                      : "fixed by model"}
+                  </code>
+                </div>
+              )}
+              <p className="text-xs text-muted-foreground">
+                Width and height are set automatically from the picked size —
+                every shipped detector ONNX is square. The engine's per-kind
+                resolver hard fails on a missing per-size file (silent
+                CPU-fallback trap on Intel NPU, fixed in v0.1.22), so only
+                sizes the kind's pack actually ships are listed here.
+              </p>
             </div>
             <div className="flex flex-col gap-1">
               <Label htmlFor="model-score">Score threshold (0..=1)</Label>

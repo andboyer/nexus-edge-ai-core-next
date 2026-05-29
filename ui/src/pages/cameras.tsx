@@ -62,6 +62,11 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Sheet, SheetSection } from "@/components/ui/sheet";
 import { Skeleton } from "@/components/ui/skeleton";
+import {
+  defaultSizeForKind,
+  describeSize,
+  sizesForKind,
+} from "@/lib/model-sizes";
 
 const EMPTY_CAMERA: CameraConfig = {
   // 0 is the sentinel for "no server-assigned id yet". The
@@ -669,6 +674,9 @@ function ModelOverrideEditor({
   const entries = catalog.data?.kinds ?? [];
   const kind = value?.kind ?? "";
   const selected = entries.find((e) => e.kind === kind);
+  const availableSizes = sizesForKind(kind);
+  const showSizePicker = availableSizes.length > 1;
+  const fixedSize = availableSizes.length === 1 ? availableSizes[0] : undefined;
 
   // Patch helper — merges a partial update, then strips any field that
   // collapsed to `""` / `null` / `undefined` so the wire payload only
@@ -688,6 +696,46 @@ function ModelOverrideEditor({
     }
   };
 
+  // Snap size fields when the kind changes so we never persist an
+  // (kind, size) combo the engine doesn't ship a file for. Per-kind
+  // size tables live in `lib/model-sizes.ts`.
+  const switchKind = (nextKind: string) => {
+    if (nextKind === kind) return;
+    if (!nextKind) {
+      // Clearing kind drops the whole override (see patch()).
+      patch({
+        kind: "",
+        preset: undefined,
+        input_width: undefined,
+        input_height: undefined,
+      });
+      return;
+    }
+    const opts = sizesForKind(nextKind);
+    if (opts.length === 0) {
+      // Single-size or no-size kind: clear size fields and let the engine apply its default.
+      patch({
+        kind: nextKind,
+        preset: undefined,
+        input_width: undefined,
+        input_height: undefined,
+      });
+      return;
+    }
+    const current = value?.input_width;
+    const keep = current && opts.includes(current) ? current : defaultSizeForKind(nextKind);
+    if (!keep) {
+      patch({ kind: nextKind });
+      return;
+    }
+    patch({
+      kind: nextKind,
+      preset: String(keep),
+      input_width: keep,
+      input_height: keep,
+    });
+  };
+
   // Parses a number input that may be empty. Returns undefined for empty
   // strings so the field is dropped from the payload, and NaN-guards bad
   // input (treats it as "unset" rather than poisoning the override).
@@ -705,7 +753,7 @@ function ModelOverrideEditor({
           id="cam-model-kind"
           className="h-9 w-full rounded-md border border-input bg-transparent px-2 text-sm"
           value={kind}
-          onChange={(e) => patch({ kind: e.target.value })}
+          onChange={(e) => switchKind(e.target.value)}
         >
           <option value="">(use engine default)</option>
           {entries.map((e) => (
@@ -739,43 +787,61 @@ function ModelOverrideEditor({
 
           <div className="space-y-2">
             <Label htmlFor="cam-model-size">Input size</Label>
-            <select
-              id="cam-model-size"
-              className="h-9 w-full rounded-md border border-input bg-transparent px-2 text-sm"
-              value={value?.input_width ? String(value.input_width) : ""}
-              onChange={(e) => {
-                const raw = e.target.value;
-                if (raw === "") {
-                  // Clear all three coupled fields atomically.
-                  patch({
-                    preset: undefined,
-                    input_width: undefined,
-                    input_height: undefined,
-                  });
-                  return;
-                }
-                const n = Number(raw);
-                patch({
-                  preset: raw,
-                  input_width: n,
-                  input_height: n,
-                });
-              }}
-            >
-              <option value="">(use tier default)</option>
-              <option value="640">640 × 640 — fastest, fits every tier</option>
-              <option value="960">960 × 960 — balanced; default on T36 / T36-S</option>
-              <option value="1280">1280 × 1280 — highest detail; opt-in for plate/face</option>
-            </select>
-            <p className="text-xs text-muted-foreground">
-              Sets preset + input width + input height to the same value
-              (the shipped <code className="font-mono">yolo26n_*.onnx</code>
-              models are square). For <code className="font-mono">yolo</code>
-              kind, the engine picks the matching
-              <code className="mx-1 font-mono">yolo26n_&lt;size&gt;.onnx</code>
-              from the pack. Other kinds use the size as their preset
-              lookup key.
-            </p>
+            {showSizePicker ? (
+              <>
+                <select
+                  id="cam-model-size"
+                  className="h-9 w-full rounded-md border border-input bg-transparent px-2 text-sm"
+                  value={value?.input_width ? String(value.input_width) : ""}
+                  onChange={(e) => {
+                    const raw = e.target.value;
+                    if (raw === "") {
+                      // Clear all three coupled fields atomically.
+                      patch({
+                        preset: undefined,
+                        input_width: undefined,
+                        input_height: undefined,
+                      });
+                      return;
+                    }
+                    const n = Number(raw);
+                    patch({
+                      preset: raw,
+                      input_width: n,
+                      input_height: n,
+                    });
+                  }}
+                >
+                  <option value="">(use tier default)</option>
+                  {availableSizes.map((sz) => (
+                    <option key={sz} value={String(sz)}>
+                      {describeSize(sz)}
+                    </option>
+                  ))}
+                </select>
+                <p className="text-xs text-muted-foreground">
+                  The router picks the matching
+                  <code className="mx-1 font-mono">{kind}_&lt;size&gt;.onnx</code>
+                  from the pack at boot. Only sizes the pack actually ships
+                  for this kind are listed — a mismatched size would silently
+                  CPU-fall-back on Intel NPU hardware (engine v0.1.22 hard
+                  fails on missing per-size files instead).
+                </p>
+              </>
+            ) : fixedSize !== undefined ? (
+              <p className="text-xs text-muted-foreground">
+                Fixed at <code className="font-mono">{fixedSize} × {fixedSize}</code>
+                {" — "}
+                <code className="font-mono">{kind}</code> ships exactly one
+                per-size variant today. Multi-size export is on the M3.4
+                roadmap (prompt-set rework).
+              </p>
+            ) : (
+              <p className="text-xs text-muted-foreground">
+                <code className="font-mono">{kind}</code> takes no detector
+                input size — engine defaults apply.
+              </p>
+            )}
           </div>
 
           <div className="space-y-2">
