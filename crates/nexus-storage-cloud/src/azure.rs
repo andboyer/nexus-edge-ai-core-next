@@ -40,9 +40,12 @@
 //!
 //! ## sha256 verification
 //!
-//! Stamped into the blob's `x-ms-meta-nexus-sha256` user metadata
-//! at PUT time. [`Self::exists`] re-reads it with a HEAD and
-//! returns `true` only if the metadata round-trips. In addition,
+//! Stamped into the blob's `x-ms-meta-nexus_sha256` user metadata
+//! at PUT time (underscore-only — Azure rejects hyphens in
+//! metadata *names* per the C#-identifier rule). [`Self::exists`]
+//! re-reads it with a HEAD and returns `true` only if the metadata
+//! round-trips; the reader also accepts the legacy hyphen spelling
+//! for blobs written by pre-fix engines. In addition,
 //! Phase 2 \u00b7 Step 2.8 pins the body's true MD5 into
 //! `x-ms-blob-content-md5` on PUT so Azure records it on the
 //! blob's properties \u2014 the Phase 6.17 cloud-side integrity sweep
@@ -82,12 +85,17 @@ use tracing::{debug, warn};
 const AZURE_API_VERSION: &str = "2023-11-03";
 
 /// User-metadata key we stamp the cleartext sha256 into at PUT time.
-/// Azure normalises metadata keys to lowercase + replaces dashes
-/// with underscores on echo; we use a hyphen here because Azure
-/// accepts both forms on input but returns underscores in the
-/// `x-ms-meta-*` response header. [`Self::exists`] reads both
-/// spellings for safety.
-const AZURE_SHA256_META: &str = "nexus-sha256";
+///
+/// Azure requires metadata names to follow C# identifier rules —
+/// letters / digits / underscore only, starting with a letter or
+/// underscore. Hyphens in the *name* (not the value) cause Azure to
+/// reject the PUT with HTTP 400 `InvalidMetadata` ("The metadata
+/// specified is invalid. It has characters that are not
+/// permitted."). We therefore stamp the underscore form on PUT.
+/// [`Self::exists`] still reads both `nexus_sha256` and the legacy
+/// `nexus-sha256` spelling so a blob written by an older engine
+/// (before this fix) still round-trips cleanly.
+const AZURE_SHA256_META: &str = "nexus_sha256";
 
 // ---------------------------------------------------------------------------
 // SasIssuer trait + concrete impls
@@ -508,16 +516,19 @@ impl ColdBackend for AzureBlobBackend {
             )));
         }
 
-        // Azure normalises metadata keys to lowercase + replaces
-        // dashes with underscores on echo. Try both spellings so a
-        // future SDK shift doesn't silently fail every existence
-        // check.
-        let hdr_dash = format!("x-ms-meta-{}", AZURE_SHA256_META);
-        let hdr_underscore = format!("x-ms-meta-{}", AZURE_SHA256_META.replace('-', "_"));
+        // Try the underscore form first (what current PUTs stamp,
+        // and the only spelling Azure actually accepts for the
+        // *name* — see `AZURE_SHA256_META`), then fall back to the
+        // hyphen form so a blob written by an older engine
+        // (pre-fix) still round-trips. Azure also lowercases
+        // metadata keys on echo, but `reqwest::HeaderMap` lookups
+        // are already case-insensitive.
+        let hdr_current = format!("x-ms-meta-{}", AZURE_SHA256_META);
+        let hdr_legacy = format!("x-ms-meta-{}", AZURE_SHA256_META.replace('_', "-"));
         let stored = resp
             .headers()
-            .get(&hdr_dash)
-            .or_else(|| resp.headers().get(&hdr_underscore))
+            .get(&hdr_current)
+            .or_else(|| resp.headers().get(&hdr_legacy))
             .and_then(|v| v.to_str().ok())
             .map(str::to_lowercase);
 
@@ -536,7 +547,7 @@ impl ColdBackend for AzureBlobBackend {
             None => {
                 debug!(
                     blob = %sas.blob_url_unsigned,
-                    "AzureBlobBackend.exists: blob present but no nexus-sha256 metadata; \
+                    "AzureBlobBackend.exists: blob present but no nexus_sha256 metadata; \
                      treating as 'does not exist' so replicator re-uploads with metadata",
                 );
                 Ok(false)
@@ -586,7 +597,7 @@ impl ColdBackend for AzureBlobBackend {
 /// Azure Blob storage header. Azure records this on the blob and returns it on
 /// GetProperties / HEAD, so the Phase 6.17 cloud-side integrity sweep can
 /// cross-check it against a fresh re-hash of the body without trusting our
-/// custom `x-ms-meta-nexus-sha256` metadata alone (defence-in-depth — an
+/// custom `x-ms-meta-nexus_sha256` metadata alone (defence-in-depth — an
 /// attacker who replays a SAS PUT must forge both an MD5 *and* a SHA-256 for
 /// the same body, which is computationally a no-op only if MD5 collision
 /// generation maps onto the SHA-256 preimage problem).
@@ -893,7 +904,7 @@ mod tests {
             Mock::given(method("HEAD"))
                 .and(path("/blob/clip-42.mp4"))
                 .respond_with(ResponseTemplate::new(200).insert_header(
-                    format!("x-ms-meta-{}", AZURE_SHA256_META.replace('-', "_")).as_str(),
+                    format!("x-ms-meta-{AZURE_SHA256_META}").as_str(),
                     sha_for_header.as_str(),
                 ))
                 .mount(&mock)
