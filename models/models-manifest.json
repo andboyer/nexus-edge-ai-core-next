@@ -66,8 +66,8 @@
     },
     {
       "id": "yolo_world_v2_s",
-      "task": "detect_open_vocab",
-      "_comment": "YOLO-World v2 (small) export. Prompts are baked into the graph at export time; per-camera config picks a subset at runtime. Regenerate via tools/models/gen_yolo_world.py whenever the prompt vocabulary changes \u2014 the manifest sha256 below will refresh and the engine's loader will catch the diff. NOTE on task strings: as of M3.1 the manifest recognises three open-vocab task tags: 'detect_open_vocab_text' (yolo_world + yoloe text mode), 'detect_open_vocab_visual' (yoloe visual mode), and 'detect_open_vocab' kept as a backward-compat alias for 'detect_open_vocab_text' so existing pack manifests continue to load. The Rust loader keys off the engine's `inference.model.kind` config, not this task field, so changing the alias has no runtime effect today; the field is informational and forward-compatible for the future ModelRegistry port.",
+      "task": "detect_open_vocab_text",
+      "_comment": "YOLO-World v2 (small) export. As of v0.1.22 the engine ships per-tier STATIC-shape ONNXs \u2014 yolo_world_v2_s_640.onnx (T10/T24 default) and yolo_world_v2_s_960.onnx (T36/T36-S default). Static shapes are mandatory for the Intel NPU plugin (silent CPU fallback on dynamic shapes, observed on Lunar Lake k13 under v0.1.18\u20130.1.20) and let the OpenVINO blob cache hit on subsequent boots. Prompts are baked into the graph at export time; per-camera config picks a subset at runtime. Regenerate via `python tools/models/gen_yolo_world.py --all-static` whenever the prompt vocabulary changes \u2014 the manifest sha256 values below will refresh and the engine's loader will catch the diff. 1280 is intentionally NOT shipped (overkill for the coarse semantic queries open-vocab is used for); the YOLOE multi-size export is deferred to M3.4 (prompt-set rework). NOTE on task strings: as of M3.1 the manifest recognises three open-vocab task tags: 'detect_open_vocab_text' (yolo_world + yoloe text mode), 'detect_open_vocab_visual' (yoloe visual mode), and 'detect_open_vocab' kept as a backward-compat alias for 'detect_open_vocab_text'. The Rust loader keys off the engine's `inference.model.kind` config, not this task field.",
       "input": {
         "width": 640,
         "height": 640,
@@ -81,15 +81,29 @@
       "artifacts": [
         {
           "backend": "onnx",
-          "path": "yolo_world_v2_s.onnx",
-          "sha256": "6f49290710a2f285171d2ced90d7fe3b105191d17c26a82113b09071796d3101"
+          "path": "yolo_world_v2_s_640.onnx",
+          "preset": "640",
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+        },
+        {
+          "backend": "onnx",
+          "path": "yolo_world_v2_s_960.onnx",
+          "preset": "960",
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
         }
       ],
       "presets": [
         {
           "name": "640",
           "inputWidth": 640,
-          "inputHeight": 640
+          "inputHeight": 640,
+          "artifact": "yolo_world_v2_s_640.onnx"
+        },
+        {
+          "name": "960",
+          "inputWidth": 960,
+          "inputHeight": 960,
+          "artifact": "yolo_world_v2_s_960.onnx"
         }
       ],
       "default_preset": "640",

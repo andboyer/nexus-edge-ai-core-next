@@ -83,7 +83,8 @@ jobs:
   #   * yolo26n_640.onnx                 (also embedded in tarball; T10/T24 default)
   #   * yolo26n_960.onnx                 (also embedded in tarball; T36/T36-S default)
   #   * yolo26n_1280.onnx                (also embedded in tarball; per-camera UI opt-in)
-  #   * yolo_world_v2_s.onnx
+  #   * yolo_world_v2_s_640.onnx        (also embedded in tarball; T10/T24 open-vocab default)
+  #   * yolo_world_v2_s_960.onnx        (also embedded in tarball; T36/T36-S open-vocab default)
   #   * yoloe26_s.onnx
   #   * models-manifest.json
   # -------------------------------------------------------------------------
@@ -129,7 +130,8 @@ jobs:
             --pattern 'yolo26n_640.onnx' \
             --pattern 'yolo26n_960.onnx' \
             --pattern 'yolo26n_1280.onnx' \
-            --pattern 'yolo_world_v2_s.onnx' \
+            --pattern 'yolo_world_v2_s_640.onnx' \
+            --pattern 'yolo_world_v2_s_960.onnx' \
             --pattern 'yoloe26_s.onnx' \
             --pattern 'models-manifest.json' \
             --dir models/ \
@@ -147,7 +149,7 @@ jobs:
           # models/yolo26n_960.onnx models/yolo26n_1280.onnx` before this workflow
           # can run — GH-hosted runners cannot generate these themselves because
           # yolo26n.pt is not a public ultralytics checkpoint.
-          for f in yolo26n_640.onnx yolo26n_960.onnx yolo26n_1280.onnx yolo_world_v2_s.onnx yoloe26_s.onnx models-manifest.json; do
+          for f in yolo26n_640.onnx yolo26n_960.onnx yolo26n_1280.onnx yolo_world_v2_s_640.onnx yolo_world_v2_s_960.onnx yoloe26_s.onnx models-manifest.json; do
             if [ ! -s "models/$f" ]; then
               echo "::error::Required model asset 'models/$f' missing from release $TAG. Upload via 'gh release upload $TAG models/$f' then re-run this workflow."
               exit 1
@@ -243,7 +245,8 @@ jobs:
           cp -a models/yolo26n_640.onnx \
                 models/yolo26n_960.onnx \
                 models/yolo26n_1280.onnx \
-                models/yolo_world_v2_s.onnx \
+                models/yolo_world_v2_s_640.onnx \
+                models/yolo_world_v2_s_960.onnx \
                 models/yoloe26_s.onnx \
                 models/models-manifest.json "$R/share/models/"
 
@@ -405,6 +408,7 @@ jobs:
             models/yolo26n_640.onnx \
             models/yolo26n_960.onnx \
             models/yolo26n_1280.onnx \
-            models/yolo_world_v2_s.onnx \
+            models/yolo_world_v2_s_640.onnx \
+            models/yolo_world_v2_s_960.onnx \
             models/yoloe26_s.onnx \
             models/models-manifest.json

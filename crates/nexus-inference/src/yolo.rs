@@ -141,18 +141,33 @@ impl YoloOrtDetector {
 }
 
 /// Pick the right `yolo26n_*.onnx` inside `pack` for the requested input
-/// size. Strategy:
-///   1. Try the exact-size file (`yolo26n_<w>.onnx`) — matches what the
-///      release ships for 640 / 960 / 1280.
-///   2. Try every other ship-size file in order — useful when an operator
-///      configures a non-standard size like 416 on a dev box that only
-///      has the 640 file staged.
-///   3. Fall back to the legacy `yolo26n_dynamic.onnx` — preserved for
-///      niche dev workflows but NOT shipped from v0.1.19 onward.
+/// size. **Strict by default**: only the exact-size file matches.
 ///
-/// Returns `ModelLoad` if no candidate exists. The selected path is
-/// logged at INFO so operators can see whether the engine actually
-/// honored their per-camera size override.
+/// Strategy:
+///   1. Try the exact-size file (`yolo26n_<w>.onnx`). This is the only
+///      path that hits in production — the release tarball stages
+///      `yolo26n_640.onnx`, `yolo26n_960.onnx`, and `yolo26n_1280.onnx`
+///      from `models/`, so every per-tier default and every
+///      per-camera UI override is satisfiable.
+///   2. **Dev escape hatch only.** Cross-size fallback (use 640 when
+///      960 was asked for, etc.) and the legacy
+///      `yolo26n_dynamic.onnx` file are gated behind
+///      `NEXUS_ALLOW_MODEL_SIZE_FALLBACK=1`. The reason: when an
+///      operator configures a camera at 960 on T36-S Lunar Lake but
+///      only the 640 file is staged, silently degrading to 640
+///      either (a) ships a lower-accuracy model the operator did NOT
+///      pick, or (b) routes the model through the dynamic-shape
+///      pathway which the Intel NPU plugin silently shunts to CPU
+///      (observed on Lunar Lake k13 under v0.1.18–v0.1.20). Both are
+///      worse failure modes than refusing to start with a clear
+///      error pointing at the missing file.
+///   3. With the escape hatch on, try every ship-size in 640/960/1280
+///      order, then `yolo26n_dynamic.onnx`.
+///
+/// Returns `ModelLoad` if no candidate matches (or only an out-of-size
+/// candidate exists with the escape hatch off). The selected path is
+/// logged at INFO so operators can see exactly which ONNX served any
+/// given camera identity.
 fn resolve_yolo26n_path(
     pack: &Path,
     input_w: u32,
@@ -172,9 +187,26 @@ fn resolve_yolo26n_path(
         return Ok(primary);
     }
 
-    // Try every ship-size file. Useful when the operator picked a
-    // non-standard size (e.g. 416 for a memory-tight test) but only the
-    // standard set is on disk.
+    // From here down: only reachable when the operator's pack is
+    // missing the size they asked for. That is a misconfiguration. Hard
+    // fail unless the dev escape hatch is set.
+    if !size_fallback_allowed() {
+        let listing = list_pack_yolo26n_files(pack);
+        return Err(InferenceError::ModelLoad(format!(
+            "yolo: pack {pack} is missing the size-matched ONNX \
+             `yolo26n_{input_w}.onnx`. Available in pack: [{listing}]. \
+             Fix: regenerate the missing file with \
+             `python tools/models/gen_yolo26n.py --all-static` and \
+             re-stage the model pack. For a dev escape hatch (NOT for \
+             production — Intel NPU plugin silently CPU-falls-back on \
+             dynamic shapes), set `NEXUS_ALLOW_MODEL_SIZE_FALLBACK=1`.",
+            pack = pack.display(),
+            input_w = input_w,
+            listing = listing,
+        )));
+    }
+
+    // Dev mode only. Try every ship-size file.
     for sz in [640u32, 960, 1280] {
         let candidate = pack.join(format!("yolo26n_{sz}.onnx"));
         if candidate.exists() {
@@ -182,9 +214,10 @@ fn resolve_yolo26n_path(
                 requested_w = input_w,
                 requested_h = input_h,
                 fallback = %candidate.display(),
-                "yolo: requested size has no matching ONNX in pack; \
-                 falling back to nearest available — preprocessor will \
-                 resize to requested input dims"
+                "yolo: NEXUS_ALLOW_MODEL_SIZE_FALLBACK=1 — requested \
+                 size has no matching ONNX in pack; falling back to \
+                 nearest available. This silently CPU-falls-back on \
+                 Intel NPU — do not use in production."
             );
             return Ok(candidate);
         }
@@ -197,18 +230,55 @@ fn resolve_yolo26n_path(
             requested_w = input_w,
             requested_h = input_h,
             legacy = %legacy.display(),
-            "yolo: no static-shape ONNX in pack, using deprecated \
-             yolo26n_dynamic.onnx — DO NOT ship this in prod; the Intel \
-             NPU plugin silently falls back to CPU on dynamic shapes"
+            "yolo: NEXUS_ALLOW_MODEL_SIZE_FALLBACK=1 — using \
+             deprecated yolo26n_dynamic.onnx. DO NOT ship this in \
+             prod; the Intel NPU plugin silently falls back to CPU on \
+             dynamic shapes (observed on Lunar Lake k13 under v0.1.18)."
         );
         return Ok(legacy);
     }
 
+    let listing = list_pack_yolo26n_files(pack);
     Err(InferenceError::ModelLoad(format!(
         "no yolo26n_*.onnx in pack {}; expected yolo26n_{input_w}.onnx \
-         (or one of yolo26n_{{640,960,1280}}.onnx)",
-        pack.display()
+         (or one of yolo26n_{{640,960,1280}}.onnx). Available: [{}]",
+        pack.display(),
+        listing
     )))
+}
+
+/// `true` iff the operator has explicitly enabled cross-size /
+/// dynamic-shape fallback for development. Production must leave this
+/// unset so a misconfigured pack fails the engine at boot rather than
+/// silently degrading to CPU.
+fn size_fallback_allowed() -> bool {
+    matches!(
+        std::env::var("NEXUS_ALLOW_MODEL_SIZE_FALLBACK").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes")
+    )
+}
+
+/// Enumerate the yolo26n_*.onnx files actually present in a pack.
+/// Used to make resolver error messages diagnose themselves —
+/// operators can see at a glance what they DID stage when the engine
+/// refuses to boot for a missing size.
+fn list_pack_yolo26n_files(pack: &Path) -> String {
+    let mut found: Vec<String> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(pack) {
+        for ent in entries.flatten() {
+            if let Some(name) = ent.file_name().to_str() {
+                if name.starts_with("yolo26n") && name.ends_with(".onnx") {
+                    found.push(name.to_string());
+                }
+            }
+        }
+    }
+    found.sort();
+    if found.is_empty() {
+        "<none>".to_string()
+    } else {
+        found.join(", ")
+    }
 }
 
 #[async_trait]
@@ -517,6 +587,8 @@ pub fn build_detector_for_yolo(cfg: &InferenceConfig) -> Result<Arc<dyn Detector
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use tempfile::TempDir;
 
     #[test]
     fn preprocess_basic_shape() {
@@ -539,5 +611,144 @@ mod tests {
         assert_eq!(map_coco_to_domain_label(0), Some("person"));
         assert_eq!(map_coco_to_domain_label(2), Some("vehicle.car"));
         assert_eq!(map_coco_to_domain_label(99), None);
+    }
+
+    /// Guard the env var so tests don't leak `NEXUS_ALLOW_MODEL_SIZE_FALLBACK`
+    /// into each other when run by `cargo test` (which interleaves tests
+    /// on the same process). Stores the prior value and restores it on
+    /// Drop. Tests using the guard MUST acquire `ENV_LOCK` first.
+    struct EnvVarGuard {
+        key: &'static str,
+        prior: Option<String>,
+    }
+    impl EnvVarGuard {
+        fn set(key: &'static str, val: &str) -> Self {
+            let prior = std::env::var(key).ok();
+            // SAFETY: Single-threaded under ENV_LOCK; env mutation is
+            // benign at process scope.
+            unsafe {
+                std::env::set_var(key, val);
+            }
+            Self { key, prior }
+        }
+        fn unset(key: &'static str) -> Self {
+            let prior = std::env::var(key).ok();
+            unsafe {
+                std::env::remove_var(key);
+            }
+            Self { key, prior }
+        }
+    }
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.prior {
+                    Some(v) => std::env::set_var(self.key, v),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
+    // Single global lock around tests that touch the
+    // NEXUS_ALLOW_MODEL_SIZE_FALLBACK env var. Avoids cross-test
+    // pollution since cargo test runs in one process by default.
+    static ENV_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+    fn touch(dir: &Path, name: &str) {
+        fs::write(dir.join(name), b"fake-onnx").unwrap();
+    }
+
+    #[test]
+    fn resolver_picks_exact_size_match() {
+        let _g = ENV_LOCK.lock();
+        let _strict = EnvVarGuard::unset("NEXUS_ALLOW_MODEL_SIZE_FALLBACK");
+        let tmp = TempDir::new().unwrap();
+        let pack = tmp.path();
+        touch(pack, "yolo26n_640.onnx");
+        touch(pack, "yolo26n_960.onnx");
+        touch(pack, "yolo26n_1280.onnx");
+
+        let p = resolve_yolo26n_path(pack, 960, 960).unwrap();
+        assert_eq!(p, pack.join("yolo26n_960.onnx"));
+    }
+
+    #[test]
+    fn resolver_strict_refuses_cross_size_fallback() {
+        let _g = ENV_LOCK.lock();
+        let _strict = EnvVarGuard::unset("NEXUS_ALLOW_MODEL_SIZE_FALLBACK");
+        let tmp = TempDir::new().unwrap();
+        let pack = tmp.path();
+        // Pack only has 640 but operator asks for 960.
+        touch(pack, "yolo26n_640.onnx");
+
+        let err = resolve_yolo26n_path(pack, 960, 960).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("yolo26n_960.onnx"),
+            "error should name the missing file: {msg}"
+        );
+        assert!(
+            msg.contains("yolo26n_640.onnx"),
+            "error should list what IS staged so operators can self-diagnose: {msg}"
+        );
+        assert!(
+            msg.contains("NEXUS_ALLOW_MODEL_SIZE_FALLBACK"),
+            "error should mention the dev escape hatch: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolver_strict_refuses_dynamic_fallback() {
+        let _g = ENV_LOCK.lock();
+        let _strict = EnvVarGuard::unset("NEXUS_ALLOW_MODEL_SIZE_FALLBACK");
+        let tmp = TempDir::new().unwrap();
+        let pack = tmp.path();
+        // Pack only has the deprecated dynamic file.
+        touch(pack, "yolo26n_dynamic.onnx");
+
+        let err = resolve_yolo26n_path(pack, 960, 960).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("yolo26n_960.onnx"),
+            "error should name the requested file: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolver_dev_escape_hatch_allows_cross_size_fallback() {
+        let _g = ENV_LOCK.lock();
+        let _on = EnvVarGuard::set("NEXUS_ALLOW_MODEL_SIZE_FALLBACK", "1");
+        let tmp = TempDir::new().unwrap();
+        let pack = tmp.path();
+        touch(pack, "yolo26n_640.onnx");
+
+        // With escape hatch on, asking for 960 falls back to 640.
+        let p = resolve_yolo26n_path(pack, 960, 960).unwrap();
+        assert_eq!(p, pack.join("yolo26n_640.onnx"));
+    }
+
+    #[test]
+    fn resolver_dev_escape_hatch_allows_dynamic_fallback() {
+        let _g = ENV_LOCK.lock();
+        let _on = EnvVarGuard::set("NEXUS_ALLOW_MODEL_SIZE_FALLBACK", "1");
+        let tmp = TempDir::new().unwrap();
+        let pack = tmp.path();
+        touch(pack, "yolo26n_dynamic.onnx");
+
+        let p = resolve_yolo26n_path(pack, 960, 960).unwrap();
+        assert_eq!(p, pack.join("yolo26n_dynamic.onnx"));
+    }
+
+    #[test]
+    fn resolver_hard_fails_on_empty_pack_even_with_escape_hatch() {
+        let _g = ENV_LOCK.lock();
+        let _on = EnvVarGuard::set("NEXUS_ALLOW_MODEL_SIZE_FALLBACK", "1");
+        let tmp = TempDir::new().unwrap();
+        let pack = tmp.path();
+        // No files staged at all.
+        let err = resolve_yolo26n_path(pack, 640, 640).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("no yolo26n_*.onnx in pack"), "{msg}");
     }
 }

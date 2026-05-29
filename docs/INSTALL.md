@@ -1472,9 +1472,14 @@ mkdir -p models/.cache
 curl -sL --fail \
     -o models/.cache/yolov8s-worldv2.pt \
     https://github.com/ultralytics/assets/releases/download/v8.4.0/yolov8s-worldv2.pt
+# Generate ALL static-size variants in one ultralytics session
+# (matches what release.yml ships). Writes:
+#   models/yolo_world_v2_s_640.onnx   (T10/T24 default)
+#   models/yolo_world_v2_s_960.onnx   (T36/T36-S default)
 python tools/models/gen_yolo_world.py \
     --base-model models/.cache/yolov8s-worldv2.pt \
-    --output /var/lib/nexus/models/yolo_world_v2_s.onnx
+    --all-static
+sudo install -m 0644 models/yolo_world_v2_s_*.onnx /var/lib/nexus/models/
 
 # Open-vocab YOLOE (M3.1 successor).
 # If the ultralytics PyPI release lacks the `YOLOE` symbol, upgrade:

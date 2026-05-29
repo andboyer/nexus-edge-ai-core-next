@@ -137,18 +137,26 @@ curl -sL --fail \
   -o models/.cache/yolov8s-worldv2.pt \
   https://github.com/ultralytics/assets/releases/download/v8.4.0/yolov8s-worldv2.pt
 
-# Generate models/yolo_world_v2_s.onnx (~48 MB) with the default
-# vocabulary baked in. The script also upserts the entry into
-# models/models-manifest.json with sha256 + prompts[]:
+# Generate per-tier static-size variants
+# (`models/yolo_world_v2_s_640.onnx` ~50 MB for T10/T24,
+#  `models/yolo_world_v2_s_960.onnx` ~50 MB for T36/T36-S) with the
+# default vocabulary baked in. `--all-static` is the release path; it
+# runs both sizes in one ultralytics session to avoid the import +
+# checkpoint-load overhead twice. The script also upserts the entry
+# into models/models-manifest.json with sha256 + prompts[] for each
+# size:
 python tools/models/gen_yolo_world.py \
-  --base-model models/.cache/yolov8s-worldv2.pt
+  --base-model models/.cache/yolov8s-worldv2.pt \
+  --all-static
 ```
 
-Then the smoke test:
+Then the smoke test (point the env-var at whichever size you want to
+exercise — the smoke test boots one ORT session per file, so 640 is
+faster):
 
 ```bash
 ORT_DYLIB_PATH=/opt/homebrew/lib/libonnxruntime.dylib \
-NEXUS_TEST_YOLO_WORLD_MODEL=$PWD/models/yolo_world_v2_s.onnx \
+NEXUS_TEST_YOLO_WORLD_MODEL=$PWD/models/yolo_world_v2_s_640.onnx \
 NEXUS_TEST_YOLO_WORLD_MANIFEST=$PWD/models/models-manifest.json \
   cargo test --locked -p nexus-inference --features ort,ep-cpu \
   yolo_world_smoke -- --nocapture
@@ -156,14 +164,16 @@ NEXUS_TEST_YOLO_WORLD_MANIFEST=$PWD/models/models-manifest.json \
 
 To change the prompt vocabulary, edit
 [`tools/models/yolo_world_default_prompts.txt`](../tools/models/yolo_world_default_prompts.txt)
-and re-run `gen_yolo_world.py`. The manifest sha256 will refresh and the
-engine's loader will catch the diff.
+and re-run `gen_yolo_world.py --all-static`. The manifest sha256 will
+refresh for every per-size artifact and the engine's loader will catch
+the diff.
 
 The worker binary picks up the open-vocab model with
 `NEXUS_WORKER_MODEL_KIND=yolo_world` +
-`NEXUS_WORKER_MODEL_PATH=$PWD/models/yolo_world_v2_s.onnx` +
+`NEXUS_WORKER_MODEL_PATH=$PWD/models/yolo_world_v2_s_640.onnx` +
 `NEXUS_WORKER_MODEL_PACK=$PWD/models` (so it can find the manifest +
-load the baked vocab).
+load the baked vocab). Substitute `_960` for the 960-input variant if
+running on a tier whose default is 960.
 
 ## Per-camera model selection (`InferenceRouter`)
 
