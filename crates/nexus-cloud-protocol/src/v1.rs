@@ -2,7 +2,7 @@
 // Regenerate with `cargo xtask gen-proto` from proto/v1.json.
 //
 // Source schema: Nexus edge↔cloud wire protocol
-// Canonical schema for v1 of the wire envelope and the eight message kinds Phase 1 needs (heartbeat, heartbeat_ack, alert, alert_ack, entitlement_update, rpc_call, rpc_response, close_session). HUMAN-EDITED source of truth. Rust types live in proto/generated/rust/v1.rs; TypeScript zod schemas in proto/generated/ts/v1.ts. `cargo xtask gen-proto` regenerates both; CI fails if they're stale.
+// Canonical schema for v1 of the wire envelope. Message kinds: heartbeat, heartbeat_ack, alert, alert_ack, clip_replicated, clip_replicated_ack, entitlement_update, rpc_call, rpc_response, close_session, camera_roster, camera_roster_ack. HUMAN-EDITED source of truth. Rust types live in proto/generated/rust/v1.rs; TypeScript zod schemas in proto/generated/ts/v1.ts. `cargo xtask gen-proto` regenerates both; CI fails if they're stale.
 
 use serde::{Deserialize, Serialize};
 
@@ -65,6 +65,67 @@ pub struct AlertPayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot_blob_url: Option<String>,
     pub ts: Timestamp,
+}
+
+/// Cloud → Edge. Reply to a camera_roster. `permanent_failure` tells the edge to stop retrying this revision (e.g. malformed metadata). `accepted_revision` is echoed back so the edge can drop the outbox entry and advance its high-water-mark.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CameraRosterAckPayload {
+    pub accepted_revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub status: String,
+}
+
+/// One camera in a CameraRosterPayload. Per AGENTS.md Rule 6 this struct MUST NOT carry any per-camera credential (RTSP URL with embedded creds, ONVIF password, etc.) — those stay edge-resident. Metadata only.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CameraRosterEntry {
+    /// Source video codec. Optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codec: Option<String>,
+    /// Per-core integer id. Cloud uses this as the dedup key together with (core_id).
+    pub edge_camera_id: u64,
+    /// Operator-controlled on the edge.
+    pub enabled: bool,
+    /// Source backend on the edge. Identifies how the edge ingests this camera but reveals no credential material.
+    pub kind: String,
+    /// Active detector kind on this camera (e.g. "yolo", "yolo_world", "yoloe", "mock"). Optional metadata; the wire shape doesn't constrain the value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_kind: Option<String>,
+    pub name: String,
+    /// Edge-observed liveness in the last frame-source pass. Optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub online: Option<bool>,
+    /// Source resolution as negotiated. Optional — unknown for virtual/file kinds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution: Option<CameraRosterEntryResolution>,
+    /// Monotonic counter incremented on every local mutation. Used by the cloud to ignore out-of-order rosters and (Phase D) for optimistic-concurrency on cloud-pushed config changes.
+    pub revision: u64,
+    /// Opaque key/value labels. Free-form; the cloud doesn't interpret them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tags: Option<std::collections::BTreeMap<String, String>>,
+    /// Edge wall-clock at the latest mutation that produced this revision.
+    pub updated_at: Timestamp,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CameraRosterEntryResolution {
+    pub height: u64,
+    pub width: u64,
+}
+
+/// Edge → Cloud. Full snapshot of the camera roster on this core. Sent (a) on tunnel-up after enrollment, (b) immediately after any local camera CRUD (POST/PATCH/DELETE on /api/v1/cameras), and (c) opportunistically on the heartbeat cadence if the roster has changed since the last ack. The cloud treats this as authoritative — cameras present here are upserted into `cameras`; cameras previously known for this core but absent here are soft-deleted (`cameras.deleted_at = now()`). No credential material crosses the tunnel (AGENTS.md Rule 6). Phase A of the cloud-managed CRUD wedge.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CameraRosterPayload {
+    /// Full list. Empty array is meaningful (= all cameras removed).
+    pub cameras: Vec<CameraRosterEntry>,
+    /// Monotonic per-core counter. Bumped on every local CRUD. Cloud drops envelopes whose revision is <= the last successfully-ingested one (out-of-order delivery defense).
+    pub roster_revision: u64,
+    /// Edge wall-clock at snapshot. Diagnostics only.
+    pub snapshot_at: Timestamp,
 }
 
 /// Cloud → Edge. Reply to clip_replicated. Mirrors AlertAckPayload semantics — permanent_failure tells the edge outbox to mark the row suppressed (e.g. unknown camera_id, signature_invalid).
@@ -247,6 +308,8 @@ pub enum EnvelopeBody {
     RpcCall(RpcCallPayload),
     RpcResponse(RpcResponsePayload),
     CloseSession(CloseSessionPayload),
+    CameraRoster(CameraRosterPayload),
+    CameraRosterAck(CameraRosterAckPayload),
 }
 
 /// One WebSocket text frame on the wire. See the schema header for invariants.

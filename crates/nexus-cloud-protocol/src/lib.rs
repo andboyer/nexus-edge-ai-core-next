@@ -15,7 +15,10 @@
 
 #![forbid(unsafe_code)]
 
-/// Wire-protocol version 1. Generated from `proto/v1.json`.
+/// Wire-protocol version 1. Generated from `proto/v1.json` in the
+/// cloud-console repo, copied here by `cargo xtask sync-cloud-protocol`.
+/// The companion `v1.CHECKSUM` (also written by the sync command) is
+/// the SHA-256 of the cloud's `proto/v1.json` at the time of last sync.
 pub mod v1 {
     #![allow(clippy::pub_underscore_fields)]
     #![allow(clippy::struct_excessive_bools)]
@@ -24,5 +27,5 @@ pub mod v1 {
     #![allow(clippy::derive_partial_eq_without_eq)]
     #![allow(missing_docs)]
 
-    include!("../../../proto/generated/rust/v1.rs");
+    include!("v1.rs");
 }

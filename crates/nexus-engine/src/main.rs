@@ -40,6 +40,7 @@ mod npu;
 mod oauth_sessions;
 mod reconciler;
 mod retention;
+mod roster;
 mod setup;
 mod storage_safety;
 mod system_metrics;
@@ -859,6 +860,15 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
         handles: running.clone(),
     });
 
+    // Phase A — camera-roster publisher. Subscribes to
+    // `topic::CONFIG_CHANGED` and pushes a `camera_roster` envelope
+    // to the cloud edge-gateway whenever cameras change (plus an
+    // initial push on boot, plus a 10s retry tick while the tunnel
+    // is down). The cloud upserts the per-core camera list so the
+    // site dashboard can show cameras the operator configured
+    // locally — even ones that have never produced an alert.
+    let roster_handle = roster::spawn(store.clone(), bus.clone(), cloud_outbox.clone());
+
     // Phase 1.8 — cloud tunnel supervisor. If the local store has a
     // `cloud_enrollment` row (populated by `nexus-engine enroll`),
     // this spawns a long-running task that maintains the WSS+mTLS
@@ -1174,6 +1184,7 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
     let _ = cloud_tunnel_shutdown_tx.send(());
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), cloud_tunnel_handle).await;
     reconciler_handle.abort();
+    roster_handle.abort();
     // Abort every per-camera supervisor. `drain()` empties the map
     // under one lock acquisition; the reconciler is already aborted
     // above so nothing will re-populate it.
