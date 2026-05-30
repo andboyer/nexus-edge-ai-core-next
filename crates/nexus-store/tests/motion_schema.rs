@@ -646,6 +646,7 @@ async fn schema_migrations_table_records_apply_order() {
             "0015_motion_clips_priority".to_string(),
             "0016_cloud_enrollment_attach_replay".to_string(),
             "0017_motion_clips_frame_size".to_string(),
+            "0018_entity_local_state".to_string(),
         ]
     );
 }

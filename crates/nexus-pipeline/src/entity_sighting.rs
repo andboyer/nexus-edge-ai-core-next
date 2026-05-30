@@ -41,6 +41,51 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use nexus_types::{BBox, CameraId, Frame, TrackId, TrackedObject};
 
+/// One persisted `(camera_id, track_id) -> entity_local_id` record
+/// loaded from `nexus-store` at supervisor boot. Passed to
+/// [`SightingScheduler::new_with_persistence`] so the scheduler can
+/// re-use the prior `entity_local_id` when the tracker re-issues the
+/// same `(camera_id, track_id)` within the GC window after a crash +
+/// systemd restart. Phase 5.6 · R4.
+#[derive(Debug, Clone)]
+pub struct EntityLocalSeed {
+    pub camera_id: CameraId,
+    pub track_id: TrackId,
+    pub entity_local_id: String,
+    pub started_ts: DateTime<Utc>,
+    pub last_seen_at: DateTime<Utc>,
+}
+
+/// Update payload pushed to the persistence sink on every emit.
+#[derive(Debug, Clone)]
+pub struct EntityLocalUpdate {
+    pub camera_id: CameraId,
+    pub track_id: TrackId,
+    pub entity_local_id: String,
+    pub started_ts: DateTime<Utc>,
+    pub last_seen_at: DateTime<Utc>,
+}
+
+/// Engine-side sink for [`EntityLocalUpdate`]s. Implementations MUST
+/// be non-blocking — the supervisor calls `upsert`/`delete`
+/// synchronously on the per-frame hot path. The engine's concrete
+/// impl buffers into a bounded mpsc whose worker batches writes
+/// against `nexus-store`.
+pub trait EntityLocalPersist: Send + Sync {
+    fn upsert(&self, update: EntityLocalUpdate);
+    fn delete(&self, camera_id: CameraId, track_id: TrackId);
+}
+
+/// Default no-op persistence sink. Wired when `[reid].enabled = false`
+/// in `nexus.toml`, when the engine boots without a usable store, or
+/// when callers explicitly opt out via [`SightingScheduler::new`].
+pub struct NoopEntityLocalPersist;
+
+impl EntityLocalPersist for NoopEntityLocalPersist {
+    fn upsert(&self, _update: EntityLocalUpdate) {}
+    fn delete(&self, _camera_id: CameraId, _track_id: TrackId) {}
+}
+
 /// What the engine hook receives per stable-track emit window. Holds
 /// an `Arc<Frame>` so the supervisor's per-frame cache clone (already
 /// `Arc<Frame>`) is shared cheaply; the engine's extractor reads the
@@ -95,6 +140,14 @@ pub struct SightingScheduler {
     emit_interval: Duration,
     track_gc_after: Duration,
     tracks: HashMap<TrackId, TrackState>,
+    /// Pre-loaded `(track_id -> seed)` records from `nexus-store`.
+    /// Consumed on first touch of a matching `(camera_id, track_id)`
+    /// so the scheduler reuses the prior `entity_local_id` instead
+    /// of minting a fresh one. Stale entries (not touched before the
+    /// next GC sweep) are dropped along with the in-memory tracks
+    /// they would have hydrated.
+    seed: HashMap<TrackId, EntityLocalSeed>,
+    persist: Arc<dyn EntityLocalPersist>,
 }
 
 #[derive(Debug, Clone)]
@@ -114,15 +167,51 @@ impl SightingScheduler {
     /// the WEDGE_PLAN's "stable track" definition — filters out
     /// 1-frame false positives). `emit_interval` is the cadence for
     /// periodic re-sends after the first sighting.
+    ///
+    /// This constructor opts out of persistence — every restart
+    /// mints fresh `entity_local_id`s. Use
+    /// [`Self::new_with_persistence`] to wire the
+    /// `nexus-store`-backed persistence + seed for crash-resilient
+    /// id reuse (Phase 5.6 · R4).
     #[must_use]
     pub fn new(camera_id: CameraId, min_track_age_frames: u32, emit_interval: Duration) -> Self {
+        Self::new_with_persistence(
+            camera_id,
+            min_track_age_frames,
+            emit_interval,
+            Vec::new(),
+            Arc::new(NoopEntityLocalPersist),
+        )
+    }
+
+    /// Construct a scheduler that hydrates from `seed` on first touch
+    /// of each `(camera_id, track_id)` and persists every emit + GC
+    /// via `persist`. `seed` is filtered to entries matching this
+    /// scheduler's `camera_id`; entries for other cameras are
+    /// silently discarded (the engine boot site is expected to
+    /// pre-filter, but defending against caller bugs is cheap).
+    #[must_use]
+    pub fn new_with_persistence(
+        camera_id: CameraId,
+        min_track_age_frames: u32,
+        emit_interval: Duration,
+        seed: Vec<EntityLocalSeed>,
+        persist: Arc<dyn EntityLocalPersist>,
+    ) -> Self {
         let track_gc_after = emit_interval.saturating_mul(2).max(Duration::from_secs(10));
+        let seed = seed
+            .into_iter()
+            .filter(|s| s.camera_id == camera_id)
+            .map(|s| (s.track_id, s))
+            .collect();
         Self {
             camera_id,
             min_track_age_frames,
             emit_interval,
             track_gc_after,
             tracks: HashMap::new(),
+            seed,
+            persist,
         }
     }
 
@@ -141,15 +230,24 @@ impl SightingScheduler {
         let mut emitted = 0usize;
         for obj in tracked {
             let due = {
-                let entry = self
-                    .tracks
-                    .entry(obj.track_id)
-                    .or_insert_with(|| TrackState {
-                        entity_local_id: new_local_id(),
-                        started_ts: now,
-                        last_emit_at: None,
-                        last_seen_at: now,
-                    });
+                let seed = self.seed.remove(&obj.track_id);
+                let entry = self.tracks.entry(obj.track_id).or_insert_with(|| {
+                    if let Some(s) = seed {
+                        TrackState {
+                            entity_local_id: s.entity_local_id,
+                            started_ts: s.started_ts,
+                            last_emit_at: None,
+                            last_seen_at: s.last_seen_at,
+                        }
+                    } else {
+                        TrackState {
+                            entity_local_id: new_local_id(),
+                            started_ts: now,
+                            last_emit_at: None,
+                            last_seen_at: now,
+                        }
+                    }
+                });
                 entry.last_seen_at = now;
                 let stable = obj.age_frames >= self.min_track_age_frames;
                 match entry.last_emit_at {
@@ -175,7 +273,7 @@ impl SightingScheduler {
                 hook.submit(SightingSnapshot {
                     camera_id: self.camera_id,
                     track_id: obj.track_id,
-                    entity_local_id: plan.entity_local_id,
+                    entity_local_id: plan.entity_local_id.clone(),
                     frame: Arc::clone(frame),
                     bbox: obj.bbox,
                     confidence: obj.confidence,
@@ -188,16 +286,41 @@ impl SightingScheduler {
                 if let Some(entry) = self.tracks.get_mut(&obj.track_id) {
                     entry.last_emit_at = Some(now);
                 }
+                self.persist.upsert(EntityLocalUpdate {
+                    camera_id: self.camera_id,
+                    track_id: obj.track_id,
+                    entity_local_id: plan.entity_local_id,
+                    started_ts: plan.started_ts,
+                    last_seen_at: now,
+                });
             }
         }
-        // GC absent tracks.
+        // GC absent tracks. Collect first so we can notify the
+        // persistence sink for every dropped track.
         let gc_horizon = self.track_gc_after;
-        self.tracks.retain(|_, state| {
-            now.signed_duration_since(state.last_seen_at)
+        let mut gc_drops: Vec<TrackId> = Vec::new();
+        self.tracks.retain(|track_id, state| {
+            let keep = now
+                .signed_duration_since(state.last_seen_at)
                 .to_std()
                 .map(|d| d < gc_horizon)
-                .unwrap_or(true)
+                .unwrap_or(true);
+            if !keep {
+                gc_drops.push(*track_id);
+            }
+            keep
         });
+        // Also drop any seed entries that were never touched and are
+        // now past the GC horizon — keeps the seed map from growing
+        // unbounded when the tracker never re-issues a stale id.
+        self.seed.retain(|_, s| {
+            now.signed_duration_since(s.last_seen_at)
+                < chrono::Duration::from_std(gc_horizon)
+                    .unwrap_or_else(|_| chrono::Duration::seconds(0))
+        });
+        for track_id in gc_drops {
+            self.persist.delete(self.camera_id, track_id);
+        }
         emitted
     }
 }
@@ -403,5 +526,112 @@ mod tests {
         // scheduler doesn't retain a copy).
         assert_eq!(Arc::strong_count(&frame), before_count + 1);
         assert_eq!(seen[0].frame.width, frame.width);
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 5.6 · R4 — seed + persistence sink coverage.
+    // ------------------------------------------------------------------
+
+    #[derive(Default, Debug)]
+    struct CapturePersist {
+        upserts: Mutex<Vec<EntityLocalUpdate>>,
+        deletes: Mutex<Vec<(CameraId, TrackId)>>,
+    }
+
+    impl EntityLocalPersist for CapturePersist {
+        fn upsert(&self, update: EntityLocalUpdate) {
+            self.upserts.lock().push(update);
+        }
+        fn delete(&self, camera_id: CameraId, track_id: TrackId) {
+            self.deletes.lock().push((camera_id, track_id));
+        }
+    }
+
+    #[test]
+    fn seeded_track_reuses_prior_entity_local_id() {
+        let hook = CaptureHook::default();
+        let persist = Arc::new(CapturePersist::default());
+        let t_pre = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let seed = vec![EntityLocalSeed {
+            camera_id: 7,
+            track_id: 42,
+            entity_local_id: "eid-from-disk".into(),
+            started_ts: t_pre,
+            last_seen_at: t_pre + chrono::Duration::seconds(2),
+        }];
+        let mut sched = SightingScheduler::new_with_persistence(
+            7,
+            1,
+            Duration::from_secs(5),
+            seed,
+            persist.clone(),
+        );
+        // Restart "now" is 8s after the seed's last_seen_at — still
+        // inside the GC window (2 * emit_interval = 10s).
+        let t_now = t_pre + chrono::Duration::seconds(10);
+        let frame = dummy_frame(7, t_now);
+        let n = sched.tick(&frame, &[tracked(42, 2)], t_now, &hook);
+        assert_eq!(n, 1);
+        let seen = hook.seen.lock();
+        assert_eq!(seen.len(), 1);
+        assert!(seen[0].is_first);
+        assert_eq!(
+            seen[0].entity_local_id, "eid-from-disk",
+            "seeded entity_local_id is reused after restart"
+        );
+        assert_eq!(seen[0].started_ts, t_pre, "seeded started_ts is preserved");
+        // Persistence sink saw the upsert with the reused id.
+        let upserts = persist.upserts.lock();
+        assert_eq!(upserts.len(), 1);
+        assert_eq!(upserts[0].entity_local_id, "eid-from-disk");
+        assert_eq!(upserts[0].started_ts, t_pre);
+        assert_eq!(upserts[0].last_seen_at, t_now);
+    }
+
+    #[test]
+    fn seed_for_other_camera_is_ignored() {
+        let hook = CaptureHook::default();
+        let persist = Arc::new(CapturePersist::default());
+        let t = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let seed = vec![EntityLocalSeed {
+            camera_id: 99, // not us
+            track_id: 42,
+            entity_local_id: "eid-other-cam".into(),
+            started_ts: t,
+            last_seen_at: t,
+        }];
+        let mut sched = SightingScheduler::new_with_persistence(
+            7,
+            1,
+            Duration::from_secs(5),
+            seed,
+            persist.clone(),
+        );
+        let frame = dummy_frame(7, t);
+        sched.tick(&frame, &[tracked(42, 2)], t, &hook);
+        let seen = hook.seen.lock();
+        assert_eq!(seen.len(), 1);
+        assert_ne!(seen[0].entity_local_id, "eid-other-cam");
+    }
+
+    #[test]
+    fn persist_delete_fires_on_gc() {
+        let hook = CaptureHook::default();
+        let persist = Arc::new(CapturePersist::default());
+        let mut sched = SightingScheduler::new_with_persistence(
+            7,
+            1,
+            Duration::from_secs(5),
+            Vec::new(),
+            persist.clone(),
+        );
+        let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let frame = dummy_frame(7, t0);
+        sched.tick(&frame, &[tracked(42, 2)], t0, &hook);
+        // 20s with no objects — well past gc_after=10s.
+        sched.tick(&frame, &[], t0 + chrono::Duration::seconds(20), &hook);
+        let deletes = persist.deletes.lock();
+        assert_eq!(deletes.len(), 1);
+        assert_eq!(deletes[0], (7, 42));
     }
 }

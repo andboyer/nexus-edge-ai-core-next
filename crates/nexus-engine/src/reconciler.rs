@@ -110,6 +110,14 @@ pub struct ReconcilerArgs {
     pub sighting_hook: Arc<dyn nexus_pipeline::SightingHook>,
     /// Tunables for the per-camera [`nexus_pipeline::SightingScheduler`].
     pub sighting_cfg: nexus_pipeline::supervisor::SightingSchedulerConfig,
+    /// Phase 5.6 · R4 — shared persistence sink for the
+    /// per-camera scheduler's `entity_local_state` writes. Cloned
+    /// into every `start_camera` call so a hot-added camera shares
+    /// the same worker as the boot-time ones.
+    pub sighting_persist: Arc<dyn nexus_pipeline::EntityLocalPersist>,
+    /// Hydration window (seconds) used when `start_camera` loads a
+    /// per-camera seed from the store. Matches the boot-time value.
+    pub sighting_hydration_window_secs: u64,
     pub handles: HandleMap,
 }
 
@@ -231,7 +239,7 @@ async fn reconcile(args: &ReconcilerArgs) -> anyhow::Result<()> {
             }
             None => {}
         }
-        start_camera(args, cam, &url, want_dims);
+        start_camera(args, cam, &url, want_dims).await;
     }
 
     Ok(())
@@ -250,7 +258,12 @@ fn stop_camera(args: &ReconcilerArgs, cam_id: CameraId) {
     args.frame_stats.clear(cam_id);
 }
 
-fn start_camera(args: &ReconcilerArgs, cam: CameraConfig, url: &str, supervisor_dims: (u32, u32)) {
+async fn start_camera(
+    args: &ReconcilerArgs,
+    cam: CameraConfig,
+    url: &str,
+    supervisor_dims: (u32, u32),
+) {
     let cam_id = cam.id;
     let (sup_w, sup_h) = supervisor_dims;
     // Pre-roll ingester first so the recorder is ready by the time
@@ -277,6 +290,39 @@ fn start_camera(args: &ReconcilerArgs, cam: CameraConfig, url: &str, supervisor_
     // Fresh per-camera tracker — see `ReconcilerArgs::tracker_cfg`
     // for why this CANNOT be shared across cameras.
     let tracker: Arc<dyn Tracker> = Arc::from(nexus_tracker::build_tracker(&args.tracker_cfg));
+    // Phase 5.6 · R4 — hydrate this camera's seed from
+    // `entity_local_state` so the freshly-spawned scheduler reuses
+    // any prior `entity_local_id` that's still inside the GC
+    // window. Cheap: indexed by `(camera_id, last_seen_at)`.
+    // Failure is non-fatal — we just start cold.
+    let seed_for_cam: Vec<nexus_pipeline::EntityLocalSeed> = match args
+        .store
+        .load_recent_entity_locals_for_camera(
+            cam_id,
+            chrono::Utc::now()
+                - chrono::Duration::seconds(args.sighting_hydration_window_secs as i64),
+        )
+        .await
+    {
+        Ok(rows) => rows
+            .into_iter()
+            .map(|r| nexus_pipeline::EntityLocalSeed {
+                camera_id: r.camera_id,
+                track_id: r.track_id,
+                entity_local_id: r.entity_local_id,
+                started_ts: r.started_ts,
+                last_seen_at: r.last_seen_at,
+            })
+            .collect(),
+        Err(e) => {
+            warn!(
+                camera_id = cam_id,
+                error = %e,
+                "reconciler: entity_local_state hydration failed; scheduler will start cold"
+            );
+            Vec::new()
+        }
+    };
     let handle = spawn_camera(
         cam,
         detector,
@@ -296,6 +342,8 @@ fn start_camera(args: &ReconcilerArgs, cam: CameraConfig, url: &str, supervisor_
         sup_h,
         args.sighting_hook.clone(),
         args.sighting_cfg,
+        seed_for_cam,
+        args.sighting_persist.clone(),
     );
     args.handles.lock().insert(
         cam_id,

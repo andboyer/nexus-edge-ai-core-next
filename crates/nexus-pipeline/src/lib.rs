@@ -34,7 +34,10 @@ pub mod preroll_ingester;
 pub mod thumbnail;
 
 pub use cache::{LatestEntry, LatestFrameCache};
-pub use entity_sighting::{NoopSightingHook, SightingHook, SightingScheduler, SightingSnapshot};
+pub use entity_sighting::{
+    EntityLocalPersist, EntityLocalSeed, EntityLocalUpdate, NoopEntityLocalPersist,
+    NoopSightingHook, SightingHook, SightingScheduler, SightingSnapshot,
+};
 pub use gate::MotionGate;
 pub use preroll::{NalRingBuffer, NalSample};
 pub use recorder::{

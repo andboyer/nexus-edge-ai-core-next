@@ -23,7 +23,9 @@ use tokio::task::JoinHandle;
 use tracing::{debug, error, info, info_span, warn, Instrument};
 
 use crate::cache::LatestFrameCache;
-use crate::entity_sighting::{SightingHook, SightingScheduler};
+use crate::entity_sighting::{
+    EntityLocalPersist, EntityLocalSeed, SightingHook, SightingScheduler,
+};
 use crate::gate::MotionGate;
 use crate::post_roll::{PostRoll, PostRollAction};
 use crate::recorder::{
@@ -87,6 +89,8 @@ pub fn spawn_camera(
     supervisor_h: u32,
     sighting_hook: Arc<dyn SightingHook>,
     sighting_cfg: SightingSchedulerConfig,
+    sighting_seed: Vec<EntityLocalSeed>,
+    sighting_persist: Arc<dyn EntityLocalPersist>,
 ) -> CameraHandle {
     let camera_id = cfg.id;
     let task = tokio::spawn(run_camera(
@@ -108,6 +112,8 @@ pub fn spawn_camera(
         supervisor_h,
         sighting_hook,
         sighting_cfg,
+        sighting_seed,
+        sighting_persist,
     ));
     CameraHandle { camera_id, task }
 }
@@ -132,6 +138,8 @@ async fn run_camera(
     supervisor_h: u32,
     sighting_hook: Arc<dyn SightingHook>,
     sighting_cfg: SightingSchedulerConfig,
+    sighting_seed: Vec<EntityLocalSeed>,
+    sighting_persist: Arc<dyn EntityLocalPersist>,
 ) {
     let span = info_span!(
         "camera.pipeline",
@@ -209,10 +217,12 @@ async fn run_camera(
         // [`NoopSightingHook`]) once per stable track per
         // `emit_interval`. Cheap when the hook is the noop — just a
         // HashMap probe + counter bump per frame.
-        let mut sighting_scheduler = SightingScheduler::new(
+        let mut sighting_scheduler = SightingScheduler::new_with_persistence(
             cfg.id,
             sighting_cfg.min_track_age_frames,
             sighting_cfg.emit_interval,
+            sighting_seed,
+            sighting_persist,
         );
         let mut current_clip: Option<ClipHandle> = None;
         // Wall-clock anchor for the currently-open clip. Used to

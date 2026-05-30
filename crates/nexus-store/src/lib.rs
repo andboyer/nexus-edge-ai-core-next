@@ -10,12 +10,14 @@
 
 pub mod audit;
 pub mod cloud;
+pub mod entity;
 pub mod motion;
 pub mod outbox;
 pub mod sessions;
 pub mod users;
 pub mod visual_prompts;
 pub use audit::{AuditActorKind, AuditEntry, AuditFilter, AuditOutcome, NewAuditEntry};
+pub use entity::{EntityLocalRecord, EntityLocalUpsert};
 pub use motion::{
     ClipClose, ClipColdMark, ClipId, ClipRow, ColdReplicaRow, ColdReplicaStats, DeleteBackendError,
     MotionEventId, MotionEventKind, MotionEventRow, MotionHistogramBucket, NewClip, NewMotionEvent,
@@ -119,6 +121,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
     (
         "0017_motion_clips_frame_size",
         include_str!("../migrations/0017_motion_clips_frame_size.sql"),
+    ),
+    (
+        "0018_entity_local_state",
+        include_str!("../migrations/0018_entity_local_state.sql"),
     ),
 ];
 

@@ -12,7 +12,7 @@ use nexus_pipeline::{
 use nexus_rules::RuleEvaluator;
 use nexus_store::Store;
 use nexus_tracker::build_tracker;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 mod admin_auth;
 mod admin_cli;
@@ -32,6 +32,7 @@ mod cold_replicator;
 mod delivery_reload;
 mod discovery;
 mod engine_rpc;
+mod entity_local_persist;
 #[cfg(unix)]
 mod fd_limit;
 mod gpu;
@@ -598,6 +599,45 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
     // unreachable: the hook drops snapshots silently when the outbox
     // has no handle, and the supervisor's per-frame tick is cheap
     // when the underlying [`NoopSightingHook`] is installed.
+    //
+    // Phase 5.6 · R4 — also build the `entity_local_state`
+    // persistence sink + load a hydration seed so the scheduler can
+    // reuse a prior `entity_local_id` when the tracker re-issues the
+    // same `(camera_id, track_id)` within the GC window after a
+    // crash + systemd restart. Persistence is wired regardless of
+    // `cfg.reid.enabled` — the table is cheap and the operator may
+    // flip the flag at runtime without restarting the engine.
+    let sighting_persist: Arc<dyn nexus_pipeline::EntityLocalPersist> = Arc::new(
+        entity_local_persist::StoreEntityLocalPersist::spawn(store.clone(), 256),
+    );
+    // Hydration window: 2 × emit_interval, floored at 30 s and
+    // capped at 5 min so a long-lived stale row never re-attaches
+    // to a fresh track. The scheduler does its own per-camera GC on
+    // top of this, so this is just an upper bound on what we ask
+    // the DB to return at boot.
+    let hydration_window_secs = (cfg.reid.emit_interval_s.saturating_mul(2)).clamp(30, 300);
+    let sighting_seed_all = match store
+        .load_recent_entity_locals(
+            chrono::Utc::now() - chrono::Duration::seconds(hydration_window_secs as i64),
+        )
+        .await
+    {
+        Ok(rows) => {
+            info!(
+                count = rows.len(),
+                window_secs = hydration_window_secs,
+                "entity_local_state hydrated from store"
+            );
+            rows
+        }
+        Err(e) => {
+            warn!(
+                error = %e,
+                "entity_local_state hydration failed; per-camera schedulers will start with empty seed"
+            );
+            Vec::new()
+        }
+    };
     let (sighting_hook, sighting_cfg): (
         Arc<dyn nexus_pipeline::SightingHook>,
         nexus_pipeline::supervisor::SightingSchedulerConfig,
@@ -649,6 +689,17 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
             .map(|m| m.input_width)
             .unwrap_or(cfg.inference.model.input_width);
         let (sup_w, sup_h) = nexus_pipeline::supervisor_frame_for(det_w);
+        let seed_for_cam: Vec<nexus_pipeline::EntityLocalSeed> = sighting_seed_all
+            .iter()
+            .filter(|r| r.camera_id == cam_id)
+            .map(|r| nexus_pipeline::EntityLocalSeed {
+                camera_id: r.camera_id,
+                track_id: r.track_id,
+                entity_local_id: r.entity_local_id.clone(),
+                started_ts: r.started_ts,
+                last_seen_at: r.last_seen_at,
+            })
+            .collect();
         let h = spawn_camera(
             cam,
             detector,
@@ -668,6 +719,8 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
             sup_h,
             sighting_hook.clone(),
             sighting_cfg,
+            seed_for_cam,
+            sighting_persist.clone(),
         );
         running.lock().insert(
             cam_id,
@@ -909,8 +962,37 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
         default_detector_width: cfg.inference.model.input_width,
         sighting_hook: sighting_hook.clone(),
         sighting_cfg,
+        sighting_persist: sighting_persist.clone(),
+        sighting_hydration_window_secs: hydration_window_secs,
         handles: running.clone(),
     });
+
+    // Phase 5.6 · R4 — periodic `entity_local_state` sweeper. Keeps
+    // the table from growing unbounded when cameras come and go.
+    // Floor of 2 hours is a deliberate over-shoot of the per-camera
+    // GC window (10s to a few minutes); any row past 2 h cannot
+    // possibly still be in the tracker's re-association window.
+    {
+        let store = store.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(60 * 60));
+            // First tick fires immediately — skip it.
+            tick.tick().await;
+            loop {
+                tick.tick().await;
+                let cutoff = chrono::Utc::now() - chrono::Duration::hours(2);
+                match store.prune_entity_local_state(cutoff).await {
+                    Ok(0) => {}
+                    Ok(n) => {
+                        debug!(pruned = n, "entity_local_state sweeper pruned stale rows");
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "entity_local_state sweeper failed");
+                    }
+                }
+            }
+        });
+    }
 
     // Phase A — camera-roster publisher. Subscribes to
     // `topic::CONFIG_CHANGED` and pushes a `camera_roster` envelope
