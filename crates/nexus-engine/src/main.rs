@@ -1716,7 +1716,15 @@ fn log_inference_summary(cfg: &InferenceConfig, has_pool: bool, router: &Inferen
 ///   engine still boots — the cloud-side allowlist gate will then
 ///   reject the mock submissions (which is the correct behaviour
 ///   when the operator misconfigured the model path).
-/// * Otherwise (feature off OR no `model_path`), build a
+/// * When the `ort` feature is present but `model_path` is unset,
+///   try the canonical release-staged path
+///   (`<exe-dir>/../share/models/dinov2_s_224.onnx`, i.e.
+///   `/opt/nexus/current/share/models/dinov2_s_224.onnx` on a
+///   standard install). This matches the layout assembled by
+///   `.github/workflows/release.yml` and lets a vanilla
+///   `[reid] enabled = true` block in `nexus.toml` resolve a
+///   real extractor without operator path-hunting.
+/// * Otherwise (feature off OR no bundled weights found), build a
 ///   `MockExtractor` directly. The wire-submission path in
 ///   `cloud_sighting::run_worker` short-circuits when the
 ///   extractor's `model_id` starts with `"mock_"`, so no cloud
@@ -1724,9 +1732,22 @@ fn log_inference_summary(cfg: &InferenceConfig, has_pool: bool, router: &Inferen
 fn build_reid_extractor(cfg: &nexus_config::ReidConfig) -> Arc<dyn nexus_reid::Extractor> {
     #[cfg(feature = "ort")]
     {
-        if let Some(path) = cfg.model_path.as_ref() {
+        let explicit = cfg.model_path.clone();
+        // Auto-discovery is intentionally narrow: only the canonical
+        // tarball-staged path is probed. We do NOT walk PWD, $PATH,
+        // /usr/local/share, etc. — operators with non-standard
+        // layouts must set `model_path` explicitly.
+        let candidate = explicit.or_else(|| {
+            std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
+                .and_then(|bin_dir| bin_dir.parent().map(std::path::Path::to_path_buf))
+                .map(|release_dir| release_dir.join("share/models/dinov2_s_224.onnx"))
+                .filter(|p| p.exists())
+        });
+        if let Some(path) = candidate {
             match nexus_reid::ort_dinov2::DinoV2Extractor::open(
-                path,
+                &path,
                 cfg.model_id.clone(),
                 cfg.ep_priority.as_slice(),
             ) {
@@ -1735,6 +1756,7 @@ fn build_reid_extractor(cfg: &nexus_config::ReidConfig) -> Arc<dyn nexus_reid::E
                         model_path = %path.display(),
                         model_id = %cfg.model_id,
                         dim = cfg.dim,
+                        auto_discovered = cfg.model_path.is_none(),
                         "reid: DinoV2 extractor opened"
                     );
                     return Arc::new(x);
