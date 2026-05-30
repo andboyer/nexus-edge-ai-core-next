@@ -76,6 +76,14 @@ jobs:
       - name: cargo test (workspace)
         run: cargo test --locked --workspace --no-fail-fast
 
+      # Enforces AGENTS.md rule 2: no face-recognition models in `models/`,
+      # no non-commercial / research-only license values on any entry.
+      # See [xtask/README.md](../../xtask/README.md). Runs without
+      # `--strict` until every legacy entry is back-filled with both
+      # license fields.
+      - name: cargo xtask check-models
+        run: cargo xtask check-models
+
   # ---------------------------------------------------------------------
   # ts-rs roundtrip — running `cargo test -p nexus-types --features ts`
   # regenerates one `*.ts` file per `#[derive(TS)]` type into

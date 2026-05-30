@@ -17,6 +17,7 @@ members = [
     "crates/nexus-probe",
     "crates/nexus-cloud-protocol",
     "crates/nexus-cloud-client",
+    "xtask",
 ]
 
 [workspace.package]

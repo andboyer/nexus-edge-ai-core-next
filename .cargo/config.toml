@@ -1,0 +1,5 @@
+[alias]
+# `cargo xtask <cmd>` shortcut so phase-5.6 manifest checks and any
+# future repo-maintenance tools can be invoked without spelling out
+# `--package xtask --bin xtask`. See [xtask/README.md](../xtask/README.md).
+xtask = "run --package xtask --bin xtask --"

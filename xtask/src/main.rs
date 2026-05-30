@@ -1,0 +1,447 @@
+//! # xtask — repo-maintenance tools
+//!
+//! Subcommands invoked via `cargo xtask <cmd>`.
+//!
+//! ## `check-models`
+//!
+//! Validates [`models/models-manifest.json`](../models/models-manifest.json)
+//! against the engine's model-license + product-invariant rules
+//! recorded in [`AGENTS.md`](../AGENTS.md) rule 2:
+//!
+//! 1. **No face-recognition extractors.** Model `id` and artifact
+//!    `path` fields are case-insensitively scanned for substrings
+//!    that identify known face-recognition model families
+//!    (`AdaFace`, `ArcFace`, `InsightFace`, `Buffalo`, `FaceNet`,
+//!    `SphereFace`, `CosFace`, `MagFace`). A match is an immediate
+//!    failure — these never ship at the edge in v1 regardless of
+//!    license, because face recognition undermines the cloud's
+//!    pseudonymous-by-default identity vault. See
+//!    [`nexus-cloud-console`'s `docs/product/WEDGE_PLAN.md`](../../nexus-cloud-console/docs/product/WEDGE_PLAN.md).
+//!
+//! 2. **License + dataset-license deny list.** Explicit values that
+//!    are incompatible with the engine's AGPL-3.0-or-later license
+//!    or with commercial redistribution are rejected:
+//!    `non-commercial`, `nc`, `cc-by-nc-*`, `research`,
+//!    `research-only`, `unknown`, `proprietary`. The check is
+//!    case-insensitive on substring; `weights_dataset_license`
+//!    values like `MS1M:research` and `Objects365:CC-BY-NC-4.0`
+//!    trip this rule.
+//!
+//! 3. **Missing license / weights_dataset_license fields.** Warned
+//!    by default and elevated to an error under `--strict`. The
+//!    distinction lets the gate land before every existing
+//!    manifest entry is fully back-filled; CI runs without
+//!    `--strict` today and with `--strict` once back-fill is done.
+//!
+//! The check exits 0 on success, 1 on any rule violation, and
+//! prints a one-line summary at the end either way.
+
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result};
+use clap::{Parser, Subcommand};
+use serde::Deserialize;
+
+/// CLI surface for `cargo xtask <subcommand>`.
+#[derive(Debug, Parser)]
+#[command(name = "xtask", about = "Nexus engine repo maintenance tools")]
+struct Cli {
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+
+#[derive(Debug, Subcommand)]
+enum Cmd {
+    /// Validate models/models-manifest.json against the rules in
+    /// AGENTS.md §2. Exits non-zero on any deny-list violation.
+    CheckModels(CheckModelsArgs),
+}
+
+#[derive(Debug, clap::Args)]
+struct CheckModelsArgs {
+    /// Path to the manifest. Defaults to `models/models-manifest.json`
+    /// resolved relative to the workspace root.
+    #[arg(long, default_value = "models/models-manifest.json")]
+    manifest: PathBuf,
+
+    /// Treat "missing license" / "missing weights_dataset_license"
+    /// warnings as hard errors. Off by default during the back-fill
+    /// transition; flip on in CI once every model entry declares
+    /// both fields.
+    #[arg(long)]
+    strict: bool,
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+    match cli.cmd {
+        Cmd::CheckModels(args) => check_models(args),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `check-models`
+// ---------------------------------------------------------------------------
+
+/// Substrings identifying face-recognition model families that MUST
+/// NOT ship in `models/` at the edge. See AGENTS.md rule 2.
+const FACE_REC_DENYLIST: &[&str] = &[
+    "adaface",
+    "arcface",
+    "insightface",
+    "buffalo",
+    "facenet",
+    "sphereface",
+    "cosface",
+    "magface",
+];
+
+/// Substrings that disqualify a license / dataset-license value.
+/// Match is case-insensitive on the field's full string (so an entry
+/// like `"weights_dataset_license": "MS1M:research"` trips on
+/// `"research"`).
+const LICENSE_DENYLIST: &[&str] = &[
+    "non-commercial",
+    "noncommercial",
+    "nc-4.0",
+    "cc-by-nc",
+    "research-only",
+    "research",
+    "unknown",
+    "proprietary",
+];
+
+/// Subset of `models-manifest.json` that the check needs to inspect.
+/// All other fields (artifacts, presets, prompts, thresholds, etc.)
+/// are intentionally `serde(flatten)`-ignored.
+#[derive(Debug, Deserialize)]
+struct Manifest {
+    models: Vec<ManifestModel>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ManifestModel {
+    id: String,
+    #[serde(default)]
+    license: Option<String>,
+    #[serde(default)]
+    weights_dataset_license: Option<String>,
+    #[serde(default)]
+    artifacts: Vec<ManifestArtifact>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ManifestArtifact {
+    #[serde(default)]
+    path: Option<String>,
+}
+
+/// Outcome of a single rule against the manifest.
+#[derive(Debug, Default)]
+struct CheckReport {
+    errors: Vec<String>,
+    warnings: Vec<String>,
+}
+
+impl CheckReport {
+    fn error(&mut self, msg: impl Into<String>) {
+        self.errors.push(msg.into());
+    }
+    fn warn(&mut self, msg: impl Into<String>) {
+        self.warnings.push(msg.into());
+    }
+}
+
+fn check_models(args: CheckModelsArgs) -> Result<()> {
+    let manifest_path = resolve_manifest_path(&args.manifest);
+    let bytes = std::fs::read(&manifest_path)
+        .with_context(|| format!("failed to read manifest {}", manifest_path.display()))?;
+    let manifest: Manifest = serde_json::from_slice(&bytes)
+        .with_context(|| format!("failed to parse manifest {}", manifest_path.display()))?;
+
+    let report = audit_manifest(&manifest);
+
+    for w in &report.warnings {
+        eprintln!("warn: {w}");
+    }
+    for e in &report.errors {
+        eprintln!("error: {e}");
+    }
+
+    let fatal_warnings = args.strict && !report.warnings.is_empty();
+    let failed = !report.errors.is_empty() || fatal_warnings;
+
+    eprintln!(
+        "check-models: {} model{}, {} warning{}, {} error{}{}",
+        manifest.models.len(),
+        if manifest.models.len() == 1 { "" } else { "s" },
+        report.warnings.len(),
+        if report.warnings.len() == 1 { "" } else { "s" },
+        report.errors.len(),
+        if report.errors.len() == 1 { "" } else { "s" },
+        if args.strict { " (strict)" } else { "" },
+    );
+
+    if failed {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// Resolve the manifest path against the workspace root (parent of
+/// `xtask/` when run via `cargo xtask`). Absolute paths are used as-is.
+fn resolve_manifest_path(manifest: &Path) -> PathBuf {
+    if manifest.is_absolute() {
+        return manifest.to_path_buf();
+    }
+    // Walk up from CARGO_MANIFEST_DIR (set to `xtask/` by `cargo run`)
+    // until we hit a dir that contains the requested file, or fall
+    // back to cwd if the env var isn't set (running the binary directly).
+    if let Some(crate_dir) = std::env::var_os("CARGO_MANIFEST_DIR") {
+        let crate_dir = PathBuf::from(crate_dir);
+        if let Some(workspace_root) = crate_dir.parent() {
+            let candidate = workspace_root.join(manifest);
+            if candidate.exists() {
+                return candidate;
+            }
+        }
+    }
+    manifest.to_path_buf()
+}
+
+/// Inspect every model entry and return aggregated errors/warnings.
+/// Pure; takes a parsed manifest and returns a report. Tests drive
+/// this directly with synthetic manifests.
+fn audit_manifest(manifest: &Manifest) -> CheckReport {
+    let mut report = CheckReport::default();
+    for model in &manifest.models {
+        audit_model(model, &mut report);
+    }
+    report
+}
+
+fn audit_model(model: &ManifestModel, report: &mut CheckReport) {
+    // Rule 1: face-recognition name pattern.
+    let id_lc = model.id.to_lowercase();
+    for needle in FACE_REC_DENYLIST {
+        if id_lc.contains(needle) {
+            report.error(format!(
+                "model id '{}' matches face-rec denylist substring '{}' — see AGENTS.md rule 2",
+                model.id, needle
+            ));
+        }
+    }
+    for art in &model.artifacts {
+        if let Some(path) = &art.path {
+            let path_lc = path.to_lowercase();
+            for needle in FACE_REC_DENYLIST {
+                if path_lc.contains(needle) {
+                    report.error(format!(
+                        "model '{}' artifact path '{}' matches face-rec denylist substring '{}' — see AGENTS.md rule 2",
+                        model.id, path, needle
+                    ));
+                }
+            }
+        }
+    }
+
+    // Rule 2: license + dataset-license deny list.
+    match &model.license {
+        Some(lic) => {
+            if let Some(bad) = license_denylist_hit(lic) {
+                report.error(format!(
+                    "model '{}' license '{}' contains denylisted token '{}'",
+                    model.id, lic, bad
+                ));
+            }
+        }
+        None => {
+            report.warn(format!(
+                "model '{}' missing `license` field — backfill before --strict CI",
+                model.id
+            ));
+        }
+    }
+    match &model.weights_dataset_license {
+        Some(lic) => {
+            if let Some(bad) = license_denylist_hit(lic) {
+                report.error(format!(
+                    "model '{}' weights_dataset_license '{}' contains denylisted token '{}'",
+                    model.id, lic, bad
+                ));
+            }
+        }
+        None => {
+            report.warn(format!(
+                "model '{}' missing `weights_dataset_license` field — backfill before --strict CI",
+                model.id
+            ));
+        }
+    }
+}
+
+fn license_denylist_hit(value: &str) -> Option<&'static str> {
+    let lc = value.to_lowercase();
+    LICENSE_DENYLIST
+        .iter()
+        .copied()
+        .find(|needle| lc.contains(needle))
+}
+
+// ---------------------------------------------------------------------------
+// tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(json: &str) -> Manifest {
+        serde_json::from_str(json).expect("test manifest must parse")
+    }
+
+    #[test]
+    fn empty_manifest_is_clean() {
+        let r = audit_manifest(&parse(r#"{"models":[]}"#));
+        assert!(r.errors.is_empty());
+        assert!(r.warnings.is_empty());
+    }
+
+    #[test]
+    fn allowlisted_entry_passes() {
+        let r = audit_manifest(&parse(
+            r#"{"models":[{
+                "id":"yolo26n",
+                "license":"AGPL-3.0",
+                "weights_dataset_license":"COCO:CC-BY-4.0",
+                "artifacts":[]
+            }]}"#,
+        ));
+        assert!(r.errors.is_empty(), "errors: {:?}", r.errors);
+        assert!(r.warnings.is_empty(), "warnings: {:?}", r.warnings);
+    }
+
+    #[test]
+    fn face_rec_id_is_rejected() {
+        // The classic InsightFace ArcFace pattern — model id contains
+        // a face-rec brand substring even when the artifact path is
+        // generic.
+        let r = audit_manifest(&parse(
+            r#"{"models":[{
+                "id":"arcface_r100",
+                "license":"MIT",
+                "weights_dataset_license":"VGGFace2:CC-BY-4.0",
+                "artifacts":[{"path":"emb_r100.onnx"}]
+            }]}"#,
+        ));
+        assert!(
+            r.errors.iter().any(|e| e.contains("arcface")),
+            "errors: {:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn face_rec_artifact_path_is_rejected_even_with_clean_id() {
+        let r = audit_manifest(&parse(
+            r#"{"models":[{
+                "id":"emb_v1",
+                "license":"Apache-2.0",
+                "weights_dataset_license":"DINOv2:Apache-2.0",
+                "artifacts":[{"path":"adaface_r100.onnx"}]
+            }]}"#,
+        ));
+        assert!(
+            r.errors.iter().any(|e| e.contains("adaface")),
+            "errors: {:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn insightface_buffalo_bundle_is_rejected() {
+        let r = audit_manifest(&parse(
+            r#"{"models":[{
+                "id":"buffalo_l",
+                "license":"Apache-2.0",
+                "weights_dataset_license":"Glint360K:CC-BY-NC-4.0",
+                "artifacts":[]
+            }]}"#,
+        ));
+        // Both `buffalo` (name) and `cc-by-nc` (dataset) hit.
+        assert!(
+            r.errors.iter().any(|e| e.contains("buffalo")),
+            "errors: {:?}",
+            r.errors
+        );
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.to_lowercase().contains("cc-by-nc")),
+            "errors: {:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn research_only_dataset_is_rejected() {
+        let r = audit_manifest(&parse(
+            r#"{"models":[{
+                "id":"x",
+                "license":"Apache-2.0",
+                "weights_dataset_license":"MS1M:research",
+                "artifacts":[]
+            }]}"#,
+        ));
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.to_lowercase().contains("research")),
+            "errors: {:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn non_commercial_license_is_rejected() {
+        let r = audit_manifest(&parse(
+            r#"{"models":[{
+                "id":"x",
+                "license":"Non-Commercial",
+                "weights_dataset_license":"COCO:CC-BY-4.0",
+                "artifacts":[]
+            }]}"#,
+        ));
+        assert!(r
+            .errors
+            .iter()
+            .any(|e| e.to_lowercase().contains("non-commercial")));
+    }
+
+    #[test]
+    fn missing_fields_warn_but_dont_error() {
+        let r = audit_manifest(&parse(r#"{"models":[{"id":"x","artifacts":[]}]}"#));
+        assert!(r.errors.is_empty(), "errors: {:?}", r.errors);
+        assert_eq!(r.warnings.len(), 2);
+    }
+
+    #[test]
+    fn shipping_manifest_is_clean_or_warn_only() {
+        // The actual repo manifest must never error under the default
+        // (non-strict) check — that's the gate this xtask provides.
+        // Warnings about missing license fields on legacy entries are
+        // acceptable until those entries are back-filled.
+        let manifest_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("xtask crate has a parent dir")
+            .join("models/models-manifest.json");
+        let bytes = std::fs::read(&manifest_path).expect("manifest readable");
+        let manifest: Manifest = serde_json::from_slice(&bytes).expect("manifest parses");
+        let r = audit_manifest(&manifest);
+        assert!(
+            r.errors.is_empty(),
+            "models/models-manifest.json must pass non-strict check-models; errors: {:?}",
+            r.errors
+        );
+    }
+}
