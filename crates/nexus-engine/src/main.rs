@@ -101,13 +101,20 @@ struct Cli {
     /// Path to the TOML config file. When set, takes precedence over
     /// `--tier`. Falls back to `config/single-camera.toml` if neither
     /// `--config` nor `--tier` is provided.
-    #[arg(short, long, env = "NEXUS_CONFIG")]
+    ///
+    /// `global = true` so the flag may appear before OR after a
+    /// subcommand name — `install.sh` invokes
+    /// `nexus-engine set-admin-password --config <path> ...` and
+    /// `nexus-engine tls init --config <path>` with the flag in the
+    /// post-subcommand position, and clap would otherwise reject it
+    /// with `unexpected argument '--config' found`.
+    #[arg(short, long, env = "NEXUS_CONFIG", global = true)]
     config: Option<PathBuf>,
 
     /// Hardware tier to load (M-Install Checkpoint 1). `auto` runs
     /// `nexus-probe` in-process and picks the matching
     /// `config/tiers/<tier>.toml`. Ignored when `--config` is given.
-    #[arg(long, env = "NEXUS_TIER", value_enum)]
+    #[arg(long, env = "NEXUS_TIER", value_enum, global = true)]
     tier: Option<TierChoice>,
 
     /// Override `inference.backend` from the config (mock|in_process|pool).
