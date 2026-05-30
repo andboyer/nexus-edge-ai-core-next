@@ -76,6 +76,14 @@ async fn build_envelope(store: &Store, revision: u64) -> anyhow::Result<Envelope
             // >=1) but guard anyway.
             let edge_camera_id = u64::try_from(c.id).unwrap_or(0);
             let model_kind = c.detector.model_override.as_ref().map(|m| m.kind.clone());
+            // `_plus` is a vendor SVC label; the wire enum is
+            // base codecs only, so collapse via `.base()`.
+            let codec = Some(
+                c.ingest
+                    .codec
+                    .map(|k| k.base().to_string())
+                    .unwrap_or_else(|| "unknown".to_string()),
+            );
             CameraRosterEntry {
                 edge_camera_id,
                 name: c.name,
@@ -83,7 +91,7 @@ async fn build_envelope(store: &Store, revision: u64) -> anyhow::Result<Envelope
                 enabled: c.ingest.enabled,
                 tags: None,
                 resolution: None,
-                codec: None,
+                codec,
                 model_kind,
                 online: None,
                 // Phase A: per-camera revision == snapshot revision.
