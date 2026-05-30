@@ -21,11 +21,12 @@
 //!   3. Adds, removes, or restarts supervisors + ingesters to make
 //!      the runtime match the DB.
 //!
-//! Restart trigger: today only "URL changed" forces a respawn.
-//! Detector / threshold / rule changes do not — those still require
-//! a process restart (or a future, finer-grained hot-reload path).
-//! This matches the UX where the admin UI surfaces camera ingest
-//! edits as the primary live operation.
+//! Restart triggers today: ingest URL change, supervisor (analysis)
+//! frame dimension change, and ingest codec change. Detector /
+//! threshold / rule changes do not — those still require a process
+//! restart (or a future, finer-grained hot-reload path). This
+//! matches the UX where the admin UI surfaces camera ingest edits
+//! as the primary live operation.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -71,6 +72,13 @@ pub struct RunningCameraEntry {
     /// caps) without needing a process restart. See
     /// [`nexus_pipeline::supervisor_frame_for`].
     pub supervisor_dims: (u32, u32),
+    /// Configured ingest codec as stored in the DB (`None` = "auto",
+    /// resolved per spawn via `discovery::rtsp_probe`). Compared on
+    /// each reconcile pass so a UI-side codec edit forces a respawn
+    /// — the new value is loaded into the GStreamer pipeline by the
+    /// fresh ingester rather than continuing to decode with the
+    /// previous depayloader/decoder chain.
+    pub codec: Option<CodecKind>,
 }
 
 /// Bundle of every dependency `spawn_camera()` needs. Constructed
@@ -212,9 +220,14 @@ async fn reconcile(args: &ReconcilerArgs) -> anyhow::Result<()> {
             .unwrap_or(args.default_detector_width);
         let want_dims = nexus_pipeline::supervisor_frame_for(det_w);
         match current.get(&cam_id) {
-            Some(entry) if entry.url == url && entry.supervisor_dims == want_dims => {
+            Some(entry)
+                if entry.url == url
+                    && entry.supervisor_dims == want_dims
+                    && entry.codec == cam.ingest.codec =>
+            {
                 // No change — supervisor still alive, URL still the
-                // same, supervisor dims still match. Skip (we
+                // same, supervisor dims still match, ingest codec
+                // still matches what's in the DB. Skip (we
                 // deliberately do not respawn on unrelated config
                 // edits today).
                 continue;
@@ -225,7 +238,7 @@ async fn reconcile(args: &ReconcilerArgs) -> anyhow::Result<()> {
                         camera_id = cam_id,
                         "camera reconciler: ingest URL changed; restarting supervisor"
                     );
-                } else {
+                } else if entry.supervisor_dims != want_dims {
                     info!(
                         camera_id = cam_id,
                         prev_w = entry.supervisor_dims.0,
@@ -233,6 +246,13 @@ async fn reconcile(args: &ReconcilerArgs) -> anyhow::Result<()> {
                         new_w = want_dims.0,
                         new_h = want_dims.1,
                         "camera reconciler: detector input size changed; restarting supervisor"
+                    );
+                } else {
+                    info!(
+                        camera_id = cam_id,
+                        prev_codec = ?entry.codec,
+                        new_codec = ?cam.ingest.codec,
+                        "camera reconciler: ingest codec changed; restarting supervisor"
                     );
                 }
                 stop_camera(args, cam_id);
@@ -266,18 +286,44 @@ async fn start_camera(
 ) {
     let cam_id = cam.id;
     let (sup_w, sup_h) = supervisor_dims;
+    let configured_codec = cam.ingest.codec;
     // Pre-roll ingester first so the recorder is ready by the time
     // the supervisor opens its first motion clip. Failure is logged
     // but non-fatal: detection still runs; clip opens for this
     // camera return Refused until the next reconcile pass.
-    let codec = cam.ingest.codec.unwrap_or_else(|| {
-        warn!(
-            camera_id = cam_id,
-            %url,
-            "camera codec unspecified; defaulting to h264 — set `ingest.codec` in the camera config to silence"
-        );
-        CodecKind::H264
-    });
+    let codec = match cam.ingest.codec {
+        Some(c) => c,
+        None => {
+            // Same boot-time autodetect as build_gst_recorder so a
+            // hot-added "auto" camera (operator left codec=None)
+            // gets probed instead of silently defaulting to h264.
+            let scheme = cam.ingest.url.scheme();
+            let probed = if scheme == "rtsp" || scheme == "rtsps" {
+                crate::discovery::rtsp_probe::probe_codec_for_url(&cam.ingest.url).await
+            } else {
+                None
+            };
+            match probed {
+                Some(c) => {
+                    info!(
+                        camera_id = cam_id,
+                        %url,
+                        codec = %c,
+                        "codec autodetected at hot-add"
+                    );
+                    c
+                }
+                None => {
+                    warn!(
+                        camera_id = cam_id,
+                        %url,
+                        "camera codec unspecified and autodetect probe failed; defaulting to h264 — set `ingest.codec` in the camera config to silence"
+                    );
+                    CodecKind::H264
+                }
+            }
+        }
+    };
     if let Err(e) = args.recorder.add_camera_ingester(
         cam_id,
         url,
@@ -360,6 +406,7 @@ async fn start_camera(
             task: Arc::new(handle.task),
             url: url.to_string(),
             supervisor_dims,
+            codec: configured_codec,
         },
     );
     info!(
