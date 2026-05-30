@@ -738,6 +738,7 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
         }
         let cam_id = cam.id;
         let cam_url = cam.ingest.url.to_string();
+        let configured_codec = cam.ingest.codec;
         let detector = router.detector_for_camera(&cam);
         // Fresh per-camera tracker — see the comment on `cfg.tracker`
         // above for why sharing one Arc across cameras is wrong.
@@ -793,6 +794,7 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
                 task: Arc::new(h.task),
                 url: cam_url,
                 supervisor_dims: (sup_w, sup_h),
+                codec: configured_codec,
             },
         );
     }
