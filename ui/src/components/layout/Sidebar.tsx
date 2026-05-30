@@ -10,6 +10,7 @@ import {
   Database,
   Eye,
   FileClock,
+  Fingerprint,
   Gauge,
   Layers,
   ListChecks,
@@ -79,6 +80,7 @@ const SECTIONS: NavSection[] = [
       { to: "/admin/network", label: "Network", icon: Network, adminOnly: true },
       { to: "/admin/auth", label: "Auth Config", icon: ShieldCheck, adminOnly: true },
       { to: "/admin/diagnostics", label: "Diagnostics", icon: Wrench, adminOnly: true },
+      { to: "/admin/reid", label: "Re-Identification", icon: Fingerprint, adminOnly: true },
     ],
   },
 ];

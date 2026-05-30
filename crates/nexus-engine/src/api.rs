@@ -267,6 +267,18 @@ pub struct ApiState {
     /// `false` forever — that's what powers the "cloud:
     /// unenrolled / disconnected / connected" pill in the topbar.
     pub cloud_outbox: Arc<nexus_cloud_client::TunnelOutbox>,
+    /// Phase 5.6 · R7 — boot-time snapshot of `[reid]` so the
+    /// `/v1/admin/reid/status` admin diagnostic page can render
+    /// the configured model id, dim, cadence, etc. alongside the
+    /// live per-camera emit counters. Restart-required: this
+    /// value never changes for the lifetime of the process.
+    pub reid_config: Arc<nexus_config::ReidConfig>,
+    /// Phase 5.6 · R7 — shared with the `CloudEntitySightingHook`
+    /// worker (writer) and the `/v1/admin/reid/status` endpoint
+    /// (reader). Always present even when `reid.enabled = false`
+    /// so the response shape is stable; the snapshot is just
+    /// empty in that case.
+    pub reid_stats: Arc<crate::cloud_sighting::ReidStatsRegistry>,
 }
 
 pub fn router(state: ApiState) -> Router {
@@ -300,6 +312,12 @@ pub fn router(state: ApiState) -> Router {
         // over a 1h + 24h window, plus the registry list so
         // configured-but-quiet sinks still get a card.
         .route("/v1/admin/sinks/health", get(get_admin_sinks_health))
+        // Phase 5.6 · R7 — per-camera re-ID emit telemetry +
+        // [reid] config snapshot. Drives the `/admin/reid`
+        // local diagnostic page. Returns shape-stable JSON
+        // regardless of whether reid is enabled, so the UI can
+        // render a clear "feature off" empty state.
+        .route("/v1/admin/reid/status", get(get_admin_reid_status))
         // M2.2 closeout: core-next-native OAuth auth-code dance for
         // cloud cold backends. `start` and `status` are gated; the
         // `callback` route is registered outside the gate (the
@@ -4331,6 +4349,75 @@ async fn get_admin_sinks_health(
 }
 
 // ===========================================================================
+// Phase 5.6 · R7 — re-identification local diagnostic.
+//
+// `GET /v1/admin/reid/status` is the local-only operator-facing
+// dashboard for the cross-camera re-ID pipeline. It pairs the
+// boot-time `[reid]` config snapshot with the live per-camera emit
+// counters from `ReidStatsRegistry` so an operator standing next
+// to the box can answer the question "is the re-ID worker actually
+// firing for the camera I'm walking in front of?".
+//
+// Shape is intentionally stable across the disabled / enabled
+// branches: when `reid.enabled = false`, the `cameras` array is
+// just empty and the config fields reflect whatever the operator
+// left in the toml. The UI uses the `enabled` flag to flip to a
+// "feature off — set `[reid] enabled = true` in /etc/nexus/nexus.toml
+// and restart" empty state.
+// ===========================================================================
+
+#[derive(Debug, serde::Serialize)]
+struct ReidStatusResp {
+    enabled: bool,
+    model_id: String,
+    /// Configured embedding dimension. The worker only publishes
+    /// snapshots whose extracted embedding length matches this
+    /// value exactly — a mismatch drops the snapshot with a WARN
+    /// and skips the `emit_count` bump.
+    dim: usize,
+    emit_interval_s: u64,
+    min_track_age_frames: u32,
+    cameras: Vec<ReidCameraStatusRow>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct ReidCameraStatusRow {
+    camera_id: i64,
+    /// Lifetime count of successful per-track emits since engine
+    /// boot. Resets to zero on every process restart.
+    emit_count: u64,
+    /// UTC of the most recent successful extract for this camera.
+    /// `None` ⇔ never emitted since boot.
+    last_emit_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// First-8-bytes hex of the most recent embedding — 16 chars,
+    /// or empty when never emitted.
+    last_embedding_hex8: String,
+}
+
+async fn get_admin_reid_status(State(s): State<ApiState>) -> Json<ReidStatusResp> {
+    let cfg = s.reid_config.as_ref();
+    let cameras = s
+        .reid_stats
+        .snapshot()
+        .into_iter()
+        .map(|(camera_id, row)| ReidCameraStatusRow {
+            camera_id,
+            emit_count: row.emit_count,
+            last_emit_at: row.last_emit_at,
+            last_embedding_hex8: row.last_embedding_hex8,
+        })
+        .collect();
+    Json(ReidStatusResp {
+        enabled: cfg.enabled,
+        model_id: cfg.model_id.clone(),
+        dim: cfg.dim,
+        emit_interval_s: cfg.emit_interval_s,
+        min_track_age_frames: cfg.min_track_age_frames,
+        cameras,
+    })
+}
+
+// ===========================================================================
 // M2.2 closeout — OAuth auth-code dance for cloud cold backends.
 //
 // The three handlers below replace the previous "register an OAuth
@@ -5659,6 +5746,13 @@ mod tests {
             // tunnel, so a fresh outbox just reports
             // `is_connected() == false` forever.
             cloud_outbox: Arc::new(nexus_cloud_client::TunnelOutbox::new()),
+            // Phase 5.6 · R7 — unit tests don't drive the re-ID
+            // worker; a default-constructed ReidConfig + empty
+            // stats registry is the documented "feature off" form
+            // and exercises the same code paths as a real
+            // operator who left `[reid]` defaulted.
+            reid_config: Arc::new(nexus_config::ReidConfig::default()),
+            reid_stats: Arc::new(crate::cloud_sighting::ReidStatsRegistry::new()),
         };
         let app = super::router(state);
         (app, store, dir)

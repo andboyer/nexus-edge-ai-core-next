@@ -19,6 +19,7 @@ import { RouteErrorBoundary } from "@/components/RouteErrorBoundary";
 import { AdminAuditPage } from "@/pages/admin-audit";
 import { AdminAuthPage } from "@/pages/admin-auth";
 import { AdminDiagnosticsPage } from "@/pages/admin-diagnostics";
+import { AdminReidPage } from "@/pages/admin-reid";
 import { AdminNetworkPage } from "@/pages/admin-network";
 import { AdminServerPage } from "@/pages/admin-server";
 import { AdminUsersPage } from "@/pages/admin-users";
@@ -264,6 +265,12 @@ const adminDiagnosticsRoute = createRoute({
   component: AdminDiagnosticsPage,
 });
 
+const adminReidRoute = createRoute({
+  getParentRoute: () => appRoute,
+  path: "/admin/reid",
+  component: AdminReidPage,
+});
+
 // ---------------------------------------------------------------------------
 // Compose tree + export router.
 // ---------------------------------------------------------------------------
@@ -292,6 +299,7 @@ const routeTree = rootRoute.addChildren([
     adminNetworkRoute,
     adminAuthRoute,
     adminDiagnosticsRoute,
+    adminReidRoute,
   ]),
 ]);
 

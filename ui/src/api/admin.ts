@@ -270,6 +270,35 @@ export function putWatermarks(low_pct: number, panic_pct: number) {
 }
 
 
+// --- Phase 5.6 · R7 — re-identification local diagnostic -----------------
+//
+// `GET /v1/admin/reid/status` pairs the boot-time `[reid]` config
+// with live per-camera emit counters drawn from the worker's stats
+// registry. Used by `/admin/reid` to answer "is the re-ID worker
+// actually firing for this camera right now?" — drives the field
+// dogfood workflow on edge boxes.
+
+export interface ReidCameraStatusRow {
+  camera_id: number;
+  emit_count: number;
+  last_emit_at: string | null;
+  last_embedding_hex8: string;
+}
+
+export interface ReidStatusResponse {
+  enabled: boolean;
+  model_id: string;
+  dim: number;
+  emit_interval_s: number;
+  min_track_age_frames: number;
+  cameras: ReidCameraStatusRow[];
+}
+
+export function getReidStatus() {
+  return api.get<ReidStatusResponse>("/v1/admin/reid/status");
+}
+
+
 // --- Default inference model (M-Admin Phase 0 follow-up, restart-based) ---
 
 export interface InferenceModelView {

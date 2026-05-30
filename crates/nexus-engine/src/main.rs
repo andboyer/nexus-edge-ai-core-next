@@ -638,13 +638,24 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
             Vec::new()
         }
     };
+    // Phase 5.6 · R7 — per-camera re-ID stats registry shared
+    // with the worker (writer) and the `/v1/admin/reid/status`
+    // admin endpoint (reader). Always built, even when reid is
+    // disabled, so the API surface is shape-stable; an empty
+    // snapshot is what the UI uses to render "feature is off".
+    let reid_stats = Arc::new(cloud_sighting::ReidStatsRegistry::new());
+
     let (sighting_hook, sighting_cfg): (
         Arc<dyn nexus_pipeline::SightingHook>,
         nexus_pipeline::supervisor::SightingSchedulerConfig,
     ) = if cfg.reid.enabled {
         let extractor = build_reid_extractor(&cfg.reid);
-        let hook =
-            cloud_sighting::CloudEntitySightingHook::spawn(extractor, cloud_outbox.clone(), 64);
+        let hook = cloud_sighting::CloudEntitySightingHook::spawn(
+            extractor,
+            cloud_outbox.clone(),
+            64,
+            reid_stats.clone(),
+        );
         let scheduler_cfg = nexus_pipeline::supervisor::SightingSchedulerConfig {
             min_track_age_frames: cfg.reid.min_track_age_frames,
             emit_interval: std::time::Duration::from_secs(cfg.reid.emit_interval_s),
@@ -1181,6 +1192,11 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
         // on every disconnect path, so `is_connected()` tracks the
         // live state without any extra plumbing.
         cloud_outbox: cloud_outbox.clone(),
+        // Phase 5.6 · R7 — boot-time [reid] config snapshot +
+        // shared per-camera stats registry the worker bumps on
+        // every successful extract. Drive `/v1/admin/reid/status`.
+        reid_config: Arc::new(cfg.reid.clone()),
+        reid_stats: reid_stats.clone(),
     };
 
     // M-Admin Phase 1B — start the registry eviction sweep. Holds
