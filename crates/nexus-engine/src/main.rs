@@ -1834,10 +1834,19 @@ fn build_gst_recorder(
             .map(|m| m.input_width)
             .unwrap_or(default_detector_width);
         let (rgb_w, rgb_h) = nexus_pipeline::supervisor_frame_for(det_w);
+        let codec = cam.ingest.codec.unwrap_or_else(|| {
+            tracing::warn!(
+                camera_id = cam.id,
+                url = %cam.ingest.url,
+                "camera codec unspecified; defaulting to h264 — set `ingest.codec` in the camera config to silence"
+            );
+            nexus_types::CodecKind::H264
+        });
         match nexus_pipeline::PreRollIngester::new_with_rgb(
             cam.id,
             cam.ingest.url.to_string(),
             pre_roll_secs,
+            codec,
             cam.ingest.max_fps,
             rgb_w,
             rgb_h,
