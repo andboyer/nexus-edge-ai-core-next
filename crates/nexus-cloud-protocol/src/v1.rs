@@ -2,7 +2,7 @@
 // Regenerate with `cargo xtask gen-proto` from proto/v1.json.
 //
 // Source schema: Nexus edge↔cloud wire protocol
-// Canonical schema for v1 of the wire envelope. Message kinds: heartbeat, heartbeat_ack, alert, alert_ack, clip_replicated, clip_replicated_ack, entitlement_update, rpc_call, rpc_response, close_session, camera_roster, camera_roster_ack. HUMAN-EDITED source of truth. Rust types live in proto/generated/rust/v1.rs; TypeScript zod schemas in proto/generated/ts/v1.ts. `cargo xtask gen-proto` regenerates both; CI fails if they're stale.
+// Canonical schema for v1 of the wire envelope. Message kinds: heartbeat, heartbeat_ack, alert, alert_ack, clip_replicated, clip_replicated_ack, entitlement_update, rpc_call, rpc_response, close_session, camera_roster, camera_roster_ack, entity_sighting. HUMAN-EDITED source of truth. Rust types live in proto/generated/rust/v1.rs; TypeScript zod schemas in proto/generated/ts/v1.ts. `cargo xtask gen-proto` regenerates both; CI fails if they're stale.
 
 use serde::{Deserialize, Serialize};
 
@@ -182,6 +182,36 @@ pub struct EntitlementUpdatePayload {
     pub jwt: String,
 }
 
+/// Edge → Cloud. Phase 5 (additive on v=1). Appearance-embedding sighting for the identity-graph linker. Sent at first-detection per stable track + every 5 s while alive. `embedding_b64` is base64 of little-endian float32[embedding_dim]; allowed `embedding_model` values are `dinov2-s-v1` (384 dims) and `osnet-x1.0-v1` (512 dims). `entity_local_id` is the engine's per-track UUIDv7 — the cloud assigns the cross-camera `entity_global_id` via the pgvector linker. `bbox` is in the supervisor frame; `frame_w/frame_h` carry those dims so the cloud can scale to native MP4 resolution when overlaying. **Hard invariant per REPO_BOUNDARY R9:** appearance embeddings only; the gateway rejects envelopes whose `embedding_model` matches a face-recognition model name (`AdaFace`, `ArcFace`, `InsightFace`, `Buffalo`, `FaceNet`, `SphereFace`, `CosFace`, `MagFace`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EntitySightingPayload {
+    /// [x, y, w, h] absolute pixel coords in the supervisor frame (see `frame_w` / `frame_h`).
+    pub bbox: Vec<u64>,
+    /// Per-core integer id (matches cameras.edge_camera_id).
+    pub camera_id: u64,
+    /// Detector confidence for the track at this sighting.
+    pub confidence: f64,
+    /// Base64 of `float32[embedding_dim]` in little-endian. Length must equal `ceil(4 * embedding_dim / 3) * 4` after padding.
+    pub embedding_b64: String,
+    /// Must agree with `embedding_model`: 384 for `dinov2-s-v1`, 512 for `osnet-x1.0-v1`. Cloud rejects with `embedding_dim_mismatch` otherwise.
+    pub embedding_dim: i64,
+    /// Free-form on the wire but constrained to the cloud's allowlist; unknown values are rejected with `embedding_model_unknown`. Face-recognition model names are rejected with `embedding_face_model_rejected` (REPO_BOUNDARY R9).
+    pub embedding_model: String,
+    /// Stable per-track id (engine UUIDv7). Two sightings with the same `(core_id, entity_local_id)` are the same track on the edge; the cloud uses it as the dedup key and to follow a track across re-sends.
+    pub entity_local_id: String,
+    /// Supervisor frame height (typically 540 for RTSP sources).
+    pub frame_h: u64,
+    /// Supervisor frame width (typically 960 for RTSP sources — see `RTSP_SOURCE_FRAME_WIDTH` in the engine).
+    pub frame_w: u64,
+    /// True for the first envelope emitted for this (core_id, entity_local_id); false for periodic re-sends.
+    pub is_first_sighting: bool,
+    /// Edge wall-clock of the FIRST frame the track was observed on.
+    pub started_ts: Timestamp,
+    /// Edge wall-clock of THIS sighting (== started_ts for the first envelope, > started_ts for periodic re-sends).
+    pub ts: Timestamp,
+}
+
 /// Cloud → Edge. Reply to a heartbeat. May hint at cert rotation after day 75.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -310,6 +340,7 @@ pub enum EnvelopeBody {
     CloseSession(CloseSessionPayload),
     CameraRoster(CameraRosterPayload),
     CameraRosterAck(CameraRosterAckPayload),
+    EntitySighting(EntitySightingPayload),
 }
 
 /// One WebSocket text frame on the wire. See the schema header for invariants.

@@ -11,7 +11,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use nexus_cloud_protocol::v1::{
-    AlertPayload, ClipReplicatedPayload, Envelope, EnvelopeBody, EnvelopeMeta,
+    AlertPayload, ClipReplicatedPayload, EntitySightingPayload, Envelope, EnvelopeBody,
+    EnvelopeMeta,
 };
 use uuid::Uuid;
 
@@ -97,6 +98,34 @@ impl CloudConsoleSink {
         let envelope = build_clip_replicated_envelope(clip);
         self.tunnel.send(envelope).await
     }
+
+    /// Publish one appearance-embedding sighting from the per-camera
+    /// tracker. Phase 5.6 4c-i: pairs with the cloud-side
+    /// `services/edge-gateway/src/entity_sighting.rs` ingester and
+    /// migration `db/migrations/0035_entity_sightings.sql`.
+    ///
+    /// Per AGENTS.md rule 7 and `WIRE_PROTOCOL.md` §4 / `REPO_BOUNDARY.md`
+    /// R9 the cloud gateway rejects payloads whose `embedding_model`
+    /// matches a face-recognition brand or whose `embedding_dim`
+    /// disagrees with the model. Build the projection from
+    /// [`nexus_reid::Extractor::model_id`] + [`nexus_reid::Embedding::dim`]
+    /// to guarantee both fields stay in lockstep — see
+    /// [`build_entity_sighting_envelope`] for the validation that
+    /// happens inside the projection.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TunnelError`] from the underlying handle (most
+    /// commonly `Disconnected` when the WSS tunnel is currently down
+    /// — the pipeline supervisor logs and continues; the next live
+    /// sighting will retry on its own cadence).
+    pub async fn publish_entity_sighting(
+        &self,
+        sighting: EntitySightingProjection,
+    ) -> Result<(), TunnelError> {
+        let envelope = build_entity_sighting_envelope(sighting);
+        self.tunnel.send(envelope).await
+    }
 }
 
 /// Pure-function projection. Public so engine tests can construct
@@ -135,6 +164,10 @@ trait _SinkContract: Send + Sync {
     async fn publish_clip_replicated(
         &self,
         clip: ClipReplicatedProjection,
+    ) -> Result<(), TunnelError>;
+    async fn publish_entity_sighting(
+        &self,
+        sighting: EntitySightingProjection,
     ) -> Result<(), TunnelError>;
 }
 
@@ -205,6 +238,116 @@ pub fn build_clip_replicated_envelope(clip: ClipReplicatedProjection) -> Envelop
             trace: None,
         },
         body: EnvelopeBody::ClipReplicated(payload),
+    }
+}
+
+/// Edge-side projection of an appearance-embedding sighting as the
+/// sink expects it. Mirrors [`AlertProjection`] / [`ClipReplicatedProjection`]
+/// in shape; the engine pipeline supervisor builds one of these per
+/// stable track at first-detection + every 5 s while alive, then hands
+/// it to [`CloudConsoleSink::publish_entity_sighting`].
+///
+/// Phase 5.6 · slice 4c-i.
+///
+/// # Wire-shape invariants
+///
+/// * `embedding_model` MUST match the cloud's allowlist
+///   (`dinov2-s-v1`, `osnet-x1.0-v1` as of v1). Anything else is
+///   rejected by the gateway with `embedding_model_unknown`; mock
+///   model ids (e.g. `mock_dinov2_s_224` produced by
+///   [`nexus_reid::MockExtractor::default`]) should NOT be published
+///   — the engine pipeline supervisor is responsible for skipping
+///   emission when the extractor is a mock.
+/// * `embedding_dim` MUST equal the actual length of the f32 slice
+///   that was base64'd into `embedding_b64`; the cloud cross-checks
+///   the dimension against the model.
+/// * `bbox` is `[x, y, w, h]` in **supervisor frame coords**
+///   (typically 960×540 on RTSP sources — see
+///   `RTSP_SOURCE_FRAME_WIDTH` in `nexus-pipeline::source`). The
+///   accompanying `frame_w` / `frame_h` carry the actual supervisor
+///   dimensions so the cloud can scale to native MP4 resolution when
+///   overlaying.
+/// * Coordinates and dimensions are clamped to `u64` at projection
+///   time — negative bbox values from upstream are saturated to 0,
+///   matching the JSON Schema `minimum: 0` constraint.
+#[derive(Debug, Clone)]
+pub struct EntitySightingProjection {
+    /// Per-core integer id (matches `cameras.edge_camera_id`).
+    pub camera_id: u64,
+    /// Stable per-track id (UUIDv7 minted on the edge). Two sightings
+    /// sharing `(core_id, entity_local_id)` are the same track; the
+    /// cloud uses this as the dedup key and to follow a track across
+    /// re-sends. Capped at 64 bytes per the JSON Schema.
+    pub entity_local_id: String,
+    /// Raw L2-normalised float32 embedding in little-endian wire
+    /// order. Length MUST equal `embedding_model`'s declared
+    /// dimension (384 for `dinov2-s-v1`, 512 for `osnet-x1.0-v1`).
+    /// `build_entity_sighting_envelope` base64-encodes this verbatim.
+    pub embedding: Vec<f32>,
+    /// Model id string from [`nexus_reid::Extractor::model_id`]. MUST
+    /// match the cloud's allowlist — see struct-level docs.
+    pub embedding_model: String,
+    /// Bbox `[x, y, w, h]` in supervisor-frame pixel coords. Signed
+    /// inputs are saturated to `0..=u64::MAX` at projection time.
+    pub bbox: [i64; 4],
+    /// Detector confidence at this sighting, 0..=1.
+    pub confidence: f64,
+    /// Supervisor frame width (typically 960 for RTSP sources).
+    pub frame_w: u64,
+    /// Supervisor frame height (typically 540 for RTSP sources).
+    pub frame_h: u64,
+    /// Wall-clock of the FIRST frame this track was observed on.
+    pub started_ts: DateTime<Utc>,
+    /// Wall-clock of THIS sighting. Equals `started_ts` for the
+    /// first envelope, `>started_ts` for periodic re-sends.
+    pub ts: DateTime<Utc>,
+    /// `true` for the first envelope emitted for this track,
+    /// `false` for every periodic re-send.
+    pub is_first_sighting: bool,
+}
+
+/// Pure-function projection. Public so engine tests can construct
+/// reference envelopes without instantiating a sink.
+///
+/// Phase 5.6 · slice 4c-i.
+#[must_use]
+pub fn build_entity_sighting_envelope(sighting: EntitySightingProjection) -> Envelope {
+    let embedding_dim = sighting.embedding.len() as i64;
+    let mut bytes = Vec::with_capacity(sighting.embedding.len() * 4);
+    for v in &sighting.embedding {
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    use base64::Engine as _;
+    let embedding_b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    let bbox: Vec<u64> = sighting
+        .bbox
+        .iter()
+        .map(|v| u64::try_from(*v).unwrap_or(0))
+        .collect();
+    let payload = EntitySightingPayload {
+        bbox,
+        camera_id: sighting.camera_id,
+        confidence: sighting.confidence,
+        embedding_b64,
+        embedding_dim,
+        embedding_model: sighting.embedding_model,
+        entity_local_id: sighting.entity_local_id,
+        frame_h: sighting.frame_h,
+        frame_w: sighting.frame_w,
+        is_first_sighting: sighting.is_first_sighting,
+        started_ts: sighting.started_ts.to_rfc3339(),
+        ts: sighting.ts.to_rfc3339(),
+    };
+    Envelope {
+        meta: EnvelopeMeta {
+            v: 1,
+            id: Uuid::now_v7().to_string(),
+            ts: Utc::now().to_rfc3339(),
+            in_reply_to: None,
+            seq: None,
+            trace: None,
+        },
+        body: EnvelopeBody::EntitySighting(payload),
     }
 }
 
@@ -290,6 +433,86 @@ mod tests {
                 assert_eq!(p.started_at, started_at.to_rfc3339());
             }
             other => panic!("expected ClipReplicated, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn publish_entity_sighting_builds_v1_envelope() {
+        let tunnel = Arc::new(CapturingTunnel {
+            last: parking_lot::Mutex::new(None),
+        });
+        let sink = CloudConsoleSink::new(tunnel.clone());
+        let started_ts = Utc::now();
+        let embedding = vec![0.1f32, 0.2, -0.3, 0.5];
+        sink.publish_entity_sighting(EntitySightingProjection {
+            camera_id: 3,
+            entity_local_id: "0192d3c2-7c4f-7000-8000-000000000001".into(),
+            embedding: embedding.clone(),
+            embedding_model: "dinov2-s-v1".into(),
+            bbox: [10, 20, 100, 200],
+            confidence: 0.87,
+            frame_w: 960,
+            frame_h: 540,
+            started_ts,
+            ts: started_ts,
+            is_first_sighting: true,
+        })
+        .await
+        .expect("send");
+        let captured = tunnel.last.lock().clone().expect("captured envelope");
+        assert_eq!(captured.meta.v, 1);
+        match captured.body {
+            EnvelopeBody::EntitySighting(p) => {
+                assert_eq!(p.camera_id, 3);
+                assert_eq!(p.embedding_model, "dinov2-s-v1");
+                assert_eq!(p.embedding_dim, 4);
+                assert_eq!(p.bbox, vec![10u64, 20, 100, 200]);
+                assert!(p.is_first_sighting);
+                assert_eq!(p.frame_w, 960);
+                assert_eq!(p.frame_h, 540);
+                assert!((p.confidence - 0.87).abs() < 1e-9);
+                // round-trip the embedding through base64 and confirm
+                // we got the same float32-little-endian bytes back
+                use base64::Engine as _;
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(p.embedding_b64.as_bytes())
+                    .expect("base64 decodes");
+                assert_eq!(bytes.len(), embedding.len() * 4);
+                for (i, v) in embedding.iter().enumerate() {
+                    let mut le = [0u8; 4];
+                    le.copy_from_slice(&bytes[i * 4..i * 4 + 4]);
+                    assert_eq!(f32::from_le_bytes(le).to_bits(), v.to_bits());
+                }
+            }
+            other => panic!("expected EntitySighting, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_entity_sighting_envelope_clamps_negative_bbox_to_zero() {
+        let env = build_entity_sighting_envelope(EntitySightingProjection {
+            camera_id: 1,
+            entity_local_id: "t1".into(),
+            embedding: vec![0.0f32; 384],
+            embedding_model: "dinov2-s-v1".into(),
+            // Negative inputs are saturated to 0 to keep the JSON
+            // Schema `minimum: 0` invariant on the bbox array
+            // honoured at the wire boundary.
+            bbox: [-5, -1, 10, 20],
+            confidence: 0.5,
+            frame_w: 960,
+            frame_h: 540,
+            started_ts: Utc::now(),
+            ts: Utc::now(),
+            is_first_sighting: false,
+        });
+        match env.body {
+            EnvelopeBody::EntitySighting(p) => {
+                assert_eq!(p.bbox, vec![0u64, 0, 10, 20]);
+                assert_eq!(p.embedding_dim, 384);
+                assert!(!p.is_first_sighting);
+            }
+            other => panic!("expected EntitySighting, got {other:?}"),
         }
     }
 }
