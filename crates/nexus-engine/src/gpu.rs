@@ -946,6 +946,50 @@ mod intel {
             other => format!("Intel integrated graphics ({other})"),
         }
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::read_event_config;
+        use std::io::Write;
+
+        fn write_sysfs(content: &str) -> tempfile::NamedTempFile {
+            let mut f = tempfile::NamedTempFile::new().expect("tempfile");
+            f.write_all(content.as_bytes()).expect("write");
+            f
+        }
+
+        #[test]
+        fn parses_event_prefix_used_by_cpu_and_uncore_pmus() {
+            let f = write_sysfs("event=0x2a\n");
+            assert_eq!(read_event_config(f.path()), Some(0x2a));
+        }
+
+        #[test]
+        fn parses_config_prefix_used_by_i915_pmu() {
+            // Real samples captured on an Alder Lake-P Iris Xe
+            // running kernel 6.17; this is the form that broke
+            // utilization sampling before the parser was widened.
+            for (raw, want) in [
+                ("config=0x0\n", 0x0),
+                ("config=0x1000\n", 0x1000),
+                ("config=0x2010\n", 0x2010),
+                ("config=0x3000\n", 0x3000),
+            ] {
+                let f = write_sysfs(raw);
+                assert_eq!(
+                    read_event_config(f.path()),
+                    Some(want),
+                    "failed to parse {raw:?}",
+                );
+            }
+        }
+
+        #[test]
+        fn returns_none_when_no_recognised_prefix_present() {
+            let f = write_sysfs("umask=0xff,inv=1\n");
+            assert_eq!(read_event_config(f.path()), None);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
