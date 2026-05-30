@@ -937,7 +937,9 @@ mod intel {
             // Raptor Lake-S UHD (T24 family / N305 etc.)
             "0xa780" | "0xa781" | "0xa782" | "0xa783" => "Intel UHD Graphics 770".to_string(),
             // Iris Xe — Tiger Lake / Alder Lake-P
-            "0x9a40" | "0x9a49" | "0x9a78" | "0x9ac0" | "0x9ac9" => {
+            // (0x46a6 is Alder Lake-P GT2 — GMKTec NucBox M3
+            // and similar 12th-gen Intel mini-PCs.)
+            "0x9a40" | "0x9a49" | "0x9a78" | "0x9ac0" | "0x9ac9" | "0x46a6" => {
                 "Intel Iris Xe Graphics".to_string()
             }
             // Arc A-series (T36)

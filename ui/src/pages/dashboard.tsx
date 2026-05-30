@@ -18,6 +18,7 @@ import {
   AlertTriangle,
   Camera,
   Cpu,
+  Gauge,
   HardDrive,
   HeartPulse,
   MemoryStick,
@@ -101,6 +102,13 @@ export function DashboardPage() {
           Math.max(1, metricsQuery.data.memory.total_bytes)) *
           100
       : null,
+  );
+  // GPU utilization (Intel i915/xe PMU, NVIDIA NVML, or Apple
+  // Silicon). `null` until the engine reports a non-null reading,
+  // which keeps the sparkline empty on hosts with no GPU or while
+  // the PMU baseline is warming up after engine restart.
+  const gpuBuf = useRollingBuffer(
+    metricsQuery.data?.gpu?.utilization_pct ?? null,
   );
 
   const eventsLastHour = useMemo(() => {
@@ -263,7 +271,12 @@ export function DashboardPage() {
       </div>
 
       {/* System sparklines ---------------------------------------- */}
-      <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
+      <div
+        className={cn(
+          "grid grid-cols-1 gap-6",
+          metricsQuery.data?.gpu ? "lg:grid-cols-4" : "lg:grid-cols-3",
+        )}
+      >
         <SystemSparkCard
           icon={<Cpu className="h-4 w-4" />}
           title="CPU"
@@ -288,6 +301,21 @@ export function DashboardPage() {
               : ""
           }
         />
+        {metricsQuery.data?.gpu && (
+          <SystemSparkCard
+            icon={<Gauge className="h-4 w-4" />}
+            title="GPU"
+            values={gpuBuf}
+            max={100}
+            primary={
+              metricsQuery.data.gpu.utilization_pct !== null &&
+              metricsQuery.data.gpu.utilization_pct !== undefined
+                ? `${metricsQuery.data.gpu.utilization_pct.toFixed(0)}%`
+                : "—"
+            }
+            secondary={metricsQuery.data.gpu.name}
+          />
+        )}
         <Card>
           <CardHeader>
             <CardTitle className="flex items-center gap-2 text-base">
