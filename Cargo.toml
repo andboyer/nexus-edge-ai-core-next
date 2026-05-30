@@ -70,6 +70,16 @@ clap = { version = "4", features = ["derive", "env"] }
 
 # HTTP
 axum = { version = "0.8", features = ["macros", "multipart", "ws"] }
+# TLS-aware HTTP listener for the engine UI on :443 (M-HTTPS Phase 1).
+# We already pull tokio-rustls + rustls-pemfile + rustls-pki-types for
+# the cloud tunnel; axum-server's `tls-rustls` feature reuses the same
+# rustls stack and exposes the same `axum::Router` we already build,
+# so the only delta from plain `axum::serve` is the TLS handshake +
+# the ability to atomically swap the cert config at runtime
+# (via `axum_server::tls_rustls::RustlsConfig::reload_from_pem`).
+axum-server = { version = "0.7", default-features = false, features = [
+    "tls-rustls-no-provider",
+] }
 tower = "0.5"
 tower-http = { version = "0.6", features = [
     "cors",

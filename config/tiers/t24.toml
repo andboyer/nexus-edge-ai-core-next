@@ -27,6 +27,15 @@ mode = "local"
 api_bind = "0.0.0.0:8089"
 ui_bind = "0.0.0.0:80"
 ui_root = "/usr/share/nexus/ui"
+# M-HTTPS Phase 1 — in-process TLS listener for the engine UI.
+# `nexus-engine tls init` mints a self-signed leaf on first boot;
+# Phase 3 cloud enrollment will overwrite with a cloud-issued leaf.
+# With `redirect_http_to_https = true` (default), the `ui_bind`
+# listener returns 308 to `https://<host>/<path>` so existing
+# `http://nexus/` bookmarks land on TLS automatically.
+https_bind = "0.0.0.0:443"
+tls_cert_path = "/etc/nexus/tls/cert.pem"
+tls_key_path  = "/etc/nexus/tls/key.pem"
 
 [store]
 url = "sqlite:///var/lib/nexus/nexus.db?mode=rwc"

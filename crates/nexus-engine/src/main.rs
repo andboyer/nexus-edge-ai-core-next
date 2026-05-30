@@ -52,6 +52,7 @@ mod system_metrics;
 #[cfg(feature = "test-injection")]
 mod test_inject;
 mod time_sync;
+mod tls;
 mod usb_watch;
 mod visual_prompts_admin;
 
@@ -145,6 +146,35 @@ enum Cmd {
     /// Reads the plaintext from stdin (one line) or from
     /// `--password-file <PATH>`.
     SetAdminPassword(admin_cli::SetAdminPasswordArgs),
+
+    /// TLS material management for the engine's in-process HTTPS
+    /// listener (M-HTTPS Phase 1). Subcommands:
+    /// `init` — generate a self-signed leaf at the configured
+    /// `tls_cert_path` / `tls_key_path` if none exists. Idempotent
+    /// unless `--force` is passed. Called by the installer on
+    /// first boot so an upgraded appliance is HTTPS-ready without
+    /// operator action.
+    #[command(subcommand)]
+    Tls(TlsCmd),
+}
+
+#[derive(Debug, Subcommand)]
+enum TlsCmd {
+    /// Generate a self-signed TLS leaf at
+    /// `cfg.server.tls_cert_path` / `cfg.server.tls_key_path` if
+    /// no PEM is present. SAN list covers the system hostname,
+    /// `<hostname>.local`, `nexus.local`, `localhost`, every
+    /// non-loopback IPv4/IPv6 on a local interface, plus
+    /// `127.0.0.1` / `::1`. Owner mode `0644` for the cert,
+    /// `0640` for the key (root:nexus assumed via systemd).
+    Init {
+        /// Regenerate the leaf even when valid PEM is already on
+        /// disk. Default behaviour preserves the existing pair
+        /// so operator-installed or cloud-issued certs are not
+        /// trampled by a subsequent install run.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 impl Cli {
@@ -226,6 +256,7 @@ fn main() -> Result<()> {
         return match cmd {
             Cmd::Enroll(args) => runtime.block_on(cloud_enroll::run_enroll(&cfg, args)),
             Cmd::SetAdminPassword(args) => runtime.block_on(admin_cli::run(&cfg, args)),
+            Cmd::Tls(TlsCmd::Init { force }) => run_tls_init(&cfg, *force),
         };
     }
 
@@ -1274,6 +1305,78 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
         };
         api_state.current_ui_bind = effective_ui_bind.clone();
         let app = api::router(api_state);
+
+        // ----------------------------------------------------------
+        // M-HTTPS Phase 1 — optional in-process TLS listener.
+        //
+        // When `[server].https_bind` + `tls_cert_path` + `tls_key_path`
+        // are all set, we spin a third listener that terminates TLS
+        // using rustls (ring provider) and serves the SAME router
+        // as `api_bind` / `ui_bind`. The `ui_bind` listener becomes
+        // a 308-redirect shim when `redirect_http_to_https = true`
+        // (the default), so an operator's bookmarked
+        // `http://nexus/dashboard` arrives at
+        // `https://nexus/dashboard` without manual intervention.
+        //
+        // Cert load failure does NOT block boot — the engine falls
+        // back to plain HTTP on `api_bind` (+ `ui_bind` without
+        // redirect) and logs loudly, so operators who haven't run
+        // `nexus-engine tls init` yet still get a working appliance.
+        // ----------------------------------------------------------
+        struct TlsListener {
+            bind: String,
+            addr: std::net::SocketAddr,
+            rustls: axum_server::tls_rustls::RustlsConfig,
+            cert_path: std::path::PathBuf,
+            key_path: std::path::PathBuf,
+        }
+        let tls_listener: Option<TlsListener> = match (
+            cfg.server.https_bind.as_deref(),
+            cfg.server.tls_cert_path.as_deref(),
+            cfg.server.tls_key_path.as_deref(),
+        ) {
+            (Some(b), Some(cert), Some(key)) => match b.parse::<std::net::SocketAddr>() {
+                Ok(addr) => match tls::load_rustls_config(cert, key).await {
+                    Ok(rc) => Some(TlsListener {
+                        bind: b.to_string(),
+                        addr,
+                        rustls: rc,
+                        cert_path: cert.to_path_buf(),
+                        key_path: key.to_path_buf(),
+                    }),
+                    Err(e) => {
+                        tracing::error!(
+                            bind = %b,
+                            cert = %cert.display(),
+                            key = %key.display(),
+                            error = %e,
+                            "TLS cert load failed; HTTPS listener disabled, plain HTTP only",
+                        );
+                        None
+                    }
+                },
+                Err(e) => {
+                    tracing::error!(
+                        bind = %b,
+                        error = %e,
+                        "https_bind is not a valid host:port; HTTPS listener disabled",
+                    );
+                    None
+                }
+            },
+            (Some(b), _, _) => {
+                tracing::warn!(
+                    bind = %b,
+                    "https_bind set but tls_cert_path / tls_key_path missing; HTTPS listener disabled (run `nexus-engine tls init`)",
+                );
+                None
+            }
+            _ => None,
+        };
+        if tls_listener.is_some() {
+            tls::install_default_crypto_provider();
+        }
+
         let listener = tokio::net::TcpListener::bind(&bind).await?;
         info!(bind = %bind, "HTTP API + UI listening");
         // `into_make_service_with_connect_info::<SocketAddr>()`
@@ -1293,23 +1396,74 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
                 }
             }
         });
+
+        // HTTPS listener (TLS termination in-process).
+        let cert_watcher_token = tokio_util::sync::CancellationToken::new();
+        let (https_server, cert_watcher) = if let Some(t) = tls_listener.as_ref() {
+            let mut tls_app = app.clone();
+            if let Some(max_age) = cfg.server.hsts_max_age_seconds {
+                let hsts_value = format!("max-age={max_age}; includeSubDomains");
+                tls_app = tls_app.layer(axum::middleware::from_fn(
+                    move |req: axum::extract::Request, next: axum::middleware::Next| {
+                        let v = hsts_value.clone();
+                        async move {
+                            let mut resp = next.run(req).await;
+                            if let Ok(h) = axum::http::HeaderValue::from_str(&v) {
+                                resp.headers_mut().insert("strict-transport-security", h);
+                            }
+                            resp
+                        }
+                    },
+                ));
+            }
+            info!(bind = %t.bind, "HTTPS API + UI listening (TLS)");
+            let addr = t.addr;
+            let rustls = t.rustls.clone();
+            let handle = tokio::spawn(async move {
+                if let Err(e) = axum_server::bind_rustls(addr, rustls)
+                    .serve(tls_app.into_make_service_with_connect_info::<std::net::SocketAddr>())
+                    .await
+                {
+                    tracing::error!("axum-server error (https): {e}");
+                }
+            });
+            let watcher = tls::spawn_cert_watcher(
+                t.rustls.clone(),
+                t.cert_path.clone(),
+                t.key_path.clone(),
+                cert_watcher_token.clone(),
+            );
+            (Some(handle), Some(watcher))
+        } else {
+            (None, None)
+        };
+
         // Optional second listener so operators can reach the admin
         // console at e.g. `http://<host>/` (port 80) without typing
-        // the engine port. Same router, same auth, same TLS posture
-        // — it is purely a second TCP bind on top of the existing
-        // app. Configured via `[server].ui_bind` in nexus.toml
-        // and overridable via the admin surface (resolved into
-        // `effective_ui_bind` above). Binding <1024 on the
-        // bare-metal systemd unit needs `CAP_NET_BIND_SERVICE`;
-        // Docker already has it.
+        // the engine port. When the HTTPS listener is up AND the
+        // operator hasn't opted out via `redirect_http_to_https =
+        // false`, this becomes a 308 redirect shim instead of a
+        // second copy of the app. Binding <1024 on the bare-metal
+        // systemd unit needs `CAP_NET_BIND_SERVICE`; Docker already
+        // has it.
         let ui_server = if let Some(ui_bind) = effective_ui_bind {
             match tokio::net::TcpListener::bind(&ui_bind).await {
                 Ok(ui_listener) => {
-                    info!(bind = %ui_bind, "HTTP UI alias listening");
+                    let redirect_mode = tls_listener.is_some() && cfg.server.redirect_http_to_https;
+                    let app_for_ui = if redirect_mode {
+                        let https_port =
+                            tls_listener.as_ref().map(|t| t.addr.port()).unwrap_or(443);
+                        info!(bind = %ui_bind, https_port = https_port, "HTTP UI listening as 308 → HTTPS redirector");
+                        tls::redirect_router(https_port)
+                    } else {
+                        info!(bind = %ui_bind, "HTTP UI alias listening");
+                        app.clone()
+                    };
                     Some(tokio::spawn(async move {
                         if let Err(e) = axum::serve(
                             ui_listener,
-                            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                            app_for_ui
+                                .into_make_service_with_connect_info::<std::net::SocketAddr>(),
                         )
                         .await
                         {
@@ -1332,6 +1486,13 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
         wait_for_signal().await;
         info!("shutdown signal received");
         server.abort();
+        cert_watcher_token.cancel();
+        if let Some(h) = https_server {
+            h.abort();
+        }
+        if let Some(h) = cert_watcher {
+            let _ = h.await;
+        }
         if let Some(h) = ui_server {
             h.abort();
         }
@@ -1361,6 +1522,38 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
     // above so nothing will re-populate it.
     for (_, entry) in running.lock().drain() {
         entry.task.abort();
+    }
+    Ok(())
+}
+
+/// One-shot helper for `nexus-engine tls init`. Mints a self-signed
+/// leaf at the configured `tls_cert_path` / `tls_key_path` if none
+/// is present (or unconditionally when `force == true`). Exits with
+/// a clear error when those paths aren't set in `nexus.toml`, so
+/// the installer's invocation surfaces config-vs-code drift loudly.
+fn run_tls_init(cfg: &Config, force: bool) -> Result<()> {
+    let cert = cfg
+        .server
+        .tls_cert_path
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("[server].tls_cert_path is not set in nexus.toml"))?;
+    let key = cfg
+        .server
+        .tls_key_path
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("[server].tls_key_path is not set in nexus.toml"))?;
+    let regenerated = tls::init_self_signed_cert(cert, key, force)?;
+    if regenerated {
+        eprintln!(
+            "nexus-engine tls init: wrote self-signed leaf to {} / {}",
+            cert.display(),
+            key.display()
+        );
+    } else {
+        eprintln!(
+            "nexus-engine tls init: existing cert preserved at {} (pass --force to regenerate)",
+            cert.display()
+        );
     }
     Ok(())
 }

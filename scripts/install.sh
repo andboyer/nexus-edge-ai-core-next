@@ -372,6 +372,26 @@ elif [[ -e "$DB_PATH" ]]; then
     log "existing $DB_PATH detected; preserving any existing admin user(s)"
 fi
 
+# --- TLS bootstrap (M-HTTPS Phase 1) -----------------------------------------
+#
+# If the loaded tier config declares an `https_bind` listener, mint
+# a self-signed leaf at the configured cert/key paths when none is
+# already present. Idempotent: subsequent installs preserve any
+# existing PEM (operator-installed or cloud-issued). Failure is
+# loud but non-fatal — the engine starts in plain-HTTP mode if
+# the cert is missing, so a bug here can't brick the appliance.
+if grep -q '^https_bind' "$NEXUS_CONFIG_DIR/nexus.toml" 2>/dev/null; then
+    log "tier config has [server].https_bind set; ensuring TLS material is present"
+    # Run as root: /etc/nexus/tls/ is root:nexus 2750 so the
+    # service user can read the PEMs (key is 0640) but not
+    # write into the directory. The cert PEM (0644) and key
+    # PEM (0640) inherit the nexus group via the setgid bit.
+    if ! "$RELEASE_DIR/bin/nexus-engine" tls init \
+            --config "$NEXUS_CONFIG_DIR/nexus.toml"; then
+        warn "tls init failed; engine will fall back to plain HTTP. Re-run as root: nexus-engine tls init --config $NEXUS_CONFIG_DIR/nexus.toml"
+    fi
+fi
+
 # --- Start the service --------------------------------------------------------
 
 if (( NO_START )); then
