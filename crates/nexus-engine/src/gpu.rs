@@ -834,6 +834,7 @@ mod intel {
     ///     field is `i915_eventid` mapped to `config:0-20`,
     ///     and the kernel emits per-engine `<engine>-busy`
     ///     files using the raw `config=` form on 6.x).
+    ///
     /// Other terms (`umask=`, ...) when present are ignored.
     fn read_event_config(p: &Path) -> Option<u64> {
         let raw = read_sysfs_string(p).ok()?;
