@@ -103,10 +103,15 @@ The wedge plan that drives the next three phases of work is
      personal identifier alongside `entity_local_id`. Operator-supplied labels (when the
      M6 admin surface adds them) live in a separate operator-only table that never
      replicates to the cloud.
-8. **Capability split: `nexus-engine` and `nexus-updater` never share authority.** The
-   engine does NOT have access to Docker / systemd-write paths; the OTA updater does NOT
-   have access to camera streams or the local admin DB. See
-   [REPO_BOUNDARY R8](../nexus-cloud-console/docs/REPO_BOUNDARY.md#r8-capability-split-on-the-edge-nexus-engine-and-nexus-updater-never-share-authority).
+8. **Edge runs as a single `nexus-engine` process; privileged work is sudoers-gated.**
+   The engine runs as the unprivileged `nexus` system user under `nexus-engine.service`
+   (systemd). There is no Docker on the edge, no sidecar updater, no shared socket. The
+   small amount of privileged work an OTA needs (extract into
+   `/opt/nexus/releases/<version>/`, flip `/opt/nexus/current`, run
+   `systemctl restart nexus-engine`) is gated through a single
+   `/etc/sudoers.d/nexus-update` entry in [deploy/sudoers.d/](deploy/sudoers.d/) that
+   whitelists only those exact commands. See
+   [REPO_BOUNDARY R8](../nexus-cloud-console/docs/REPO_BOUNDARY.md#r8-edge-runs-as-a-single-nexus-engine-process-privileged-work-is-sudoers-gated).
 
 ## Conventions
 
