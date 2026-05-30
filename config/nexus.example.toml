@@ -61,6 +61,19 @@ api_bind = "0.0.0.0:8089"
 ui_bind = "0.0.0.0:80"
 # In the container the UI is at /usr/share/nexus/ui. Locally use ui/dist.
 ui_root = "/usr/share/nexus/ui"
+# M-HTTPS Phase 1 — in-process TLS listener. When `https_bind` is
+# set, the engine binds the third listener on :443 and (with the
+# default `redirect_http_to_https = true`) turns `ui_bind` into a
+# 308-redirect shim. Run `nexus-engine tls init` once to mint the
+# self-signed leaf at the paths below; the installer does this
+# automatically. Leave all three lines commented to opt out.
+# https_bind = "0.0.0.0:443"
+# tls_cert_path = "/etc/nexus/tls/cert.pem"
+# tls_key_path  = "/etc/nexus/tls/key.pem"
+# Enable HSTS only AFTER the operator has trusted the cert chain
+# (a browser that caches HSTS against a self-signed leaf cannot
+# later override the warning page).
+# hsts_max_age_seconds = 15552000
 
 [store]
 url = "sqlite:///var/lib/nexus/nexus.db?mode=rwc"

@@ -81,6 +81,13 @@ ensure_dirs() {
     install -d -o root                  -g root                  -m 0755 "$NEXUS_PREFIX"
     install -d -o root                  -g root                  -m 0755 "$NEXUS_PREFIX/releases"
     install -d -o root                  -g root                  -m 0755 "$NEXUS_CONFIG_DIR"
+    # M-HTTPS Phase 1 — staging dir for the in-process TLS
+    # listener's cert+key. Mode 2750 (setgid) so any cert
+    # files dropped here later inherit the nexus group; the
+    # service user reads them via group permission (key is
+    # 0640). Owner stays root so only root (the installer
+    # and the `tls init` invocation) can write the PEMs.
+    install -d -o root                  -g "$NEXUS_SERVICE_GROUP" -m 2750 "$NEXUS_CONFIG_DIR/tls"
     install -d -o "$NEXUS_SERVICE_USER" -g "$NEXUS_SERVICE_GROUP" -m 0750 "$NEXUS_STATE_DIR"
     install -d -o "$NEXUS_SERVICE_USER" -g "$NEXUS_SERVICE_GROUP" -m 0750 "$NEXUS_STATE_DIR/state"
     install -d -o "$NEXUS_SERVICE_USER" -g "$NEXUS_SERVICE_GROUP" -m 0750 "$NEXUS_STATE_DIR/clips"
@@ -254,8 +261,9 @@ _system_prep_firewall() {
         log "ufw is inactive; skipping rules (enable ufw + re-run install.sh)"
         return 0
     fi
-    log "adding ufw rules for engine ports (80/tcp UI alias, 8089/tcp API)"
+    log "adding ufw rules for engine ports (80/tcp UI alias, 443/tcp HTTPS, 8089/tcp API)"
     ufw allow 80/tcp   comment 'nexus-engine UI alias'  >/dev/null 2>&1 || true
+    ufw allow 443/tcp  comment 'nexus-engine HTTPS'     >/dev/null 2>&1 || true
     ufw allow 8089/tcp comment 'nexus-engine API + UI' >/dev/null 2>&1 || true
 }
 

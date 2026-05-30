@@ -128,8 +128,24 @@ arc-swap = { workspace = true }
 futures = { workspace = true }
 
 axum = { workspace = true }
+# TLS-aware listener for the engine UI on :443 (M-HTTPS Phase 1).
+# Wraps the same `axum::Router` we already build; reuses the
+# tokio-rustls stack that the cloud tunnel already pulls in.
+axum-server = { workspace = true }
 tower-http = { workspace = true }
 tower = { workspace = true }
+
+# TLS server bits for the in-process HTTPS listener and the
+# `nexus-engine tls init` subcommand. `rcgen` mints the self-signed
+# leaf on first boot; `rustls-pemfile` + `rustls-pki-types` parse
+# the PEM blobs into the typed forms axum-server / rustls expect;
+# `rustls` itself is loaded only for the `CryptoProvider` install
+# call (axum-server's tls-rustls-no-provider feature requires the
+# caller to pick a provider — we use `ring`).
+rcgen = { workspace = true }
+rustls-pemfile = { workspace = true }
+rustls-pki-types = { workspace = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 
 # HS256 bearer verifier for admin writes (M2.2 Phase 2 step 12).
 jsonwebtoken = { workspace = true }
@@ -147,8 +163,16 @@ image = { workspace = true }
 async-stream = "0.3"
 sha2 = "0.10"
 # Phase 1.8 — `nexus-engine enroll` derives a stable opaque
-# hardware fingerprint that includes the local hostname.
+# hardware fingerprint that includes the local hostname. Also
+# used by the M-HTTPS Phase 1 self-signed-cert generator to
+# stamp the local hostname into the leaf's SAN list.
 hostname = "0.4"
+# M-HTTPS Phase 1 — cross-platform writer for the self-signed
+# cert PEM (atomic-write via NamedTempFile::persist). Already
+# declared Linux-only below for the netplan path; pulling it up
+# to the always-on deps section keeps the version pin unified
+# (one workspace dep → one resolved crate).
+tempfile = { workspace = true }
 
 # M-Admin Phase 0 — streaming diagnostics tarball
 # (`GET /v1/admin/diagnostics/export`). Tar entries are
@@ -239,7 +263,8 @@ libc = "0.2"# Linux-only: `network::apply` stages netplan YAML into a tempfile
 # branch, so tempfile is gated to Linux too. Tests on every platform
 # also need it (see [dev-dependencies] below) — workspace dep means
 # both entries resolve to the same crate version.
-tempfile = { workspace = true }
+# NOTE: also declared above in the cross-platform deps section for
+# the M-HTTPS TLS init path. Cargo merges these into a single entry.
 
 [dev-dependencies]
 tempfile = { workspace = true }
