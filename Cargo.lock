@@ -2313,6 +2313,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "nexus-reid"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "ndarray",
+ "nexus-inference",
+ "nexus-types",
+ "ort",
+ "parking_lot",
+ "serde",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "nexus-rules"
 version = "0.1.0"
 dependencies = [

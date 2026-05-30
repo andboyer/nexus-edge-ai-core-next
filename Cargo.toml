@@ -17,6 +17,7 @@ members = [
     "crates/nexus-probe",
     "crates/nexus-cloud-protocol",
     "crates/nexus-cloud-client",
+    "crates/nexus-reid",
     "xtask",
 ]
 
@@ -223,6 +224,7 @@ nexus-store = { path = "crates/nexus-store" }
 nexus-rules = { path = "crates/nexus-rules" }
 nexus-tracker = { path = "crates/nexus-tracker" }
 nexus-inference = { path = "crates/nexus-inference" }
+nexus-reid = { path = "crates/nexus-reid" }
 nexus-storage = { path = "crates/nexus-storage" }
 nexus-storage-cloud = { path = "crates/nexus-storage-cloud" }
 nexus-sinks = { path = "crates/nexus-sinks" }

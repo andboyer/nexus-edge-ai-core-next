@@ -1,0 +1,53 @@
+[package]
+name = "nexus-reid"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Appearance-embedding extractor for cross-camera re-identification (Phase 5.6)."
+
+[features]
+default = []
+# Per-EP feature flags, mirroring `nexus-inference`. Each EP feature
+# implicitly enables the `ort` integration so building with e.g.
+# `--features ep-coreml` is enough — no need to also pass
+# `--features ort`. The `nexus-inference` dep is only pulled in to
+# reuse `execution_providers::selected_for_priority` so two backends
+# resolve `ep_priority` identically.
+ep-cpu      = ["ort", "nexus-inference/ep-cpu"]
+ep-openvino = ["ort", "nexus-inference/ep-openvino"]
+ep-cuda     = ["ort", "nexus-inference/ep-cuda"]
+ep-coreml   = ["ort", "nexus-inference/ep-coreml"]
+ep-tensorrt = ["ort", "nexus-inference/ep-tensorrt"]
+ep-directml = ["ort", "nexus-inference/ep-directml"]
+# Wire ORT itself; selected automatically by any ep-* feature above.
+# Listed separately so `--features ort` (no EPs) still compiles the
+# session-builder code path for diagnostics / dry-runs. Always pulls
+# nexus-inference in with its own `ort` feature on so we can reuse
+# `execution_providers::selected_for_priority`.
+ort         = ["dep:ort", "dep:ndarray", "dep:nexus-inference", "nexus-inference/ort"]
+
+[dependencies]
+nexus-types = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+parking_lot = { workspace = true }
+# Needed by the ORT extractor to wrap `session.run` in
+# `tokio::task::block_in_place`. Kept as a hard dep (not optional)
+# because the mock extractor's async impl already pulls in async-trait
+# expectations and the engine always links tokio anyway — making it
+# optional would just balloon the feature matrix.
+tokio = { workspace = true }
+
+ort = { workspace = true, optional = true }
+ndarray = { workspace = true, optional = true }
+# Only used by the ORT-backed extractor for its
+# `execution_providers::selected_for_priority` helper. Mock + pre/post
+# helpers don't need it, so it stays optional + gated behind `ort`.
+nexus-inference = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
