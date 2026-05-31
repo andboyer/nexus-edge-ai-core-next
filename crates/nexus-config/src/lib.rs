@@ -1865,6 +1865,21 @@ pub struct ReidConfig {
     /// concurrent tracks per camera.
     #[serde(default = "default_reid_emit_interval_s")]
     pub emit_interval_s: u64,
+    /// Concurrent-track count above which the scheduler switches
+    /// the periodic re-emit branch to [`crowded_emit_interval_s`].
+    /// `0` disables the adaptive cadence (always use
+    /// `emit_interval_s`). M_PERF_CROWD B2 — defaults to 15.
+    /// First-emit unaffected: freshly-stable entities still emit
+    /// promptly so the cloud linker can stitch them.
+    #[serde(default = "default_reid_crowded_track_threshold")]
+    pub crowded_track_threshold: u32,
+    /// Periodic re-emit cadence in seconds used while the per-camera
+    /// tracked-object count exceeds [`crowded_track_threshold`].
+    /// M_PERF_CROWD B2 — defaults to 15s, giving ~3× bandwidth
+    /// reduction at 30+ concurrent tracks (30 × every-5s →
+    /// 30 × every-15s).
+    #[serde(default = "default_reid_crowded_emit_interval_s")]
+    pub crowded_emit_interval_s: u64,
     /// Minimum tracker `age_frames` before the first emit fires.
     /// Filters out single-frame false positives that the tracker
     /// would otherwise let through. Default 5 frames (~165 ms at
@@ -1885,6 +1900,8 @@ impl Default for ReidConfig {
             model_id: default_reid_model_id(),
             dim: default_reid_dim(),
             emit_interval_s: default_reid_emit_interval_s(),
+            crowded_track_threshold: default_reid_crowded_track_threshold(),
+            crowded_emit_interval_s: default_reid_crowded_emit_interval_s(),
             min_track_age_frames: default_reid_min_track_age_frames(),
             ep_priority: default_ep_priority(),
         }
@@ -1899,6 +1916,12 @@ fn default_reid_dim() -> usize {
 }
 fn default_reid_emit_interval_s() -> u64 {
     5
+}
+fn default_reid_crowded_track_threshold() -> u32 {
+    15
+}
+fn default_reid_crowded_emit_interval_s() -> u64 {
+    15
 }
 fn default_reid_min_track_age_frames() -> u32 {
     5

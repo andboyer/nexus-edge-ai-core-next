@@ -138,6 +138,13 @@ pub struct SightingScheduler {
     camera_id: CameraId,
     min_track_age_frames: u32,
     emit_interval: Duration,
+    /// M_PERF_CROWD B2 — above this concurrent-track count the
+    /// scheduler swaps the periodic re-emit cadence to
+    /// [`crowded_emit_interval`]. `0` (the default) disables the
+    /// crowded-mode adaptive cadence — callers must opt in via
+    /// [`Self::with_crowded_cadence`].
+    crowded_track_threshold: u32,
+    crowded_emit_interval: Duration,
     track_gc_after: Duration,
     tracks: HashMap<TrackId, TrackState>,
     /// Pre-loaded `(track_id -> seed)` records from `nexus-store`.
@@ -208,11 +215,26 @@ impl SightingScheduler {
             camera_id,
             min_track_age_frames,
             emit_interval,
+            crowded_track_threshold: 0,
+            crowded_emit_interval: Duration::ZERO,
             track_gc_after,
             tracks: HashMap::new(),
             seed,
             persist,
         }
+    }
+
+    /// M_PERF_CROWD B2 — enable the adaptive re-emit cadence. When
+    /// the current tick sees more than `threshold` concurrent tracked
+    /// objects, the scheduler uses `crowded_interval` for the periodic
+    /// re-emit branch instead of `emit_interval`. First-emit is
+    /// unaffected so freshly-stable entities still get linked
+    /// promptly. `threshold = 0` disables crowded mode entirely.
+    #[must_use]
+    pub fn with_crowded_cadence(mut self, threshold: u32, crowded_interval: Duration) -> Self {
+        self.crowded_track_threshold = threshold;
+        self.crowded_emit_interval = crowded_interval;
+        self
     }
 
     /// Drive the scheduler with one frame's worth of tracked objects.
@@ -226,6 +248,16 @@ impl SightingScheduler {
         now: DateTime<Utc>,
         hook: &dyn SightingHook,
     ) -> usize {
+        // M_PERF_CROWD B2 — pick the periodic re-emit cadence based
+        // on the current per-camera tracked-object count. Threshold
+        // 0 disables crowded mode (always use the regular interval).
+        let periodic_interval = if self.crowded_track_threshold > 0
+            && tracked.len() > self.crowded_track_threshold as usize
+        {
+            self.crowded_emit_interval
+        } else {
+            self.emit_interval
+        };
         // Update / insert per current frame.
         let mut emitted = 0usize;
         for obj in tracked {
@@ -258,7 +290,7 @@ impl SightingScheduler {
                     }),
                     Some(prev)
                         if now.signed_duration_since(prev).to_std().unwrap_or_default()
-                            >= self.emit_interval =>
+                            >= periodic_interval =>
                     {
                         Some(EmitPlan {
                             entity_local_id: entry.entity_local_id.clone(),
@@ -633,5 +665,101 @@ mod tests {
         let deletes = persist.deletes.lock();
         assert_eq!(deletes.len(), 1);
         assert_eq!(deletes[0], (7, 42));
+    }
+
+    // ---- M_PERF_CROWD B2 — adaptive re-id cadence ----
+
+    /// Build a slice of `count` distinct tracks, all aged past
+    /// `min_track_age_frames`, so first-emit fires on the first tick
+    /// for every one of them.
+    fn many_tracked(count: u64) -> Vec<TrackedObject> {
+        (1..=count).map(|id| tracked(id, 10)).collect()
+    }
+
+    #[test]
+    fn b2_crowded_threshold_zero_keeps_regular_cadence() {
+        // crowded_threshold = 0 disables adaptive mode entirely:
+        // even with 50 tracks, the scheduler must keep using the
+        // regular `emit_interval`.
+        let hook = CaptureHook::default();
+        let mut sched = SightingScheduler::new(7, 1, Duration::from_secs(5))
+            .with_crowded_cadence(0, Duration::from_secs(15));
+        let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let frame = dummy_frame(7, t0);
+        let many = many_tracked(50);
+        // First-emit tick fires once per track regardless of cadence.
+        assert_eq!(sched.tick(&frame, &many, t0, &hook), 50);
+        hook.seen.lock().clear();
+        // At t+5s (= regular emit_interval), periodic re-emit must fire
+        // for all 50 because crowded mode is disabled.
+        let t5 = t0 + chrono::Duration::seconds(5);
+        assert_eq!(sched.tick(&frame, &many, t5, &hook), 50);
+    }
+
+    #[test]
+    fn b2_crowded_cadence_throttles_periodic_emit() {
+        // 50 tracks > threshold 15 → periodic re-emit must wait for
+        // crowded_emit_interval (15s) instead of emit_interval (5s).
+        let hook = CaptureHook::default();
+        let mut sched = SightingScheduler::new(7, 1, Duration::from_secs(5))
+            .with_crowded_cadence(15, Duration::from_secs(15));
+        let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let frame = dummy_frame(7, t0);
+        let many = many_tracked(50);
+        // First-emit at t0 — adaptive cadence does NOT gate first-emit.
+        assert_eq!(sched.tick(&frame, &many, t0, &hook), 50);
+        hook.seen.lock().clear();
+        // t0+5s: regular emit_interval has elapsed but crowded cadence
+        // has not — no periodic emits.
+        let t5 = t0 + chrono::Duration::seconds(5);
+        assert_eq!(sched.tick(&frame, &many, t5, &hook), 0);
+        // t0+14s: still below crowded 15s threshold.
+        let t14 = t0 + chrono::Duration::seconds(14);
+        assert_eq!(sched.tick(&frame, &many, t14, &hook), 0);
+        // t0+15s: crowded interval elapsed → re-emit fires for all 50.
+        let t15 = t0 + chrono::Duration::seconds(15);
+        assert_eq!(sched.tick(&frame, &many, t15, &hook), 50);
+    }
+
+    #[test]
+    fn b2_below_threshold_uses_regular_cadence() {
+        // 10 tracks <= threshold 15 → regular emit_interval (5s) wins.
+        let hook = CaptureHook::default();
+        let mut sched = SightingScheduler::new(7, 1, Duration::from_secs(5))
+            .with_crowded_cadence(15, Duration::from_secs(15));
+        let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let frame = dummy_frame(7, t0);
+        let few = many_tracked(10);
+        assert_eq!(sched.tick(&frame, &few, t0, &hook), 10);
+        hook.seen.lock().clear();
+        // t0+5s — regular cadence fires.
+        let t5 = t0 + chrono::Duration::seconds(5);
+        assert_eq!(sched.tick(&frame, &few, t5, &hook), 10);
+    }
+
+    #[test]
+    fn b2_crowded_first_emit_still_prompt() {
+        // First-emit for freshly-stable tracks must NOT be throttled
+        // by crowded mode — the cloud linker needs them promptly.
+        // A 50-track scene + a brand-new 51st stable track at t+1s
+        // must see the 51st fire first-emit at t+1s.
+        let hook = CaptureHook::default();
+        let mut sched = SightingScheduler::new(7, 1, Duration::from_secs(5))
+            .with_crowded_cadence(15, Duration::from_secs(15));
+        let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let frame = dummy_frame(7, t0);
+        let many = many_tracked(50);
+        assert_eq!(sched.tick(&frame, &many, t0, &hook), 50);
+        hook.seen.lock().clear();
+        // t+1s: same 50 tracks (no periodic — crowded cadence) plus a
+        // brand-new track 99 at age=2 (just crossed min_track_age 1).
+        let mut next = many.clone();
+        next.push(tracked(99, 2));
+        let t1 = t0 + chrono::Duration::seconds(1);
+        assert_eq!(sched.tick(&frame, &next, t1, &hook), 1);
+        let seen = hook.seen.lock();
+        assert_eq!(seen.len(), 1);
+        assert!(seen[0].is_first);
+        assert_eq!(seen[0].track_id, 99);
     }
 }
