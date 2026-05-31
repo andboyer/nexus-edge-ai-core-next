@@ -52,7 +52,7 @@ pub use dispatcher::{AuditSink, Handler, NullAuditSink, RpcDispatcher, SystemMet
 pub use enrollment::{EnrollmentClient, EnrollmentError, EnrollmentRequest, EnrollmentResponse};
 pub use error::{DispatchError, InvalidReason, RejectReason};
 pub use jti_cache::JtiReplayCache;
-pub use outbox::TunnelOutbox;
+pub use outbox::{caps as cloud_capabilities, TunnelOutbox};
 pub use response_cache::RpcResponseCache;
 pub use sink::{
     build_alert_envelope, build_clip_replicated_envelope, AlertProjection,

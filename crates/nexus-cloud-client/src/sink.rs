@@ -11,8 +11,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use nexus_cloud_protocol::v1::{
-    AlertPayload, ClipReplicatedPayload, EntitySightingPayload, Envelope, EnvelopeBody,
-    EnvelopeMeta,
+    AlertPayload, ClipReplicatedPayload, EntitySightingBatchPayload, EntitySightingPayload,
+    Envelope, EnvelopeBody, EnvelopeMeta,
 };
 use uuid::Uuid;
 
@@ -312,32 +312,20 @@ pub struct EntitySightingProjection {
 /// Phase 5.6 · slice 4c-i.
 #[must_use]
 pub fn build_entity_sighting_envelope(sighting: EntitySightingProjection) -> Envelope {
-    let embedding_dim = sighting.embedding.len() as i64;
-    let mut bytes = Vec::with_capacity(sighting.embedding.len() * 4);
-    for v in &sighting.embedding {
-        bytes.extend_from_slice(&v.to_le_bytes());
-    }
-    use base64::Engine as _;
-    let embedding_b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-    let bbox: Vec<u64> = sighting
-        .bbox
-        .iter()
-        .map(|v| u64::try_from(*v).unwrap_or(0))
-        .collect();
-    let payload = EntitySightingPayload {
-        bbox,
-        camera_id: sighting.camera_id,
-        confidence: sighting.confidence,
-        embedding_b64,
-        embedding_dim,
-        embedding_model: sighting.embedding_model,
-        entity_local_id: sighting.entity_local_id,
-        frame_h: sighting.frame_h,
-        frame_w: sighting.frame_w,
-        is_first_sighting: sighting.is_first_sighting,
-        started_ts: sighting.started_ts.to_rfc3339(),
-        ts: sighting.ts.to_rfc3339(),
-    };
+    build_entity_sighting_envelope_with_dtype(sighting, false)
+}
+
+/// Phase M_PERF_CROWD A1: same as [`build_entity_sighting_envelope`]
+/// but selects FP16 wire encoding when `use_f16` is true.
+/// Callers MUST gate `use_f16` on the cloud advertising
+/// [`crate::cloud_capabilities::EMBEDDING_DTYPE_F16`] in
+/// `HeartbeatAckPayload.cloud_capabilities`.
+#[must_use]
+pub fn build_entity_sighting_envelope_with_dtype(
+    sighting: EntitySightingProjection,
+    use_f16: bool,
+) -> Envelope {
+    let payload = build_entity_sighting_payload(sighting, use_f16);
     Envelope {
         meta: EnvelopeMeta {
             v: 1,
@@ -349,6 +337,118 @@ pub fn build_entity_sighting_envelope(sighting: EntitySightingProjection) -> Env
         },
         body: EnvelopeBody::EntitySighting(payload),
     }
+}
+
+/// Phase M_PERF_CROWD A3: bundle 1..=32 sightings into a single
+/// `entity_sighting_batch` envelope. Callers MUST gate emission on
+/// the cloud advertising
+/// [`crate::cloud_capabilities::ENTITY_SIGHTING_BATCH`].
+///
+/// # Panics
+///
+/// Debug-only assert that `1..=32` items are passed — the wire
+/// schema rejects empty and >32. In release builds an oversized
+/// vector silently produces an envelope the cloud will refuse, so
+/// the worker pre-chunks to 32.
+#[must_use]
+pub fn build_entity_sighting_batch_envelope(
+    sightings: Vec<EntitySightingProjection>,
+    use_f16: bool,
+) -> Envelope {
+    debug_assert!(
+        !sightings.is_empty() && sightings.len() <= 32,
+        "entity_sighting_batch requires 1..=32 items, got {}",
+        sightings.len()
+    );
+    let items = sightings
+        .into_iter()
+        .map(|s| build_entity_sighting_payload(s, use_f16))
+        .collect();
+    Envelope {
+        meta: EnvelopeMeta {
+            v: 1,
+            id: Uuid::now_v7().to_string(),
+            ts: Utc::now().to_rfc3339(),
+            in_reply_to: None,
+            seq: None,
+            trace: None,
+        },
+        body: EnvelopeBody::EntitySightingBatch(EntitySightingBatchPayload { items }),
+    }
+}
+
+fn build_entity_sighting_payload(
+    sighting: EntitySightingProjection,
+    use_f16: bool,
+) -> EntitySightingPayload {
+    let embedding_dim = sighting.embedding.len() as i64;
+    let bytes = if use_f16 {
+        let mut out = Vec::with_capacity(sighting.embedding.len() * 2);
+        for v in &sighting.embedding {
+            out.extend_from_slice(&f32_to_f16_bits(*v).to_le_bytes());
+        }
+        out
+    } else {
+        let mut out = Vec::with_capacity(sighting.embedding.len() * 4);
+        for v in &sighting.embedding {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out
+    };
+    use base64::Engine as _;
+    let embedding_b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    let bbox: Vec<u64> = sighting
+        .bbox
+        .iter()
+        .map(|v| u64::try_from(*v).unwrap_or(0))
+        .collect();
+    EntitySightingPayload {
+        bbox,
+        camera_id: sighting.camera_id,
+        confidence: sighting.confidence,
+        embedding_b64,
+        embedding_dim,
+        embedding_dtype: if use_f16 {
+            Some("f16".to_string())
+        } else {
+            None
+        },
+        embedding_model: sighting.embedding_model,
+        entity_local_id: sighting.entity_local_id,
+        frame_h: sighting.frame_h,
+        frame_w: sighting.frame_w,
+        is_first_sighting: sighting.is_first_sighting,
+        started_ts: sighting.started_ts.to_rfc3339(),
+        ts: sighting.ts.to_rfc3339(),
+    }
+}
+
+/// Mirror of `nexus_reid::f32_to_f16_bits`. Duplicated here to keep
+/// `nexus-cloud-client` free of the `nexus-reid` (ORT-heavy) dep.
+/// Both paths are checked in `crates/nexus-reid/tests/fp16_parity.rs`.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap
+)]
+fn f32_to_f16_bits(value: f32) -> u16 {
+    let bits = value.to_bits();
+    let sign = ((bits >> 31) & 0x1) as u16;
+    let exponent = ((bits >> 23) & 0xff) as i32;
+    let mantissa = bits & 0x007f_ffff;
+    if exponent == 0xff {
+        let mantissa16 = if mantissa != 0 { 0x0200 } else { 0 };
+        return (sign << 15) | 0x7c00 | mantissa16;
+    }
+    let new_exp = exponent - 127 + 15;
+    if new_exp >= 0x1f {
+        return (sign << 15) | 0x7c00;
+    }
+    if new_exp <= 0 {
+        return sign << 15;
+    }
+    let mantissa16 = (mantissa >> 13) as u16;
+    (sign << 15) | ((new_exp as u16) << 10) | mantissa16
 }
 
 #[cfg(test)]

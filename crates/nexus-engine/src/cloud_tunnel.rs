@@ -508,7 +508,13 @@ async fn run(
                     conn.clone() as Arc<dyn nexus_cloud_client::TunnelHandle>
                 ));
                 let pump = pump_heartbeats(&*conn, &core_id, store.clone());
-                let dispatch = pump_rpc_dispatch(&*conn, inbound, dispatcher.as_deref(), &core_id);
+                let dispatch = pump_rpc_dispatch(
+                    &*conn,
+                    inbound,
+                    dispatcher.as_deref(),
+                    &core_id,
+                    cloud_outbox.as_ref(),
+                );
                 tokio::select! {
                     biased;
                     _ = &mut shutdown => {
@@ -569,6 +575,7 @@ async fn pump_rpc_dispatch<H: TunnelHandle>(
     inbound: Option<mpsc::Receiver<Envelope>>,
     dispatcher: Option<&RpcDispatcher<EngineRpcHandler>>,
     core_id: &str,
+    outbox: &nexus_cloud_client::TunnelOutbox,
 ) {
     let Some(mut rx) = inbound else {
         debug!(core_id = %core_id, "no inbound channel on this connection; pump idle");
@@ -616,6 +623,15 @@ async fn pump_rpc_dispatch<H: TunnelHandle>(
                 }
             }
             other => {
+                if let EnvelopeBody::HeartbeatAck(ack) = other {
+                    outbox.update_caps(ack.cloud_capabilities.as_deref());
+                    debug!(
+                        core_id = %core_id,
+                        cap_count = ack.cloud_capabilities.as_ref().map_or(0, Vec::len),
+                        "cloud heartbeat_ack capabilities refreshed",
+                    );
+                    continue;
+                }
                 debug!(
                     core_id = %core_id,
                     kind = ?std::mem::discriminant(other),

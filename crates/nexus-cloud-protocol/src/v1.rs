@@ -2,7 +2,7 @@
 // Regenerate with `cargo xtask gen-proto` from proto/v1.json.
 //
 // Source schema: Nexus edge↔cloud wire protocol
-// Canonical schema for v1 of the wire envelope. Message kinds: heartbeat, heartbeat_ack, alert, alert_ack, clip_replicated, clip_replicated_ack, entitlement_update, rpc_call, rpc_response, close_session, camera_roster, camera_roster_ack, entity_sighting. HUMAN-EDITED source of truth. Rust types live in proto/generated/rust/v1.rs; TypeScript zod schemas in proto/generated/ts/v1.ts. `cargo xtask gen-proto` regenerates both; CI fails if they're stale.
+// Canonical schema for v1 of the wire envelope. Message kinds: heartbeat, heartbeat_ack, alert, alert_ack, clip_replicated, clip_replicated_ack, entitlement_update, rpc_call, rpc_response, close_session, camera_roster, camera_roster_ack, entity_sighting, entity_sighting_batch. HUMAN-EDITED source of truth. Rust types live in proto/generated/rust/v1.rs; TypeScript zod schemas in proto/generated/ts/v1.ts. `cargo xtask gen-proto` regenerates both; CI fails if they're stale.
 
 use serde::{Deserialize, Serialize};
 
@@ -182,6 +182,14 @@ pub struct EntitlementUpdatePayload {
     pub jwt: String,
 }
 
+/// Edge → Cloud. Phase M_PERF_CROWD A3 (additive on v=1). Batched form of `entity_sighting`: an array of up to 32 `EntitySightingPayload` items, intended to amortise WSS frame overhead and JSON dictionary warmup over a 100ms drain window. Cloud routing is identical to `entity_sighting` — each item is validated and inserted independently; a rejection of one item does NOT discard the batch. Edges MUST only emit this kind when the cloud advertised `entity_sighting_batch` in `HeartbeatAckPayload.cloud_capabilities`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EntitySightingBatchPayload {
+    /// 1..32 sightings. Order is preserved on insert.
+    pub items: Vec<EntitySightingPayload>,
+}
+
 /// Edge → Cloud. Phase 5 (additive on v=1). Appearance-embedding sighting for the identity-graph linker. Sent at first-detection per stable track + every 5 s while alive. `embedding_b64` is base64 of little-endian float32[embedding_dim]; allowed `embedding_model` values are `dinov2-s-v1` (384 dims) and `osnet-x1.0-v1` (512 dims). `entity_local_id` is the engine's per-track UUIDv7 — the cloud assigns the cross-camera `entity_global_id` via the pgvector linker. `bbox` is in the supervisor frame; `frame_w/frame_h` carry those dims so the cloud can scale to native MP4 resolution when overlaying. **Hard invariant per REPO_BOUNDARY R9:** appearance embeddings only; the gateway rejects envelopes whose `embedding_model` matches a face-recognition model name (`AdaFace`, `ArcFace`, `InsightFace`, `Buffalo`, `FaceNet`, `SphereFace`, `CosFace`, `MagFace`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -192,10 +200,13 @@ pub struct EntitySightingPayload {
     pub camera_id: u64,
     /// Detector confidence for the track at this sighting.
     pub confidence: f64,
-    /// Base64 of `float32[embedding_dim]` in little-endian. Length must equal `ceil(4 * embedding_dim / 3) * 4` after padding.
+    /// Base64 of `float32[embedding_dim]` in little-endian by default. When `embedding_dtype` is `"f16"`, length is `2 * embedding_dim` bytes (IEEE-754 binary16 little-endian) before base64 padding.
     pub embedding_b64: String,
     /// Must agree with `embedding_model`: 384 for `dinov2-s-v1`, 512 for `osnet-x1.0-v1`. Cloud rejects with `embedding_dim_mismatch` otherwise.
     pub embedding_dim: i64,
+    /// Phase M_PERF_CROWD A1: numeric type of `embedding_b64`. Omitted/null/`"f32"` mean little-endian float32 (legacy / pre-Phase-A engines). `"f16"` means little-endian IEEE-754 binary16 — the cloud expands to FP32 on ingest. Edges MUST only emit `"f16"` when the cloud advertised `embedding_dtype_f16` in `HeartbeatAckPayload.cloud_capabilities`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_dtype: Option<String>,
     /// Free-form on the wire but constrained to the cloud's allowlist; unknown values are rejected with `embedding_model_unknown`. Face-recognition model names are rejected with `embedding_face_model_rejected` (REPO_BOUNDARY R9).
     pub embedding_model: String,
     /// Stable per-track id (engine UUIDv7). Two sightings with the same `(core_id, entity_local_id)` are the same track on the edge; the cloud uses it as the dedup key and to follow a track across re-sends.
@@ -212,12 +223,15 @@ pub struct EntitySightingPayload {
     pub ts: Timestamp,
 }
 
-/// Cloud → Edge. Reply to a heartbeat. May hint at cert rotation after day 75.
+/// Cloud → Edge. Reply to a heartbeat. May hint at cert rotation after day 75. Phase M_PERF_CROWD A: optionally carries `cloud_capabilities` so the edge can gate batched / FP16 sighting envelopes on cloud-side support.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HeartbeatAckPayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cert_rotate: Option<HeartbeatAckPayloadCertRotate>,
+    /// Phase M_PERF_CROWD A: advertised gateway capabilities. Edge enables a feature only if the corresponding tag is present. Defined tags so far: `entity_sighting_batch` (gateway routes batched envelopes), `embedding_dtype_f16` (gateway decodes FP16 embeddings). Unknown tags are ignored; missing field is treated identically to an empty array (pre-Phase-A gateway).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cloud_capabilities: Option<Vec<String>>,
     pub server_ts: Timestamp,
 }
 
@@ -344,6 +358,7 @@ pub enum EnvelopeBody {
     CameraRoster(CameraRosterPayload),
     CameraRosterAck(CameraRosterAckPayload),
     EntitySighting(EntitySightingPayload),
+    EntitySightingBatch(EntitySightingBatchPayload),
 }
 
 /// One WebSocket text frame on the wire. See the schema header for invariants.
