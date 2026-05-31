@@ -43,6 +43,13 @@ use crate::stats::FrameStatsRegistry;
 pub struct SightingSchedulerConfig {
     pub min_track_age_frames: u32,
     pub emit_interval: std::time::Duration,
+    /// M_PERF_CROWD B2 — above this concurrent-track count the
+    /// scheduler swaps the periodic re-emit cadence to
+    /// [`crowded_emit_interval`]. `0` disables crowded mode.
+    pub crowded_track_threshold: u32,
+    /// M_PERF_CROWD B2 — cadence used while the per-camera
+    /// tracked-object count exceeds [`crowded_track_threshold`].
+    pub crowded_emit_interval: std::time::Duration,
 }
 
 impl Default for SightingSchedulerConfig {
@@ -50,6 +57,8 @@ impl Default for SightingSchedulerConfig {
         Self {
             min_track_age_frames: 5,
             emit_interval: std::time::Duration::from_secs(5),
+            crowded_track_threshold: 15,
+            crowded_emit_interval: std::time::Duration::from_secs(15),
         }
     }
 }
@@ -223,6 +232,10 @@ async fn run_camera(
             sighting_cfg.emit_interval,
             sighting_seed,
             sighting_persist,
+        )
+        .with_crowded_cadence(
+            sighting_cfg.crowded_track_threshold,
+            sighting_cfg.crowded_emit_interval,
         );
         let mut current_clip: Option<ClipHandle> = None;
         // Wall-clock anchor for the currently-open clip. Used to

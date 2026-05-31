@@ -713,11 +713,15 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
         let scheduler_cfg = nexus_pipeline::supervisor::SightingSchedulerConfig {
             min_track_age_frames: cfg.reid.min_track_age_frames,
             emit_interval: std::time::Duration::from_secs(cfg.reid.emit_interval_s),
+            crowded_track_threshold: cfg.reid.crowded_track_threshold,
+            crowded_emit_interval: std::time::Duration::from_secs(cfg.reid.crowded_emit_interval_s),
         };
         info!(
             model_id = %cfg.reid.model_id,
             dim = cfg.reid.dim,
             emit_interval_s = cfg.reid.emit_interval_s,
+            crowded_track_threshold = cfg.reid.crowded_track_threshold,
+            crowded_emit_interval_s = cfg.reid.crowded_emit_interval_s,
             min_track_age_frames = cfg.reid.min_track_age_frames,
             model_path = ?cfg.reid.model_path,
             "reid enabled — entity-sighting hook installed"
