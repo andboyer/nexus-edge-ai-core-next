@@ -432,6 +432,22 @@ pub fn router(state: ApiState) -> Router {
             axum::routing::post(crate::visual_prompts_admin::attach_camera_visual_prompt)
                 .delete(crate::visual_prompts_admin::detach_camera_visual_prompt),
         )
+        // Cloud-tunnel camera CRUD aliases. The cloud's
+        // `services/api-gateway/src/handlers/cameras.rs` proxies
+        // mutations as `rpc_call` envelopes with path `/admin/cameras`
+        // and `/admin/cameras/{id}`; the engine_rpc dispatcher
+        // prepends `/api/v1`, producing `/api/v1/admin/cameras*`.
+        // The bare `/cameras` routes the local UI uses live below in
+        // the (un-gated) `api` sub-router; these alias routes live
+        // inside the admin sub-router so the loopback HS256 bearer
+        // minted by `admin_auth::mint_internal_passthrough_bearer`
+        // gates the cloud's writes. Same handlers as the local-UI
+        // routes — no behaviour fork.
+        .route("/v1/admin/cameras", get(list_cameras).post(create_camera))
+        .route(
+            "/v1/admin/cameras/{id}",
+            put(upsert_camera).delete(delete_camera),
+        )
         // ----- M-Admin Phase 0 — runtime knobs that today require
         // an engine restart to take effect.
         //
@@ -6008,8 +6024,123 @@ mod tests {
         );
     }
 
-    // -------------------------------------------------------------------
-    // M7 Step 6 — delivery-policy admin surface tests.
+    // ===============================================================
+    // Cloud-tunnel camera CRUD aliases regression
+    // ===============================================================
+    //
+    // The cloud's api-gateway proxies camera writes as `rpc_call`
+    // envelopes with path `/admin/cameras` (and `/admin/cameras/{id}`);
+    // the engine_rpc dispatcher prepends `/api/v1`, so the URL the
+    // edge router sees is `/api/v1/admin/cameras*`. Pre-fix those
+    // paths did not exist (the bare `/cameras` routes live in the
+    // un-gated `api` sub-router for the local UI), but the sibling
+    // `/v1/admin/cameras/{camera_id}/visual-prompts` route caused
+    // axum's matchit to return 405 instead of 404 on the cloud's
+    // POSTs — same shape as the discovery 405 above.
+
+    #[tokio::test]
+    async fn cloud_tunnel_camera_routes_do_not_405() {
+        const ADMIN_SECRET: &[u8] = b"cloud-tunnel-cameras-route-regression-secret";
+        let (app, _store, _dir) = build_test_router(Some(ADMIN_SECRET)).await;
+        let token = sign_admin_jwt(ADMIN_SECRET);
+
+        // POST: route is wired and reaches the create_camera
+        // handler. Body is intentionally minimal so we don't
+        // depend on the CameraConfig schema staying stable — a
+        // body parse error here is fine (would be 400/422), but
+        // 405/404 would mean the route is missing again.
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/admin/cameras")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from("{}"))
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_ne!(
+            res.status(),
+            StatusCode::METHOD_NOT_ALLOWED,
+            "POST /api/v1/admin/cameras must not 405 (cloud-tunnel alias must exist)"
+        );
+        assert_ne!(
+            res.status(),
+            StatusCode::NOT_FOUND,
+            "POST /api/v1/admin/cameras must not 404"
+        );
+
+        // GET: list is unauthenticated at the handler level
+        // (list_cameras takes only State), but the admin gate
+        // still requires the bearer; an empty store returns 200
+        // with `[]`.
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/admin/cameras")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(
+            res.status(),
+            StatusCode::OK,
+            "GET /api/v1/admin/cameras on an empty store should return 200"
+        );
+
+        // DELETE: route resolves even when the id is unknown.
+        // Engine returns 404 for missing ids; what we care about
+        // is that the alias exists at all.
+        let mut req = Request::builder()
+            .method(Method::DELETE)
+            .uri("/api/v1/admin/cameras/9999")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_ne!(
+            res.status(),
+            StatusCode::METHOD_NOT_ALLOWED,
+            "DELETE /api/v1/admin/cameras/{{id}} must not 405"
+        );
+
+        // PUT: same regression check for the upsert alias.
+        let mut req = Request::builder()
+            .method(Method::PUT)
+            .uri("/api/v1/admin/cameras/9999")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from("{}"))
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+        let res = app.oneshot(req).await.unwrap();
+        assert_ne!(
+            res.status(),
+            StatusCode::METHOD_NOT_ALLOWED,
+            "PUT /api/v1/admin/cameras/{{id}} must not 405"
+        );
+    }
+
+    #[tokio::test]
+    async fn cloud_tunnel_camera_routes_require_admin_bearer() {
+        const ADMIN_SECRET: &[u8] = b"cloud-tunnel-cameras-auth-secret";
+        let (app, _store, _dir) = build_test_router(Some(ADMIN_SECRET)).await;
+        // No Authorization header — admin gate must reject with 401.
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/admin/cameras")
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(remote_peer()));
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            res.status(),
+            StatusCode::UNAUTHORIZED,
+            "POST /api/v1/admin/cameras without bearer must 401, not bypass the admin gate"
+        );
+    }
+
     //
     // Each test stands up its own router so the inserted rows
     // (rules, motion_events, outbox entries) don't leak. We exercise
