@@ -42,6 +42,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 use md5::{Digest, Md5};
+use percent_encoding::percent_decode_str;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
@@ -275,12 +276,7 @@ pub async fn probe_codec_for_url(url: &url::Url) -> Option<nexus_types::CodecKin
     let host = url.host_str()?.to_string();
     let port = url.port().unwrap_or(554);
     let path = url.path().to_string();
-    let username = if url.username().is_empty() {
-        None
-    } else {
-        Some(url.username().to_string())
-    };
-    let password = url.password().map(|p| p.to_string());
+    let (username, password) = extract_userinfo(url);
     let req = ProbeRtspReq {
         host,
         port,
@@ -289,6 +285,34 @@ pub async fn probe_codec_for_url(url: &url::Url) -> Option<nexus_types::CodecKin
         password,
     };
     probe(&req).await.codec
+}
+
+/// Pull the userinfo out of a parsed RTSP URL, **percent-decoding**
+/// both fields. `url::Url::username()` / `password()` return the
+/// raw percent-encoded form (per WHATWG URL); feeding those bytes
+/// directly into HTTP Digest HA1 makes the camera compute a
+/// different hash from the operator's literal credential and 401
+/// the request with a fresh nonce on every retry. Concretely, a
+/// password `Cam$0950` arrives as `Cam%240950` and Hikvision's
+/// `MD5("admin:IP Camera(J5794):Cam%240950")` ≠ our
+/// `MD5("admin:IP Camera(J5794):Cam$0950")`. `decode_utf8_lossy`
+/// is correct here because RTSP userinfo is ASCII-by-spec and any
+/// non-UTF-8 bytes already indicate a malformed URL the camera
+/// won't accept either way.
+fn extract_userinfo(url: &url::Url) -> (Option<String>, Option<String>) {
+    let username = if url.username().is_empty() {
+        None
+    } else {
+        Some(
+            percent_decode_str(url.username())
+                .decode_utf8_lossy()
+                .into_owned(),
+        )
+    };
+    let password = url
+        .password()
+        .map(|p| percent_decode_str(p).decode_utf8_lossy().into_owned());
+    (username, password)
 }
 
 async fn probe_inner(req: &ProbeRtspReq) -> io::Result<ProbeRtspResult> {
@@ -1142,5 +1166,37 @@ mod tests {
         let h = build_basic_response("admin", "secret123");
         // base64("admin:secret123") = YWRtaW46c2VjcmV0MTIz
         assert_eq!(h, "Basic YWRtaW46c2VjcmV0MTIz");
+    }
+
+    #[test]
+    fn extract_userinfo_percent_decodes_password() {
+        // Real-world failure mode (Hikvision J5794 firmware, May
+        // 2026): a password containing `$` is URL-encoded as
+        // `%24` inside the camera URL. `url::Url::password()`
+        // returns the encoded form; feeding it into Digest HA1
+        // makes the camera compute a different hash and 401 with
+        // a fresh nonce on every retry, so codec autodetect
+        // silently falls through to the "default to h264" path.
+        let u = url::Url::parse("rtsp://admin:Cam%240950@10.3.6.124:554/Streaming/Channels/101")
+            .unwrap();
+        let (user, pass) = extract_userinfo(&u);
+        assert_eq!(user.as_deref(), Some("admin"));
+        assert_eq!(pass.as_deref(), Some("Cam$0950"));
+    }
+
+    #[test]
+    fn extract_userinfo_handles_no_credentials() {
+        let u = url::Url::parse("rtsp://10.0.0.1:554/stream1").unwrap();
+        let (user, pass) = extract_userinfo(&u);
+        assert_eq!(user, None);
+        assert_eq!(pass, None);
+    }
+
+    #[test]
+    fn extract_userinfo_passes_through_plain_ascii() {
+        let u = url::Url::parse("rtsp://admin:hunter2@10.0.0.1:554/stream1").unwrap();
+        let (user, pass) = extract_userinfo(&u);
+        assert_eq!(user.as_deref(), Some("admin"));
+        assert_eq!(pass.as_deref(), Some("hunter2"));
     }
 }
