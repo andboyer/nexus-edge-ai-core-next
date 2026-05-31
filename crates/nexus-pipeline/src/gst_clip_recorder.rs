@@ -862,7 +862,14 @@ impl ClipRecorder for GstClipRecorder {
         // shutdown via Drop, which cleans up the GStreamer pipeline
         // and reconnect task synchronously.
         let prev = self.ingesters.write().insert(camera_id, new_ing);
-        if prev.is_some() {
+        if let Some(prev_ing) = prev {
+            // Same reason as `remove_camera_ingester`: other
+            // holders (a stale `SharedRtspSource` clone, an
+            // in-flight clip's snapshot Arc) would otherwise keep
+            // the previous ingester's supervisor reconnecting to
+            // the old URL/codec for an unbounded amount of time
+            // after we install the replacement.
+            prev_ing.shutdown();
             info!(camera_id, %url, codec = %codec, "pre-roll ingester replaced (URL or codec changed)");
         } else {
             info!(camera_id, %url, pre_roll_secs, max_fps, codec = %codec, "pre-roll ingester started (hot-add)");
@@ -871,7 +878,18 @@ impl ClipRecorder for GstClipRecorder {
     }
 
     fn remove_camera_ingester(&self, camera_id: CameraId) {
-        if self.ingesters.write().remove(&camera_id).is_some() {
+        if let Some(ing) = self.ingesters.write().remove(&camera_id) {
+            // Synchronously stop the supervisor + null the
+            // GStreamer pipeline regardless of how many other
+            // `Arc<PreRollIngester>` clones exist (a per-camera
+            // supervisor's `SharedRtspSource`, an in-flight clip's
+            // snapshot Arc). Without this, those clones would keep
+            // the struct alive past the map removal, the supervisor
+            // task we're about to lose track of would keep
+            // reconnecting forever, and a misconfigured camera
+            // that was added then deleted would leak GstPipelines
+            // at the reconnect-backoff rate until process exit.
+            ing.shutdown();
             info!(camera_id, "pre-roll ingester removed (hot-remove)");
         }
     }
