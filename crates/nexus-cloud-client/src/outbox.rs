@@ -39,9 +39,21 @@ use parking_lot::RwLock;
 
 use crate::tunnel::{TunnelError, TunnelHandle};
 
+/// Capability tag advertised by the cloud in
+/// `HeartbeatAckPayload.cloud_capabilities`. Wire-defined string the
+/// cloud guarantees in `proto/v1.json`; the engine treats unknown tags
+/// as inert (forward-compatible).
+pub mod caps {
+    /// Cloud routes batched `entity_sighting_batch` envelopes.
+    pub const ENTITY_SIGHTING_BATCH: &str = "entity_sighting_batch";
+    /// Cloud decodes IEEE-754 binary16 (`f16`) embedding payloads.
+    pub const EMBEDDING_DTYPE_F16: &str = "embedding_dtype_f16";
+}
+
 /// Shared, swappable tunnel handle slot. See module docs.
 pub struct TunnelOutbox {
     inner: RwLock<Option<Arc<dyn TunnelHandle>>>,
+    caps: RwLock<std::collections::HashSet<String>>,
 }
 
 impl TunnelOutbox {
@@ -52,14 +64,39 @@ impl TunnelOutbox {
     pub fn new() -> Self {
         Self {
             inner: RwLock::new(None),
+            caps: RwLock::new(std::collections::HashSet::new()),
         }
     }
 
     /// Install or clear the active tunnel handle. Called by the
     /// reconnect loop on every connect (`Some(handle)`) and on every
-    /// disconnect (`None`).
+    /// disconnect (`None`). Disconnect also clears advertised
+    /// capabilities — the next session's heartbeat_ack re-advertises.
     pub fn set_handle(&self, handle: Option<Arc<dyn TunnelHandle>>) {
+        let connected = handle.is_some();
         *self.inner.write() = handle;
+        if !connected {
+            self.caps.write().clear();
+        }
+    }
+
+    /// Replace the advertised cloud capability set. Called from the
+    /// inbound pump when a `heartbeat_ack` arrives. `None` or empty
+    /// slice means "pre-Phase-A cloud, no opt-in features".
+    pub fn update_caps(&self, advertised: Option<&[String]>) {
+        let mut w = self.caps.write();
+        w.clear();
+        if let Some(list) = advertised {
+            for tag in list {
+                w.insert(tag.clone());
+            }
+        }
+    }
+
+    /// `true` if the cloud most recently advertised support for `tag`.
+    #[must_use]
+    pub fn supports(&self, tag: &str) -> bool {
+        self.caps.read().contains(tag)
     }
 
     /// `true` while a handle is installed. Cheap.

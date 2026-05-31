@@ -34,10 +34,15 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use nexus_cloud_client::{
-    sink::{build_entity_sighting_envelope, EntitySightingProjection},
+    cloud_capabilities,
+    sink::{
+        build_entity_sighting_batch_envelope, build_entity_sighting_envelope_with_dtype,
+        EntitySightingProjection,
+    },
     TunnelOutbox,
 };
 use nexus_pipeline::{SightingHook, SightingSnapshot};
@@ -218,6 +223,15 @@ impl SightingHook for CloudEntitySightingHook {
     }
 }
 
+/// Phase M_PERF_CROWD A3 — max sightings per `entity_sighting_batch`
+/// envelope. Matches the wire schema (`items: maxItems: 32`).
+const BATCH_MAX: usize = 32;
+
+/// Phase M_PERF_CROWD A3 — drain window for batched mode. Worker
+/// blocks for the first snapshot, then opportunistically drains up
+/// to `BATCH_MAX-1` more arrivals within this window before flushing.
+const BATCH_WINDOW: Duration = Duration::from_millis(100);
+
 async fn run_worker(
     extractor: Arc<dyn Extractor>,
     outbox: Arc<TunnelOutbox>,
@@ -238,103 +252,195 @@ async fn run_worker(
         );
     }
     while let Some(snapshot) = rx.recv().await {
-        let SightingSnapshot {
-            camera_id,
-            track_id,
-            entity_local_id,
-            frame,
-            bbox,
-            confidence,
-            started_ts,
-            ts,
-            is_first,
-        } = snapshot;
-        let frame_w = frame.width;
-        let frame_h = frame.height;
-        let embedding = match extractor.extract(&frame, &bbox).await {
-            Ok(emb) => emb,
-            Err(e) => {
-                warn!(
-                    camera_id,
-                    track_id,
-                    error = %e,
-                    "entity-sighting extractor failed; dropping snapshot"
-                );
-                continue;
-            }
+        let Some(first) = extract_projection(
+            &*extractor,
+            &model_id,
+            dim,
+            cloud_eligible,
+            &stats,
+            snapshot,
+        )
+        .await
+        else {
+            continue;
         };
-        if embedding.vec.len() != dim {
+        // Snapshot the cloud's advertised capabilities ONCE per
+        // batch — the heartbeat_ack pump updates the outbox set in
+        // the background, but checking inside the drain loop would
+        // let a mid-batch flip produce a mixed-mode envelope.
+        let use_batch = outbox.supports(cloud_capabilities::ENTITY_SIGHTING_BATCH);
+        let use_f16 = outbox.supports(cloud_capabilities::EMBEDDING_DTYPE_F16);
+        if !use_batch {
+            publish_single(&outbox, first, use_f16).await;
+            continue;
+        }
+        let mut buf: Vec<EntitySightingProjection> = Vec::with_capacity(BATCH_MAX);
+        buf.push(first);
+        let deadline = Instant::now() + BATCH_WINDOW;
+        while buf.len() < BATCH_MAX {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, rx.recv()).await {
+                Ok(Some(snap)) => {
+                    if let Some(p) = extract_projection(
+                        &*extractor,
+                        &model_id,
+                        dim,
+                        cloud_eligible,
+                        &stats,
+                        snap,
+                    )
+                    .await
+                    {
+                        buf.push(p);
+                    }
+                }
+                Ok(None) => break, // channel closed
+                Err(_) => break,   // drain window elapsed
+            }
+        }
+        publish_batch(&outbox, buf, use_f16).await;
+    }
+}
+
+async fn publish_single(
+    outbox: &TunnelOutbox,
+    projection: EntitySightingProjection,
+    use_f16: bool,
+) {
+    let camera_id = projection.camera_id;
+    let envelope = build_entity_sighting_envelope_with_dtype(projection, use_f16);
+    match outbox.send(envelope).await {
+        Ok(()) => debug!(
+            camera_id,
+            dtype = if use_f16 { "f16" } else { "f32" },
+            "entity_sighting envelope published"
+        ),
+        Err(e) => debug!(
+            camera_id,
+            error = %e,
+            "entity_sighting envelope publish failed (tunnel down?); dropping"
+        ),
+    }
+}
+
+async fn publish_batch(outbox: &TunnelOutbox, items: Vec<EntitySightingProjection>, use_f16: bool) {
+    if items.is_empty() {
+        return;
+    }
+    // Singleton batches are wasteful — the unwrap below would also
+    // panic the debug_assert in `build_entity_sighting_batch_envelope`
+    // for a zero-item input. Fall back to the plain envelope.
+    if items.len() == 1 {
+        publish_single(outbox, items.into_iter().next().unwrap(), use_f16).await;
+        return;
+    }
+    let count = items.len();
+    let envelope = build_entity_sighting_batch_envelope(items, use_f16);
+    match outbox.send(envelope).await {
+        Ok(()) => debug!(
+            count,
+            dtype = if use_f16 { "f16" } else { "f32" },
+            "entity_sighting_batch envelope published"
+        ),
+        Err(e) => debug!(
+            count,
+            error = %e,
+            "entity_sighting_batch envelope publish failed (tunnel down?); dropping"
+        ),
+    }
+}
+
+/// Extract a single snapshot into a wire projection. Returns `None`
+/// when the snapshot should be dropped (extractor error, dim
+/// mismatch, or dev-mode mock extractor). All counter updates and
+/// log emissions match the pre-batching behaviour so the admin
+/// `/reid/status` semantics are unchanged.
+async fn extract_projection(
+    extractor: &dyn Extractor,
+    model_id: &str,
+    dim: usize,
+    cloud_eligible: bool,
+    stats: &ReidStatsRegistry,
+    snapshot: SightingSnapshot,
+) -> Option<EntitySightingProjection> {
+    let SightingSnapshot {
+        camera_id,
+        track_id,
+        entity_local_id,
+        frame,
+        bbox,
+        confidence,
+        started_ts,
+        ts,
+        is_first,
+    } = snapshot;
+    let frame_w = frame.width;
+    let frame_h = frame.height;
+    let embedding = match extractor.extract(&frame, &bbox).await {
+        Ok(emb) => emb,
+        Err(e) => {
             warn!(
                 camera_id,
                 track_id,
-                got = embedding.vec.len(),
-                want = dim,
-                "entity-sighting embedding dimension mismatch; dropping snapshot"
+                error = %e,
+                "entity-sighting extractor failed; dropping snapshot"
             );
-            continue;
+            return None;
         }
-        // Phase 5.6 · R7 — record the emit in the shared stats
-        // registry BEFORE the publish branch. The admin /reid
-        // diagnostic page MUST be able to distinguish "extractor
-        // is running, cloud is down" from "extractor isn't even
-        // invoked", so we bump the counter even for the dev-mode
-        // skip path below.
-        stats.record_emit(camera_id, &embedding.vec, ts);
-        if !cloud_eligible {
-            debug!(
-                camera_id,
-                track_id,
-                model_id = %model_id,
-                "entity-sighting extracted (dev mode); skipping cloud publish"
-            );
-            continue;
-        }
-        // Saturating casts here: the engine's CameraId is i64 and
-        // BBox::{x1,y1,x2,y2} are f32. Negative cam_id never happens
-        // in practice (POST /cameras assigns from SQLite rowid which
-        // is always > 0), but `as u64` would underflow if it ever
-        // did — clamp explicitly so the wire bbox can never carry a
-        // surprise huge value.
-        let projection = EntitySightingProjection {
-            camera_id: u64::try_from(camera_id).unwrap_or(0),
-            entity_local_id,
-            embedding: embedding.vec,
-            embedding_model: model_id.clone(),
-            bbox: [
-                bbox.x1.max(0.0).round() as i64,
-                bbox.y1.max(0.0).round() as i64,
-                bbox.width().max(0.0).round() as i64,
-                bbox.height().max(0.0).round() as i64,
-            ],
-            confidence: f64::from(confidence).clamp(0.0, 1.0),
-            frame_w: u64::from(frame_w),
-            frame_h: u64::from(frame_h),
-            started_ts,
-            ts,
-            is_first_sighting: is_first,
-        };
-        let envelope = build_entity_sighting_envelope(projection);
-        match outbox.send(envelope).await {
-            Ok(()) => {
-                debug!(
-                    camera_id,
-                    track_id, is_first, "entity_sighting envelope published"
-                );
-            }
-            Err(e) => {
-                // Disconnected / send-channel-closed is the
-                // dominant case before enrollment completes; debug
-                // not warn so we don't spam the log during the
-                // first few minutes of life.
-                debug!(
-                    camera_id,
-                    track_id,
-                    error = %e,
-                    "entity_sighting envelope publish failed (tunnel down?); dropping"
-                );
-            }
-        }
+    };
+    if embedding.vec.len() != dim {
+        warn!(
+            camera_id,
+            track_id,
+            got = embedding.vec.len(),
+            want = dim,
+            "entity-sighting embedding dimension mismatch; dropping snapshot"
+        );
+        return None;
     }
+    // Phase 5.6 · R7 — record the emit in the shared stats
+    // registry BEFORE the publish branch. The admin /reid
+    // diagnostic page MUST be able to distinguish "extractor
+    // is running, cloud is down" from "extractor isn't even
+    // invoked", so we bump the counter even for the dev-mode
+    // skip path below.
+    stats.record_emit(camera_id, &embedding.vec, ts);
+    if !cloud_eligible {
+        debug!(
+            camera_id,
+            track_id,
+            model_id = %model_id,
+            "entity-sighting extracted (dev mode); skipping cloud publish"
+        );
+        return None;
+    }
+    // Saturating casts here: the engine's CameraId is i64 and
+    // BBox::{x1,y1,x2,y2} are f32. Negative cam_id never happens
+    // in practice (POST /cameras assigns from SQLite rowid which
+    // is always > 0), but `as u64` would underflow if it ever
+    // did — clamp explicitly so the wire bbox can never carry a
+    // surprise huge value.
+    Some(EntitySightingProjection {
+        camera_id: u64::try_from(camera_id).unwrap_or(0),
+        entity_local_id,
+        embedding: embedding.vec,
+        embedding_model: model_id.to_string(),
+        bbox: [
+            bbox.x1.max(0.0).round() as i64,
+            bbox.y1.max(0.0).round() as i64,
+            bbox.width().max(0.0).round() as i64,
+            bbox.height().max(0.0).round() as i64,
+        ],
+        confidence: f64::from(confidence).clamp(0.0, 1.0),
+        frame_w: u64::from(frame_w),
+        frame_h: u64::from(frame_h),
+        started_ts,
+        ts,
+        is_first_sighting: is_first,
+    })
 }
 
 #[cfg(test)]
@@ -444,5 +550,122 @@ mod tests {
             start.elapsed() < std::time::Duration::from_millis(200),
             "submit must be non-blocking even when the queue is full"
         );
+    }
+
+    // --------------------------------------------------------------------
+    // Phase M_PERF_CROWD A3 — entity_sighting_batch coverage.
+    // --------------------------------------------------------------------
+
+    use async_trait::async_trait;
+    use nexus_cloud_client::tunnel::{TunnelError, TunnelHandle};
+    use nexus_cloud_protocol::v1::{Envelope, EnvelopeBody};
+
+    struct CapturingTunnel {
+        sent: parking_lot::Mutex<Vec<Envelope>>,
+    }
+
+    #[async_trait]
+    impl TunnelHandle for CapturingTunnel {
+        async fn send(&self, envelope: Envelope) -> Result<(), TunnelError> {
+            self.sent.lock().push(envelope);
+            Ok(())
+        }
+    }
+
+    /// Force `cloud_eligible = true` by using a non-mock model id —
+    /// the worker only batches when the gateway will actually accept
+    /// the envelopes.
+    fn real_extractor() -> Arc<dyn Extractor> {
+        Arc::new(MockExtractor::with_config("dinov2-s-v1", 384))
+    }
+
+    fn install(outbox: &TunnelOutbox, caps: &[&str]) -> Arc<CapturingTunnel> {
+        let cap = Arc::new(CapturingTunnel {
+            sent: parking_lot::Mutex::new(Vec::new()),
+        });
+        outbox.set_handle(Some(cap.clone() as Arc<dyn TunnelHandle>));
+        let owned: Vec<String> = caps.iter().map(|s| (*s).to_string()).collect();
+        outbox.update_caps(Some(&owned));
+        cap
+    }
+
+    /// Phase M_PERF_CROWD A3 — when the cloud advertises
+    /// `entity_sighting_batch`, 64 snapshots arriving back-to-back
+    /// MUST be flushed as ≤ 4 envelopes (BATCH_MAX = 32), every
+    /// non-final envelope MUST be an `EntitySightingBatch`, and every
+    /// payload MUST carry `embedding_dtype = Some("f16")` when the
+    /// gateway also advertised `embedding_dtype_f16`.
+    #[tokio::test]
+    async fn batch_envelope_emitted_when_capability_advertised() {
+        let outbox = Arc::new(TunnelOutbox::new());
+        let cap = install(
+            &outbox,
+            &[
+                cloud_capabilities::ENTITY_SIGHTING_BATCH,
+                cloud_capabilities::EMBEDDING_DTYPE_F16,
+            ],
+        );
+        let stats = Arc::new(ReidStatsRegistry::new());
+        let hook = CloudEntitySightingHook::spawn(real_extractor(), outbox.clone(), 128, stats);
+        for i in 0..64 {
+            hook.submit(dummy_snapshot(1, i));
+        }
+        // Real wall-clock here; one BATCH_WINDOW per envelope at
+        // worst, so 64/32 = 2 windows plus a generous fudge for
+        // the per-snapshot extract pass.
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        let sent = cap.sent.lock().clone();
+        assert!(
+            sent.len() <= 4,
+            "batch mode produced {} envelopes for 64 snapshots; expected ≤ 4",
+            sent.len()
+        );
+        let mut total_items = 0usize;
+        for env in &sent {
+            match &env.body {
+                EnvelopeBody::EntitySightingBatch(b) => {
+                    assert!(!b.items.is_empty() && b.items.len() <= BATCH_MAX);
+                    for item in &b.items {
+                        assert_eq!(item.embedding_dtype.as_deref(), Some("f16"));
+                    }
+                    total_items += b.items.len();
+                }
+                EnvelopeBody::EntitySighting(p) => {
+                    // Permitted only as a trailing singleton.
+                    assert_eq!(p.embedding_dtype.as_deref(), Some("f16"));
+                    total_items += 1;
+                }
+                other => panic!("unexpected envelope body: {other:?}"),
+            }
+        }
+        assert_eq!(total_items, 64);
+    }
+
+    /// Without the `entity_sighting_batch` capability the worker
+    /// MUST fall back to the legacy per-item envelope and MUST NOT
+    /// stamp `embedding_dtype = "f16"`.
+    #[tokio::test]
+    async fn no_batching_when_capability_absent() {
+        let outbox = Arc::new(TunnelOutbox::new());
+        let cap = install(&outbox, &[]);
+        let stats = Arc::new(ReidStatsRegistry::new());
+        let hook = CloudEntitySightingHook::spawn(real_extractor(), outbox.clone(), 32, stats);
+        for i in 0..4 {
+            hook.submit(dummy_snapshot(1, i));
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let sent = cap.sent.lock().clone();
+        assert_eq!(sent.len(), 4, "legacy mode is one envelope per snapshot");
+        for env in &sent {
+            match &env.body {
+                EnvelopeBody::EntitySighting(p) => {
+                    assert!(
+                        p.embedding_dtype.is_none(),
+                        "FP16 must not be selected without capability"
+                    );
+                }
+                other => panic!("expected EntitySighting, got {other:?}"),
+            }
+        }
     }
 }
