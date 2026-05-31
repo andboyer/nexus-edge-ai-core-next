@@ -123,6 +123,7 @@ chrono = { workspace = true }
 chrono-tz = { workspace = true }
 uuid = { workspace = true }
 url = { workspace = true }
+percent-encoding = { workspace = true }
 parking_lot = { workspace = true }
 arc-swap = { workspace = true }
 futures = { workspace = true }

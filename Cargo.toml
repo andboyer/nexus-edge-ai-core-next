@@ -153,6 +153,10 @@ ts-rs = { version = "10", features = [
 
 once_cell = "1"
 url = { version = "2", features = ["serde"] }
+# Percent-decode userinfo (`url::Url::username()` / `password()`
+# return the encoded form; the RTSP probe needs the raw bytes
+# before computing Digest HA1).
+percent-encoding = "2"
 tempfile = "3"
 
 # Host metrics for `/api/v1/system/metrics` (M-Dashboard Phase 2).
