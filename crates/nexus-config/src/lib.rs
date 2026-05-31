@@ -1732,6 +1732,13 @@ pub struct CameraBehavior {
 /// than catching field-name typos.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CameraConfig {
+    // Defaults to 0 so admin-API POST bodies (and any caller that
+    // expects server-assigned ids) can omit the field. The
+    // `create_camera` handler in `nexus-engine::api` force-zeros
+    // this on insert anyway, so a missing id deserialises to the
+    // same value the handler would assign — no behaviour change
+    // for existing callers that send `id: 0` explicitly.
+    #[serde(default)]
     pub id: CameraId,
     pub name: String,
     #[serde(flatten)]
