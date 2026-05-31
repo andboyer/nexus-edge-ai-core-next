@@ -5,7 +5,7 @@
 //   * /v1/system/metrics every 2s
 //   * /events?limit=100 once per minute (for "events last hour")
 //   * /cameras once per minute (list rarely changes)
-//   * /api/stream/events SSE for the live ticker
+//   * /api/v1/stream/events SSE for the live ticker
 //   * /cameras/:id/frames/latest as JPEG every 2s (cache-busted)
 //
 // Cards that need fast feedback (CPU, RAM) poll once a second via
@@ -92,7 +92,7 @@ export function DashboardPage() {
   });
 
   // Live alert ticker from SSE.
-  const sse = useSSE<AlertEvent>({ url: "/api/stream/events", maxBuffer: 20 });
+  const sse = useSSE<AlertEvent>({ url: "/api/v1/stream/events", maxBuffer: 20 });
 
   // Rolling buffer of CPU/RAM percentages for sparklines.
   const cpuBuf = useRollingBuffer(metricsQuery.data?.cpu.usage_pct ?? null);
@@ -527,7 +527,7 @@ function CameraTile({ camera }: { camera: CameraConfig }) {
     queryKey: ["camera", camera.id, "meta"],
     queryFn: async () => {
       const r = await fetch(
-        `/api/cameras/${encodeURIComponent(camera.id)}/frames/latest.json`,
+        `/api/v1/cameras/${encodeURIComponent(camera.id)}/frames/latest.json`,
       );
       if (!r.ok) return null;
       return (await r.json()) as { captured_at?: string };

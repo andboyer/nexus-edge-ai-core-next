@@ -6,7 +6,7 @@
 //! restarting the engine.
 //!
 //! Why this exists: every camera mutation in the admin API
-//! (`PUT /api/cameras/{id}`, `DELETE /api/cameras/{id}`, including
+//! (`PUT /api/v1/cameras/{id}`, `DELETE /api/v1/cameras/{id}`, including
 //! the discovery → Add flow) writes the row + publishes a
 //! `config.changed` bus event. Without a subscriber, the on-disk
 //! state and the in-memory runtime drift apart until the next engine

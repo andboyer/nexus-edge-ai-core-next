@@ -28,7 +28,7 @@
 #     on first run; preserves operator edits forever after),
 #   * installs the systemd unit,
 #   * atomically flips /opt/nexus/current to the new release,
-#   * (re)starts nexus-engine.service and waits for /api/health.
+#   * (re)starts nexus-engine.service and waits for /api/v1/health.
 #
 # Idempotent: re-running with the same --tier on the same version
 # is a no-op except for `systemctl restart`.  Re-running with a
@@ -437,7 +437,7 @@ log ""
 log "================================================================"
 log "  nexus-engine $VERSION installed and healthy."
 log "  UI:    http://$(hostname -f 2>/dev/null || hostname)/"
-log "  API:   http://$(hostname -f 2>/dev/null || hostname):8089/api/health"
+log "  API:   http://$(hostname -f 2>/dev/null || hostname):8089/api/v1/health"
 log ""
 
 # --- First-boot admin credentials --------------------------------------------

@@ -31,7 +31,7 @@ export function getHealth(): Promise<HealthResponse> {
 // ---------------------------------------------------------------------------
 
 export function getSystemMetrics(): Promise<SystemMetrics> {
-  return api.get<SystemMetrics>("/v1/system/metrics");
+  return api.get<SystemMetrics>("/system/metrics");
 }
 
 // ---------------------------------------------------------------------------
@@ -50,7 +50,7 @@ export function getLatestFrameMeta(cameraId: string): Promise<FrameMetadata> {
 
 /** Absolute URL for a JPEG snapshot — used directly as an `<img src>`. */
 export function latestFrameJpegUrl(cameraId: string): string {
-  return `/api/cameras/${encodeURIComponent(cameraId)}/frames/latest`;
+  return `/api/v1/cameras/${encodeURIComponent(cameraId)}/frames/latest`;
 }
 
 // Per-camera live frame stats — fps EMA, frames_emitted/dropped,
@@ -109,7 +109,7 @@ export interface StaticObjectDefaults {
 }
 
 export function getStaticObjectDefaults(): Promise<StaticObjectDefaults> {
-  return api.get<StaticObjectDefaults>("/v1/system/static-object-defaults");
+  return api.get<StaticObjectDefaults>("/system/static-object-defaults");
 }
 
 // ---------------------------------------------------------------------------
@@ -122,7 +122,7 @@ export function listEvents(limit = 50): Promise<AlertEvent[]> {
 
 export function getEventDelivery(eventId: string): Promise<OutboxRow[]> {
   return api.get<OutboxRow[]>(
-    `/v1/events/${encodeURIComponent(eventId)}/delivery`,
+    `/events/${encodeURIComponent(eventId)}/delivery`,
   );
 }
 
@@ -130,7 +130,7 @@ export function getEventClipId(
   eventId: string,
 ): Promise<{ clip_id: number }> {
   return api.get<{ clip_id: number }>(
-    `/v1/events/${encodeURIComponent(eventId)}/clip`,
+    `/events/${encodeURIComponent(eventId)}/clip`,
   );
 }
 
@@ -154,7 +154,7 @@ export function listCameraMotion(
   params: MotionRangeParams = {},
 ): Promise<MotionEventRow[]> {
   return api.get<MotionEventRow[]>(
-    `/v1/cameras/${encodeURIComponent(cameraId)}/motion`,
+    `/cameras/${encodeURIComponent(cameraId)}/motion`,
     { query: { ...params } },
   );
 }
@@ -170,7 +170,7 @@ export function getCameraMotionHistogram(
   params: MotionHistogramParams = {},
 ): Promise<MotionHistogramBucket[]> {
   return api.get<MotionHistogramBucket[]>(
-    `/v1/cameras/${encodeURIComponent(cameraId)}/motion/histogram`,
+    `/cameras/${encodeURIComponent(cameraId)}/motion/histogram`,
     { query: { ...params } },
   );
 }

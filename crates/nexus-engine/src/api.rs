@@ -2,21 +2,21 @@
 //!
 //! Routes:
 //!
-//! * `GET  /api/health`
-//! * `GET  /api/cameras`
-//! * `PUT  /api/cameras/:id`
-//! * `DELETE /api/cameras/:id`
-//! * `GET  /api/cameras/:id/frames/latest`        — JPEG snapshot
-//! * `GET  /api/cameras/:id/frames/latest.json`   — metadata for that snapshot
-//! * `GET  /api/rules`
-//! * `PUT  /api/rules/:id`
-//! * `DELETE /api/rules/:id`
-//! * `POST /api/rules/validate`                  — compile-only CEL check
-//! * `POST /api/rules/preview`                   — replay against motion_events
-//! * `GET  /api/events?limit=N`
-//! * `GET  /api/stream/metadata`                  — SSE
-//! * `GET  /api/stream/events`                    — SSE
-//! * `GET  /api/backends`                         — DetectorPool slot status (OPS-1)
+//! * `GET  /api/v1/health`
+//! * `GET  /api/v1/cameras`
+//! * `PUT  /api/v1/cameras/:id`
+//! * `DELETE /api/v1/cameras/:id`
+//! * `GET  /api/v1/cameras/:id/frames/latest`        — JPEG snapshot
+//! * `GET  /api/v1/cameras/:id/frames/latest.json`   — metadata for that snapshot
+//! * `GET  /api/v1/rules`
+//! * `PUT  /api/v1/rules/:id`
+//! * `DELETE /api/v1/rules/:id`
+//! * `POST /api/v1/rules/validate`                  — compile-only CEL check
+//! * `POST /api/v1/rules/preview`                   — replay against motion_events
+//! * `GET  /api/v1/events?limit=N`
+//! * `GET  /api/v1/stream/metadata`                  — SSE
+//! * `GET  /api/v1/stream/events`                    — SSE
+//! * `GET  /api/v1/backends`                         — DetectorPool slot status (OPS-1)
 //!
 //! Everything else is served from the UI directory via [`tower_http::services::ServeDir`].
 
@@ -75,7 +75,7 @@ pub struct ApiState {
     /// `engine_runtime_settings` shape.
     pub current_ui_bind: Option<String>,
     /// Shared with every per-camera supervisor. The admin
-    /// `PUT /api/rules/:id` + `DELETE /api/rules/:id` handlers
+    /// `PUT /api/v1/rules/:id` + `DELETE /api/v1/rules/:id` handlers
     /// call `reload()` on this after the DB write so rule edits
     /// take effect on the next frame without an engine restart.
     /// Without this wire-up the engine kept evaluating with the
@@ -227,7 +227,7 @@ pub struct ApiState {
     pub state_dir: PathBuf,
     /// Operator-initiated static-anchor wipe signal shared with
     /// every camera supervisor. Bumped by
-    /// `DELETE /api/cameras/:id/static-anchors`; the supervisor
+    /// `DELETE /api/v1/cameras/:id/static-anchors`; the supervisor
     /// polls per-frame and invokes
     /// `StaticObjectFilter::clear` (in-memory + on-disk) on the
     /// next iteration after a delta. See
@@ -262,7 +262,7 @@ pub struct ApiState {
     /// Shared handle on the outbound tunnel session — held by the
     /// cloud_tunnel supervisor and used here only for the
     /// read-only `is_connected()` probe surfaced by
-    /// `GET /api/cloud/status`. When the engine is built without
+    /// `GET /api/v1/cloud/status`. When the engine is built without
     /// any enrollment, the outbox lives but `is_connected()` stays
     /// `false` forever — that's what powers the "cloud:
     /// unenrolled / disconnected / connected" pill in the topbar.
@@ -564,25 +564,25 @@ pub fn router(state: ApiState) -> Router {
         ));
 
     let api = Router::new()
-        .route("/health", get(health))
+        .route("/v1/health", get(health))
         // Unauthenticated cloud-tunnel liveness probe. Returns
         // `{enrolled, connected}` so the TopBar can render a
         // "cloud: unenrolled / disconnected / connected" pill
         // next to the engine-health pill. Deliberately minimal:
         // no gateway URL, no core_id (those stay behind the
         // admin gate at `/v1/admin/cloud/enrollment`).
-        .route("/cloud/status", get(cloud_status))
-        .route("/cameras", get(list_cameras).post(create_camera))
-        .route("/cameras/{id}", put(upsert_camera).delete(delete_camera))
-        .route("/cameras/{id}/frames/latest", get(get_latest_frame_jpeg))
+        .route("/v1/cloud/status", get(cloud_status))
+        .route("/v1/cameras", get(list_cameras).post(create_camera))
+        .route("/v1/cameras/{id}", put(upsert_camera).delete(delete_camera))
+        .route("/v1/cameras/{id}/frames/latest", get(get_latest_frame_jpeg))
         .route(
-            "/cameras/{id}/frames/latest.json",
+            "/v1/cameras/{id}/frames/latest.json",
             get(get_latest_frame_meta),
         )
         // M-Admin Phase 0 closeout — per-camera frame stats
         // (fps EMA, last_frame_age_ms, frames_emitted/dropped,
         // source dims). Used by the dashboard health column.
-        .route("/cameras/{id}/stats", get(get_camera_stats))
+        .route("/v1/cameras/{id}/stats", get(get_camera_stats))
         // Static-object map for the live viewer overlay. Reads
         // the on-disk per-camera anchor registry written by the
         // `StaticObjectFilter` running inside each supervisor.
@@ -591,7 +591,7 @@ pub fn router(state: ApiState) -> Router {
         // "Clear anchors" button when an operator notices stale
         // entries (e.g. a vehicle drove off occluded).
         .route(
-            "/cameras/{id}/static-anchors",
+            "/v1/cameras/{id}/static-anchors",
             get(get_static_anchors).delete(delete_static_anchors),
         )
         // Engine-wide defaults for tracker.static_object. Read by
@@ -602,21 +602,21 @@ pub fn router(state: ApiState) -> Router {
             "/v1/system/static-object-defaults",
             get(get_static_object_defaults),
         )
-        .route("/rules", get(list_rules).post(create_rule))
-        .route("/rules/{id}", put(upsert_rule))
-        .route("/rules/{id}", delete(delete_rule))
-        .route("/rules/validate", axum::routing::post(validate_rule))
-        .route("/rules/preview", axum::routing::post(preview_rule))
+        .route("/v1/rules", get(list_rules).post(create_rule))
+        .route("/v1/rules/{id}", put(upsert_rule))
+        .route("/v1/rules/{id}", delete(delete_rule))
+        .route("/v1/rules/validate", axum::routing::post(validate_rule))
+        .route("/v1/rules/preview", axum::routing::post(preview_rule))
         // CEL editor schema — labels emittable by the loaded detector
         // kinds plus the canonical attribute keys the annotator stamps.
         // The UI's CodeMirror completion source merges this with its
         // static fallback so newly-added annotator attributes show up
         // without a UI rebuild.
         .route("/v1/rules/schema", get(get_rules_schema))
-        .route("/events", get(list_events))
-        .route("/stream/metadata", get(stream_metadata))
-        .route("/stream/events", get(stream_events))
-        .route("/backends", get(get_backends))
+        .route("/v1/events", get(list_events))
+        .route("/v1/stream/metadata", get(stream_metadata))
+        .route("/v1/stream/events", get(stream_events))
+        .route("/v1/backends", get(get_backends))
         // M2.1 Stage A — motion + clips + storage health.
         .route("/v1/storage/local", get(get_storage_local))
         .route("/v1/cameras/{id}/motion", get(list_motion_for_camera))
@@ -638,7 +638,7 @@ pub fn router(state: ApiState) -> Router {
         // the global cascade. PUT sets or clears the override and
         // emits `rule.delivery_policy.changed` so the dispatcher
         // re-hydrates the in-memory cache. Mirrors the existing
-        // `/api/rules/{id}` shape — not gated, since the rules
+        // `/api/v1/rules/{id}` shape — not gated, since the rules
         // CRUD it lives next to isn't either.
         .route(
             "/v1/rules/{id}/delivery",
@@ -807,7 +807,7 @@ async fn health() -> Json<serde_json::Value> {
     }))
 }
 
-/// `GET /api/cloud/status` — unauthenticated liveness probe for the
+/// `GET /api/v1/cloud/status` — unauthenticated liveness probe for the
 /// cloud tunnel, used by the UI TopBar to render a status pill
 /// next to the engine-health pill.
 ///
@@ -2112,7 +2112,7 @@ struct StaticAnchorsFile {
     anchors: Vec<StaticAnchor>,
 }
 
-/// `GET /api/cameras/:id/static-anchors` — returns the persisted
+/// `GET /api/v1/cameras/:id/static-anchors` — returns the persisted
 /// static-object map for the camera. Missing file, empty list, or
 /// a parse error all collapse to `{ camera_id, anchors: [] }` (no
 /// 404 / 500) so the UI overlay can poll without bothering the
@@ -2155,7 +2155,7 @@ async fn get_static_anchors(
     }))
 }
 
-/// `DELETE /api/cameras/:id/static-anchors` — operator-initiated
+/// `DELETE /api/v1/cameras/:id/static-anchors` — operator-initiated
 /// wipe of the persisted + in-memory static-object map for one
 /// camera. Bumps the per-camera entry in the shared
 /// [`StaticAnchorClearRegistry`]; the camera's supervisor task
@@ -5099,7 +5099,7 @@ mod tests {
         assert!(parse_byte_range("bytes=500-100", 1000).is_none());
     }
 
-    // M-Admin Phase 5 — POST /api/rules/validate.
+    // M-Admin Phase 5 — POST /api/v1/rules/validate.
     //
     // The handler is intentionally `async fn` over `Json<T>`, so we
     // can drive it directly here without standing up a Router or a
@@ -5155,7 +5155,7 @@ mod tests {
         }
     }
 
-    // POST /api/rules/preview — exercises the full HTTP round-trip
+    // POST /api/v1/rules/preview — exercises the full HTTP round-trip
     // (router + state) because the handler reads from `ApiState`
     // (store + frame cache + cameras). Two slices:
     //   * happy path: insert a couple of motion_events; CEL filters
@@ -5244,7 +5244,7 @@ mod tests {
         });
         let req = Request::builder()
             .method(Method::POST)
-            .uri("/api/rules/preview")
+            .uri("/api/v1/rules/preview")
             .header("content-type", "application/json")
             .body(Body::from(body.to_string()))
             .unwrap();
@@ -5281,7 +5281,7 @@ mod tests {
         });
         let req = Request::builder()
             .method(Method::POST)
-            .uri("/api/rules/preview")
+            .uri("/api/v1/rules/preview")
             .header("content-type", "application/json")
             .body(Body::from(body.to_string()))
             .unwrap();

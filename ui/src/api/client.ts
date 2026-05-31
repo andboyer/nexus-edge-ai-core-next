@@ -17,7 +17,7 @@
 
 import type { TokenResponse } from "@/api/types";
 
-const BASE = "/api";
+const BASE = "/api/v1";
 
 // In-memory mirror of the session. Owned by AuthProvider; this module
 // just reads/writes via setters so we don't introduce a React import
@@ -77,7 +77,7 @@ export interface RequestOptions {
 }
 
 function buildUrl(path: string, query?: RequestOptions["query"]): string {
-  const url = path.startsWith("/api/") ? path : `${BASE}${path}`;
+  const url = path.startsWith("/api/v1/") ? path : `${BASE}${path}`;
   if (!query) return url;
   const params = new URLSearchParams();
   for (const [k, v] of Object.entries(query)) {
@@ -151,7 +151,7 @@ async function doFetch<T>(path: string, opts: RequestOptions): Promise<T> {
 async function tryRefresh(): Promise<boolean> {
   if (!currentRefreshToken) return false;
   try {
-    const res = await fetch(`${BASE}/v1/auth/refresh`, {
+    const res = await fetch(`${BASE}/auth/refresh`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ refresh_token: currentRefreshToken }),

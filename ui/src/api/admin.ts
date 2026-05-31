@@ -16,41 +16,41 @@ import type {
 // --- Users ----------------------------------------------------------------
 
 export function listUsers(includeDeleted = false) {
-  return api.get<ListUsersResponse>("/v1/admin/users", {
+  return api.get<ListUsersResponse>("/admin/users", {
     query: includeDeleted ? { include_deleted: true } : undefined,
   });
 }
 
 export function createUser(req: CreateUserRequest) {
-  return api.post<CreateUserResponse>("/v1/admin/users", req);
+  return api.post<CreateUserResponse>("/admin/users", req);
 }
 
 export function updateUser(id: string, req: UpdateUserRequest) {
-  return api.put<UserView>(`/v1/admin/users/${encodeURIComponent(id)}`, req);
+  return api.put<UserView>(`/admin/users/${encodeURIComponent(id)}`, req);
 }
 
 export function resetUserPassword(id: string) {
   return api.post<ResetPasswordResponse>(
-    `/v1/admin/users/${encodeURIComponent(id)}/reset-password`,
+    `/admin/users/${encodeURIComponent(id)}/reset-password`,
     {},
   );
 }
 
 export function unlockUser(id: string) {
   return api.post<void>(
-    `/v1/admin/users/${encodeURIComponent(id)}/unlock`,
+    `/admin/users/${encodeURIComponent(id)}/unlock`,
     {},
   );
 }
 
 export function deleteUser(id: string) {
-  return api.delete<void>(`/v1/admin/users/${encodeURIComponent(id)}`);
+  return api.delete<void>(`/admin/users/${encodeURIComponent(id)}`);
 }
 
 // --- Audit ----------------------------------------------------------------
 
 export function listAudit(q: ListAuditQuery = {}) {
-  return api.get<ListAuditResponse>("/v1/admin/audit", {
+  return api.get<ListAuditResponse>("/admin/audit", {
     query: q as Record<string, string | number | boolean | undefined>,
   });
 }
@@ -98,7 +98,7 @@ export interface PutServerBindOut {
 }
 
 export function getServerBind() {
-  return api.get<ServerBindOut>("/v1/admin/server/bind");
+  return api.get<ServerBindOut>("/admin/server/bind");
 }
 
 export function putServerBind(addr: string, ui_bind?: UiBindUpdate) {
@@ -106,7 +106,7 @@ export function putServerBind(addr: string, ui_bind?: UiBindUpdate) {
   // touched the UI bind editor — keeps the wire shape stable.
   const body: { addr: string; ui_bind?: UiBindUpdate } = { addr };
   if (ui_bind !== undefined) body.ui_bind = ui_bind;
-  return api.put<PutServerBindOut>("/v1/admin/server/bind", body);
+  return api.put<PutServerBindOut>("/admin/server/bind", body);
 }
 
 // --- Auth config (M-Admin Phase 0, restart-based) -------------------------
@@ -147,11 +147,11 @@ export interface PutAuthConfigOut {
 }
 
 export function getAuthConfig() {
-  return api.get<AuthConfigOut>("/v1/admin/auth/config");
+  return api.get<AuthConfigOut>("/admin/auth/config");
 }
 
 export function putAuthConfig(body: unknown) {
-  return api.put<PutAuthConfigOut>("/v1/admin/auth/config", body);
+  return api.put<PutAuthConfigOut>("/admin/auth/config", body);
 }
 
 // --- OIDC discovery dry-run -----------------------------------------------
@@ -172,7 +172,7 @@ export function testOidcDiscovery(req: {
   jwks_uri?: string;
 }) {
   return api.post<TestDiscoveryOut>(
-    "/v1/admin/auth/oidc/test-discovery",
+    "/admin/auth/oidc/test-discovery",
     req,
   );
 }
@@ -259,11 +259,11 @@ export interface PutWatermarkOut {
 }
 
 export function getWatermarks() {
-  return api.get<WatermarkOut>("/v1/admin/server/watermarks");
+  return api.get<WatermarkOut>("/admin/server/watermarks");
 }
 
 export function putWatermarks(low_pct: number, panic_pct: number) {
-  return api.put<PutWatermarkOut>("/v1/admin/server/watermarks", {
+  return api.put<PutWatermarkOut>("/admin/server/watermarks", {
     low_pct,
     panic_pct,
   });
@@ -295,7 +295,7 @@ export interface ReidStatusResponse {
 }
 
 export function getReidStatus() {
-  return api.get<ReidStatusResponse>("/v1/admin/reid/status");
+  return api.get<ReidStatusResponse>("/admin/reid/status");
 }
 
 
@@ -333,11 +333,11 @@ export interface InferenceModelPatch {
 }
 
 export function getInferenceModel() {
-  return api.get<InferenceModelOut>("/v1/admin/server/inference");
+  return api.get<InferenceModelOut>("/admin/server/inference");
 }
 
 export function putInferenceModel(patch: InferenceModelPatch) {
-  return api.put<PutInferenceModelOut>("/v1/admin/server/inference", patch);
+  return api.put<PutInferenceModelOut>("/admin/server/inference", patch);
 }
 
 
@@ -386,11 +386,11 @@ export interface PostCloudEnrollReq {
 }
 
 export function getCloudEnrollment() {
-  return api.get<CloudEnrollmentStatus>("/v1/admin/cloud/enrollment");
+  return api.get<CloudEnrollmentStatus>("/admin/cloud/enrollment");
 }
 
 export function postCloudEnroll(req: PostCloudEnrollReq) {
-  return api.post<CloudEnrollmentStatus>("/v1/admin/cloud/enroll", req);
+  return api.post<CloudEnrollmentStatus>("/admin/cloud/enroll", req);
 }
 
 
@@ -404,7 +404,7 @@ export interface RestartOut {
 
 export function restartEngine(delay_ms?: number) {
   return api.post<RestartOut>(
-    "/v1/admin/server/restart",
+    "/admin/server/restart",
     delay_ms === undefined ? {} : { delay_ms },
   );
 }
@@ -513,29 +513,29 @@ export interface ApplyStatusOut {
 }
 
 export function listNetworkInterfaces() {
-  return api.get<InterfacesOut>("/v1/admin/network/interfaces");
+  return api.get<InterfacesOut>("/admin/network/interfaces");
 }
 
 export function getNetworkPlan() {
-  return api.get<PlanOut>("/v1/admin/network/plan");
+  return api.get<PlanOut>("/admin/network/plan");
 }
 
 export function putNetworkPlan(plan: NetplanPlan) {
-  return api.put<PlanOut>("/v1/admin/network/plan", plan);
+  return api.put<PlanOut>("/admin/network/plan", plan);
 }
 
 export function applyNetworkPlan() {
-  return api.post<ApplyOut>("/v1/admin/network/plan/apply", {});
+  return api.post<ApplyOut>("/admin/network/plan/apply", {});
 }
 
 export function confirmNetworkApply(apply_token: string) {
-  return api.post<void>("/v1/admin/network/plan/confirm", { apply_token });
+  return api.post<void>("/admin/network/plan/confirm", { apply_token });
 }
 
 export function rollbackNetworkApply() {
-  return api.post<void>("/v1/admin/network/plan/rollback", {});
+  return api.post<void>("/admin/network/plan/rollback", {});
 }
 
 export function getNetworkApplyStatus() {
-  return api.get<ApplyStatusOut>("/v1/admin/network/apply/status");
+  return api.get<ApplyStatusOut>("/admin/network/apply/status");
 }

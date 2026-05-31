@@ -187,13 +187,13 @@ export default async function globalSetup() {
     }
   });
 
-  // Wait for /api/health to respond, up to 30s.
+  // Wait for /api/v1/health to respond, up to 30s.
   const deadline = Date.now() + 30_000;
   let healthy = false;
   while (Date.now() < deadline) {
     if (child.exitCode !== null) break;
     try {
-      const r = await fetch(`${baseUrl}/api/health`);
+      const r = await fetch(`${baseUrl}/api/v1/health`);
       if (r.ok) {
         healthy = true;
         break;

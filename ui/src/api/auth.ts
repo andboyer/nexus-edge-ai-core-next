@@ -20,19 +20,19 @@ export interface OidcStartResponse {
 }
 
 export const authApi = {
-  info: () => api.get<AuthInfo>("/v1/auth/info"),
+  info: () => api.get<AuthInfo>("/auth/info"),
 
   login: (username: string, password: string) =>
-    api.post<TokenResponse>("/v1/auth/login", { username, password }),
+    api.post<TokenResponse>("/auth/login", { username, password }),
 
   refresh: (refresh_token: string) =>
-    api.post<TokenResponse>("/v1/auth/refresh", { refresh_token }),
+    api.post<TokenResponse>("/auth/refresh", { refresh_token }),
 
   logout: (refresh_token?: string) =>
-    api.post<void>("/v1/auth/logout", refresh_token ? { refresh_token } : {}),
+    api.post<void>("/auth/logout", refresh_token ? { refresh_token } : {}),
 
   changePassword: (old_password: string, new_password: string) =>
-    api.post<void>("/v1/auth/change-password", { old_password, new_password }),
+    api.post<void>("/auth/change-password", { old_password, new_password }),
 
   // First-run setup. Unauthenticated. Only call when
   // `info.first_run_pending` is true; the engine returns 409
@@ -41,7 +41,7 @@ export const authApi = {
   // immediately.
   firstRunSetup: (password: string, username?: string) =>
     api.post<TokenResponse>(
-      "/v1/auth/first-run-setup",
+      "/auth/first-run-setup",
       username ? { username, password } : { password },
     ),
 
@@ -51,7 +51,7 @@ export const authApi = {
   // by the response (HttpOnly, scoped to /api/v1/auth).
   oidcStart: (redirect_to?: string) =>
     api.post<OidcStartResponse>(
-      "/v1/auth/oidc/start",
+      "/auth/oidc/start",
       redirect_to ? { redirect_to } : {},
     ),
 };

@@ -43,7 +43,7 @@ impl DetectorPool {
         }
     }
 
-    /// Per-slot status snapshot — exposed by `/api/backends` for OPS.
+    /// Per-slot status snapshot — exposed by `/api/v1/backends` for OPS.
     pub fn snapshot(&self) -> Vec<BackendStatus> {
         let mut out: Vec<BackendStatus> = self
             .workers

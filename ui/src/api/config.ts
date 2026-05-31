@@ -110,7 +110,7 @@ export interface RulesSchema {
 }
 
 export function getRulesSchema(): Promise<RulesSchema> {
-  return api.get<RulesSchema>("/v1/rules/schema");
+  return api.get<RulesSchema>("/rules/schema");
 }
 
 export function previewRule(
@@ -124,12 +124,12 @@ export function previewRule(
 // ---------------------------------------------------------------------------
 
 export function listVisualPrompts(): Promise<VisualPromptSummary[]> {
-  return api.get<VisualPromptSummary[]>("/v1/admin/visual-prompts");
+  return api.get<VisualPromptSummary[]>("/admin/visual-prompts");
 }
 
 export function getVisualPrompt(id: string): Promise<VisualPrompt> {
   return api.get<VisualPrompt>(
-    `/v1/admin/visual-prompts/${encodeURIComponent(id)}`,
+    `/admin/visual-prompts/${encodeURIComponent(id)}`,
   );
 }
 
@@ -146,12 +146,12 @@ export function uploadVisualPrompt(opts: {
   fd.set("name", opts.name);
   if (opts.description) fd.set("description", opts.description);
   fd.set("image", opts.image);
-  return api.post<VisualPrompt>("/v1/admin/visual-prompts", fd);
+  return api.post<VisualPrompt>("/admin/visual-prompts", fd);
 }
 
 export function deleteVisualPrompt(id: string): Promise<void> {
   return api.delete<void>(
-    `/v1/admin/visual-prompts/${encodeURIComponent(id)}`,
+    `/admin/visual-prompts/${encodeURIComponent(id)}`,
   );
 }
 
@@ -159,7 +159,7 @@ export function listCameraVisualPrompts(
   cameraId: string,
 ): Promise<CameraVisualPromptAttachment[]> {
   return api.get<CameraVisualPromptAttachment[]>(
-    `/v1/admin/cameras/${encodeURIComponent(cameraId)}/visual-prompts`,
+    `/admin/cameras/${encodeURIComponent(cameraId)}/visual-prompts`,
   );
 }
 
@@ -168,7 +168,7 @@ export function attachVisualPrompt(
   visualPromptId: string,
 ): Promise<void> {
   return api.post<void>(
-    `/v1/admin/cameras/${encodeURIComponent(cameraId)}/visual-prompts/${encodeURIComponent(visualPromptId)}`,
+    `/admin/cameras/${encodeURIComponent(cameraId)}/visual-prompts/${encodeURIComponent(visualPromptId)}`,
   );
 }
 
@@ -177,7 +177,7 @@ export function detachVisualPrompt(
   visualPromptId: string,
 ): Promise<void> {
   return api.delete<void>(
-    `/v1/admin/cameras/${encodeURIComponent(cameraId)}/visual-prompts/${encodeURIComponent(visualPromptId)}`,
+    `/admin/cameras/${encodeURIComponent(cameraId)}/visual-prompts/${encodeURIComponent(visualPromptId)}`,
   );
 }
 
@@ -187,7 +187,7 @@ export function detachVisualPrompt(
 
 export function startOnvifDiscovery(): Promise<DiscoverySessionCreated> {
   return api.post<DiscoverySessionCreated>(
-    "/v1/admin/discovery/onvif",
+    "/admin/discovery/onvif",
     {},
   );
 }
@@ -196,7 +196,7 @@ export function startCidrScan(
   req: ScanRequest,
 ): Promise<DiscoverySessionCreated> {
   return api.post<DiscoverySessionCreated>(
-    "/v1/admin/discovery/scan",
+    "/admin/discovery/scan",
     req,
   );
 }
@@ -205,7 +205,7 @@ export function getDiscoverySession(
   sessionId: string,
 ): Promise<DiscoverySessionView> {
   return api.get<DiscoverySessionView>(
-    `/v1/admin/discovery/sessions/${encodeURIComponent(sessionId)}`,
+    `/admin/discovery/sessions/${encodeURIComponent(sessionId)}`,
   );
 }
 
@@ -214,7 +214,7 @@ export function probeRtsp(
   req: ProbeRtspRequest,
 ): Promise<ProbeRtspResult> {
   return api.post<ProbeRtspResult>(
-    `/v1/admin/discovery/sessions/${encodeURIComponent(sessionId)}/probe-rtsp`,
+    `/admin/discovery/sessions/${encodeURIComponent(sessionId)}/probe-rtsp`,
     req,
   );
 }
@@ -229,7 +229,7 @@ export function probeOnvifStreams(
   req: ProbeOnvifRequest,
 ): Promise<ProbeOnvifResult> {
   return api.post<ProbeOnvifResult>(
-    `/v1/admin/discovery/sessions/${encodeURIComponent(sessionId)}/onvif-streams`,
+    `/admin/discovery/sessions/${encodeURIComponent(sessionId)}/onvif-streams`,
     req,
   );
 }
@@ -239,5 +239,5 @@ export function probeOnvifStreams(
 // ---------------------------------------------------------------------------
 
 export function getModelPromptsCatalog(): Promise<ModelPromptsCatalog> {
-  return api.get<ModelPromptsCatalog>("/v1/models/prompts");
+  return api.get<ModelPromptsCatalog>("/models/prompts");
 }

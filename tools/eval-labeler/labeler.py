@@ -1,6 +1,6 @@
 """eval-labeler — judge open-vocab prompt precision against engine snapshots.
 
-Pulls /api/cameras/<id>/frames/latest from a running engine, lets the user
+Pulls /api/v1/cameras/<id>/frames/latest from a running engine, lets the user
 mark each detection True / False / Skip, and at the end reports per-prompt
 precision. Designed to be run *next to* a soak engine to grade prompt lists
 without a full eval harness.
@@ -29,8 +29,8 @@ class Snapshot:
 
 
 def fetch_snapshot(engine: str, camera: int) -> Snapshot:
-    img_url = f"{engine}/api/cameras/{camera}/frames/latest"
-    meta_url = f"{engine}/api/cameras/{camera}/frames/latest.json"
+    img_url = f"{engine}/api/v1/cameras/{camera}/frames/latest"
+    meta_url = f"{engine}/api/v1/cameras/{camera}/frames/latest.json"
     img_bytes = urllib.request.urlopen(img_url, timeout=5).read()
     meta = json.loads(urllib.request.urlopen(meta_url, timeout=5).read())
     return Snapshot(image=Image.open(io.BytesIO(img_bytes)).convert("RGB"),

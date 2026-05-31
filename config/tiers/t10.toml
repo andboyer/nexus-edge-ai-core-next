@@ -76,4 +76,4 @@ backend = "broadcast"
 capacity = 256                  # ~half of T24; matches expected sub/pub volume
 
 # Cameras are normally seeded from the admin UI / DB on first boot;
-# leave [[cameras]] empty here and add via PUT /api/cameras/:id.
+# leave [[cameras]] empty here and add via PUT /api/v1/cameras/:id.

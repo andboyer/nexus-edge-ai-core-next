@@ -47,7 +47,7 @@ pub struct VisualPrompt {
     pub updated_at: DateTime<Utc>,
 }
 
-/// Lightweight projection for the `/api/visual-prompts` listing.
+/// Lightweight projection for the `/api/v1/admin/visual-prompts` listing.
 /// Omits the embedding so the JSON payload stays in the kilobyte
 /// range even with hundreds of prompts.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

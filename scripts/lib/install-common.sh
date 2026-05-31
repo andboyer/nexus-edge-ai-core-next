@@ -1147,16 +1147,16 @@ install_systemd_unit() {
 
 # --- Health check -------------------------------------------------------------
 
-# Poll the API until /api/health returns 200 or the timeout elapses.
+# Poll the API until /api/v1/health returns 200 or the timeout elapses.
 # The engine takes a few seconds to run migrations + open the model
 # pack on first boot; 60s is generous but still bounded.
 wait_for_health() {
     local timeout="${1:-60}"
     local port="${2:-8089}"
     local i=0
-    log "waiting for engine /api/health on :$port (up to ${timeout}s)..."
+    log "waiting for engine /api/v1/health on :$port (up to ${timeout}s)..."
     while (( i < timeout )); do
-        if curl -fsS -m 2 -o /dev/null "http://127.0.0.1:${port}/api/health" 2>/dev/null; then
+        if curl -fsS -m 2 -o /dev/null "http://127.0.0.1:${port}/api/v1/health" 2>/dev/null; then
             log "engine healthy after ${i}s"
             return 0
         fi

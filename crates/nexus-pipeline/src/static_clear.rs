@@ -1,7 +1,7 @@
 //! Per-camera operator-clear signal for the static-object filter.
 //!
 //! Owned by the engine; shared with every supervisor task and with
-//! the `DELETE /api/cameras/{id}/static-anchors` HTTP handler. The
+//! the `DELETE /api/v1/cameras/{id}/static-anchors` HTTP handler. The
 //! API handler bumps a per-camera sequence counter; the supervisor
 //! polls the counter once per frame and invokes
 //! [`nexus_tracker::static_object::StaticObjectFilter::clear`]
