@@ -103,7 +103,8 @@ pub fn spawn_tunnel(
     trace_rx: Option<mpsc::Receiver<Span>>,
     loopback_admin_base: Arc<arc_swap::ArcSwap<String>>,
     admin_secret: Option<Arc<String>>,
-) -> (oneshot::Sender<()>, tokio::task::JoinHandle<()>) {    let (tx, mut rx) = oneshot::channel::<()>();
+) -> (oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
+    let (tx, mut rx) = oneshot::channel::<()>();
     let handle = tokio::spawn(async move {
         // Shared HTTP client for the admin-passthrough RPC handler.
         // Cheap to clone (internal `Arc`); reusing one client keeps

@@ -1029,9 +1029,10 @@ mod tests {
     async fn forward_admin_request_404_json_round_trips_status_and_message() {
         let (base, _handle) = spawn_admin_stub().await;
         let client = reqwest::Client::new();
-        let wire = forward_admin_request(&client, &base, "DELETE", "/admin/cameras/999", None, None)
-            .await
-            .expect_err("expected 404");
+        let wire =
+            forward_admin_request(&client, &base, "DELETE", "/admin/cameras/999", None, None)
+                .await
+                .expect_err("expected 404");
         // Round-trip the wire JSON back into a RpcResponsePayload
         // the way the dispatcher does on the way out.
         let resp = parse_handler_error(&wire);
@@ -1050,10 +1051,16 @@ mod tests {
     async fn forward_admin_request_non_json_error_body_falls_back_to_default_code() {
         let (base, _handle) = spawn_admin_stub().await;
         let client = reqwest::Client::new();
-        let wire =
-            forward_admin_request(&client, &base, "GET", "/admin/discovery/sessions/abc", None, None)
-                .await
-                .expect_err("expected non-2xx");
+        let wire = forward_admin_request(
+            &client,
+            &base,
+            "GET",
+            "/admin/discovery/sessions/abc",
+            None,
+            None,
+        )
+        .await
+        .expect_err("expected non-2xx");
         let resp = parse_handler_error(&wire);
         assert_eq!(resp.status, 400);
         assert_eq!(
