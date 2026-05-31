@@ -6141,6 +6141,55 @@ mod tests {
         );
     }
 
+    // Regression: the cloud UI sends `POST /api/v1/admin/cameras`
+    // with a body that omits `id` (the server assigns it). Pre-fix
+    // `CameraConfig.id` had no serde default, so axum's
+    // `Json<CameraConfig>` extractor returned 422 and the operator
+    // saw "edge returned status 422" from the api-gateway. The fix
+    // adds `#[serde(default)]` to `id` so a missing id deserialises
+    // to 0 — the same value `create_camera` force-assigns on insert.
+    #[tokio::test]
+    async fn cloud_tunnel_create_camera_accepts_body_without_id() {
+        use axum::body::to_bytes;
+        const ADMIN_SECRET: &[u8] = b"cloud-tunnel-create-no-id-secret";
+        let (app, _store, _dir) = build_test_router(Some(ADMIN_SECRET)).await;
+        let token = sign_admin_jwt(ADMIN_SECRET);
+
+        // Cloud-UI shape: no `id`, codec pinned so the rtsp_probe
+        // path is skipped (otherwise the handler would block on a
+        // DESCRIBE against a non-routable address).
+        let body = serde_json::json!({
+            "name": "regression cam",
+            "url": "rtsp://camera.invalid:554/stream",
+            "codec": "h264",
+        });
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/admin/cameras")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+        let res = app.oneshot(req).await.unwrap();
+        let status = res.status();
+        let body_bytes = to_bytes(res.into_body(), 64 * 1024).await.unwrap();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "POST /api/v1/admin/cameras without id must succeed; got {status} body={}",
+            String::from_utf8_lossy(&body_bytes)
+        );
+        let cam: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(cam["name"], "regression cam");
+        // SQLite assigns id 1 for the first row.
+        assert!(
+            cam["id"].as_i64().is_some_and(|i| i > 0),
+            "engine should have stamped a server-assigned id; got {:?}",
+            cam["id"]
+        );
+    }
+
     //
     // Each test stands up its own router so the inserted rows
     // (rules, motion_events, outbox entries) don't leak. We exercise
