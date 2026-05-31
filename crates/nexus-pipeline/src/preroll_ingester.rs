@@ -355,6 +355,28 @@ impl PreRollIngester {
         let g = self.ring.lock();
         g.gop_count() >= 1 && g.sample_count() >= 1
     }
+
+    /// Synchronously tear down the always-on supervisor: flip the
+    /// shutdown flag, transition the active GStreamer pipeline to
+    /// NULL, and abort the background tokio task. Idempotent — a
+    /// second call is a no-op because both `Mutex<Option<_>>`
+    /// slots use `take()`. Drop calls this too, but holders that
+    /// know an ingester should stop right now (the recorder's
+    /// `remove_camera_ingester`) call it directly so the cleanup
+    /// is not gated on the Arc refcount reaching zero — other
+    /// holders (a per-camera supervisor's `SharedRtspSource`, an
+    /// in-flight clip's snapshot Arc) can keep the struct alive
+    /// for an unbounded amount of time without preventing the
+    /// retry loop from stopping.
+    pub fn shutdown(&self) {
+        self.shutdown.store(true, Ordering::Release);
+        if let Some(pipeline) = self.active_pipeline.lock().take() {
+            let _ = pipeline.set_state(gst::State::Null);
+        }
+        if let Some(handle) = self.task.lock().take() {
+            handle.abort();
+        }
+    }
 }
 
 async fn run_supervisor(
@@ -741,13 +763,10 @@ impl Drop for PreRollIngester {
         //   3. Abort the supervisor task. (Aborting first leaves
         //      the pipeline in PLAYING which causes GStreamer to
         //      emit a CRITICAL and on macOS SIGSEGV during dispose.)
-        self.shutdown.store(true, Ordering::Release);
-        if let Some(pipeline) = self.active_pipeline.lock().take() {
-            let _ = pipeline.set_state(gst::State::Null);
-        }
-        if let Some(handle) = self.task.lock().take() {
-            handle.abort();
-        }
+        // Delegates to `shutdown()` so the recorder's
+        // `remove_camera_ingester` path (which calls `shutdown()`
+        // directly) and this last-Arc-drop path stay byte-identical.
+        self.shutdown();
         debug!(camera_id = self.camera_id, "preroll ingester dropped");
     }
 }
