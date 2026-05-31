@@ -120,7 +120,7 @@ async fn build_worker_detector(kind: &str) -> Arc<dyn Detector> {
         // kind got encoded as NEXUS_WORKER_MODEL_KIND; the
         // worker-side warn here makes the misconfiguration loud and
         // the camera fall back to mock detections (visible as
-        // `model_kind=mock` on /api/cameras/:id/frames/latest.json).
+        // `model_kind=mock` on /api/v1/cameras/:id/frames/latest.json).
         "ensemble" => {
             eprintln!(
                 "[nexus-inference-worker] kind = 'ensemble' is not supported in the \

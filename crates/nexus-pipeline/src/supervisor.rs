@@ -244,7 +244,7 @@ async fn run_camera(
             stats.observe_frame(cfg.id, frame.captured_at, frame.width, frame.height);
 
             // Honour any operator-initiated anchor wipe issued via
-            // `DELETE /api/cameras/{id}/static-anchors` since the
+            // `DELETE /api/v1/cameras/{id}/static-anchors` since the
             // previous frame. Cheap: one atomic load per frame.
             // Skipped entirely for cameras where the filter is
             // disabled (`parking_lot_mode = false`).
@@ -656,7 +656,7 @@ fn build_source(
         // Refuse to silently fall back to a 640x480 black VirtualSource —
         // surface a loud error and return a FailingSource so the
         // supervisor's existing warn path makes the misconfiguration
-        // visible in `/api/cameras` (pipeline state stays Initializing →
+        // visible in `/api/v1/cameras` (pipeline state stays Initializing →
         // error) instead of "running" with a fake feed.
         #[cfg(not(feature = "gstreamer"))]
         "rtsp" | "rtsps" => {

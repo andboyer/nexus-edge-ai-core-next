@@ -4,7 +4,7 @@
 //!
 //! * `yoloe26_s_image_encoder.onnx` — image crop → embedding
 //!   vector. Runs in the engine process (this module), invoked
-//!   from the admin POST `/api/visual-prompts` handler ONCE per
+//!   from the admin POST `/api/v1/admin/visual-prompts` handler ONCE per
 //!   uploaded reference image. The embedding is persisted to
 //!   `visual_prompts.embedding_blob`.
 //!

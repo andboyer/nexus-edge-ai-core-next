@@ -365,7 +365,7 @@ async fn list_motion_events_for_camera_window_and_order() {
 
 #[tokio::test]
 async fn list_motion_events_across_cameras_filters_window_and_scope() {
-    // Powers `POST /api/rules/preview` — must:
+    // Powers `POST /api/v1/rules/preview` — must:
     //   * span multiple cameras when no filter is set,
     //   * apply IN(...) filter when the rule has a camera_filter,
     //   * order DESC by captured_at,

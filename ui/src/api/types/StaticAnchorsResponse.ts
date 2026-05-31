@@ -2,7 +2,7 @@
 import type { StaticAnchor } from "./StaticAnchor";
 
 /**
- * Returned by `GET /api/cameras/:id/static-anchors`. `anchors`
+ * Returned by `GET /api/v1/cameras/:id/static-anchors`. `anchors`
  * is empty when the per-camera registry file is missing OR when the
  * camera has `behavior.parking_lot_mode = false`.
  */

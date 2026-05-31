@@ -512,7 +512,7 @@ export interface BackendsResponse {
 }
 
 // ---------------------------------------------------------------------------
-// Health (GET /api/health).
+// Health (GET /api/v1/health).
 // ---------------------------------------------------------------------------
 
 export interface HealthResponse {

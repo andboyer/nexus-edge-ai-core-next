@@ -149,7 +149,7 @@ impl StaticObjectFilter {
     /// Wipe every persisted anchor and per-track state for this
     /// camera, then remove the on-disk registry file (so a restart
     /// doesn't resurrect what the operator just cleared). Used by
-    /// `DELETE /api/cameras/{id}/static-anchors` — the supervisor
+    /// `DELETE /api/v1/cameras/{id}/static-anchors` — the supervisor
     /// polls a shared clear-registry per frame and invokes this
     /// when an operator requests a reset.
     ///

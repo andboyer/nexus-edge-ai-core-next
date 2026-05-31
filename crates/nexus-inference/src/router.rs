@@ -187,7 +187,7 @@ impl InferenceRouter {
     }
 
     /// Default identity's pool, for back-compat with the existing
-    /// `/api/backends` endpoint.
+    /// `/api/v1/backends` endpoint.
     pub fn default_pool(&self) -> Option<Arc<DetectorPool>> {
         self.layers
             .get(&self.default_key)
@@ -218,7 +218,7 @@ impl InferenceRouter {
     }
 
     /// Every layer's composite identity (`kind@WxH`) as a display
-    /// string. Useful for diagnostics / `/api/backends` extensions —
+    /// string. Useful for diagnostics / `/api/v1/backends` extensions —
     /// callers that need to enumerate every distinct (kind, size)
     /// layer should consume this instead of [`detectors`].
     pub fn layer_keys(&self) -> Vec<String> {

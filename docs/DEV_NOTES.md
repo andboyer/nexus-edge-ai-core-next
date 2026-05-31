@@ -207,7 +207,7 @@ At boot, `InferenceRouter::build` walks the camera list, dedups
 overrides by `kind`, and builds one `InferenceLayer` per *kind
 referenced by any camera* (default + each unique override). Each
 camera spawn calls `router.detector_for_camera(&cam)` to get its
-`Arc<dyn Detector>`. The default kind's pool is what `/api/backends`
+`Arc<dyn Detector>`. The default kind's pool is what `/api/v1/backends`
 shows; per-kind pool visibility is a future expansion.
 
 Two cameras that pick the same `kind` but different thresholds today

@@ -361,7 +361,7 @@ fn check_time_sync() -> Outcome {
 }
 
 fn check_health(client: &Client, base: &str) -> Outcome {
-    let url = format!("{base}/api/health");
+    let url = format!("{base}/api/v1/health");
     match client.get(&url).send() {
         Ok(resp) => {
             let status = resp.status();
@@ -431,7 +431,7 @@ fn check_ui_loads(client: &Client, base: &str) -> Outcome {
     }
 }
 
-/// Result of `GET /api/cameras` parsed enough to decide which IDs to
+/// Result of `GET /api/v1/cameras` parsed enough to decide which IDs to
 /// snapshot / motion-poll. We deliberately don't import
 /// `nexus-config::CameraConfig` to keep the doctor crate's compile
 /// graph small; a serde_json::Value walk is enough.
@@ -443,7 +443,7 @@ struct CameraSummary {
 }
 
 fn fetch_cameras(client: &Client, base: &str) -> CameraSummary {
-    let url = format!("{base}/api/cameras");
+    let url = format!("{base}/api/v1/cameras");
     match client.get(&url).send() {
         Ok(resp) => {
             let status = resp.status();
@@ -558,7 +558,7 @@ fn check_snapshots(client: &Client, base: &str, enabled_ids: &[i64]) -> Outcome 
     let mut failures = 0;
     let mut empty_bodies = 0;
     for id in enabled_ids {
-        let url = format!("{base}/api/cameras/{id}/frames/latest");
+        let url = format!("{base}/api/v1/cameras/{id}/frames/latest");
         match client.get(&url).send() {
             Ok(resp) => {
                 let status = resp.status();
@@ -617,7 +617,7 @@ fn check_snapshots(client: &Client, base: &str, enabled_ids: &[i64]) -> Outcome 
 }
 
 fn check_backends_ready(client: &Client, base: &str) -> Outcome {
-    let url = format!("{base}/api/backends");
+    let url = format!("{base}/api/v1/backends");
     match client.get(&url).send() {
         Ok(resp) => {
             let status = resp.status();
@@ -843,7 +843,7 @@ fn check_motion_recent(client: &Client, base: &str, enabled_ids: &[i64]) -> Outc
 }
 
 fn check_events_recent(client: &Client, base: &str) -> Outcome {
-    let url = format!("{base}/api/events?limit=1");
+    let url = format!("{base}/api/v1/events?limit=1");
     match client.get(&url).send() {
         Ok(resp) => {
             let status = resp.status();
@@ -851,7 +851,7 @@ fn check_events_recent(client: &Client, base: &str) -> Outcome {
                 return Outcome::fail(
                     "9.8",
                     "events_recent",
-                    "200 OK from /api/events",
+                    "200 OK from /api/v1/events",
                     format!("HTTP {status}"),
                     "INSTALL.md §11 row 1 (engine HTTP unreachable).",
                 );
@@ -894,7 +894,7 @@ fn check_events_recent(client: &Client, base: &str) -> Outcome {
         Err(e) => Outcome::fail(
             "9.8",
             "events_recent",
-            "200 OK from /api/events",
+            "200 OK from /api/v1/events",
             format!("request failed: {e}"),
             "INSTALL.md §11 row 1 (engine HTTP unreachable).",
         ),

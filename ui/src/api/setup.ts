@@ -21,6 +21,6 @@ export interface SetupStatus {
 }
 
 export const setupApi = {
-  status: () => api.get<SetupStatus>("/v1/setup/status"),
-  complete: () => api.post<void>("/v1/setup/complete", {}),
+  status: () => api.get<SetupStatus>("/setup/status"),
+  complete: () => api.post<void>("/setup/complete", {}),
 };

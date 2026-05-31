@@ -357,7 +357,7 @@ pub struct AlertEvent {
 }
 
 // ---------------------------------------------------------------------------
-// Pipeline status (for /api/health and the ops bus)
+// Pipeline status (for /api/v1/health and the ops bus)
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -429,7 +429,7 @@ pub struct StaticAnchor {
     pub last_seen_unix_ms: Option<i64>,
 }
 
-/// Returned by `GET /api/cameras/:id/static-anchors`. `anchors`
+/// Returned by `GET /api/v1/cameras/:id/static-anchors`. `anchors`
 /// is empty when the per-camera registry file is missing OR when the
 /// camera has `behavior.parking_lot_mode = false`.
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -58,7 +58,7 @@ export function EventsPage() {
   });
 
   const sse = useSSE<AlertEvent>({
-    url: "/api/stream/events",
+    url: "/api/v1/stream/events",
     maxBuffer: 100,
     enabled: liveMode,
   });

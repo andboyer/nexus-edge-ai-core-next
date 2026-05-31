@@ -6,7 +6,7 @@
 //! whenever the motion gate (or any later stage) discards a frame.
 //!
 //! The HTTP layer (`GET /v1/cameras/:id/stats` + the same fields
-//! merged into `GET /api/cameras`) reads a cheap snapshot of the
+//! merged into `GET /api/v1/cameras`) reads a cheap snapshot of the
 //! map. Same contention model as [`crate::cache::LatestFrameCache`]:
 //! one writer per camera, many readers — `parking_lot::RwLock` over
 //! a `HashMap` is the right primitive.

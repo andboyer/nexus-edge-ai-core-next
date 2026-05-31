@@ -570,7 +570,7 @@ nexus-engine` to pick it up.
 > OpenVINO EP library can only be registered once. Listing both
 > `openvino` and `npu` trips the duplicate-registration guard, the
 > yolo loader silently catches the error, and the camera falls back
-> to the mock detector — `/api/backends` still reports
+> to the mock detector — `/api/v1/backends` still reports
 > `state: "ready"` so the failure is invisible from the UI. The
 > single `npu` entry already dispatches through the OpenVINO EP with
 > `device_type=NPU`, which covers both accelerators. See the inline
@@ -700,7 +700,7 @@ The bootstrap script:
    - Atomically flips `/opt/nexus/current → releases/<version>` and
      records the previous version into `/etc/nexus/install-state.json`.
    - Enables + starts the unit and waits up to 60 s for
-     `/api/health` to return 200.
+     `/api/v1/health` to return 200.
 
 ### 6.3 On-disk layout
 
@@ -816,7 +816,7 @@ CIDR sweep, with per-row **Verify** that issues an RTSP `OPTIONS` /
 
 ```bash
 curl -fsS -X PUT -H 'Content-Type: application/json' \
-    http://localhost:8089/api/cameras/1 \
+    http://localhost:8089/api/v1/cameras/1 \
     -d '{
       "id": 1,
       "name": "Front Door",
@@ -982,9 +982,9 @@ expected output; if you don't see it, drop into §9.
 ### 7.1 Engine answers HTTP
 
 ```bash
-curl -fsS http://localhost:8089/api/health
+curl -fsS http://localhost:8089/api/v1/health
 # Expect: {"status":"ok"}  (or similar — non-empty 200)
-curl -fsS http://localhost/api/health         # UI alias on :80
+curl -fsS http://localhost/api/v1/health         # UI alias on :80
 # Same body.
 ```
 
@@ -1017,7 +1017,7 @@ In the UI, each enabled camera should transition to **`connected`**
 within ~60 s.
 
 ```bash
-curl -fsS http://localhost:8089/api/cameras | jq '.[] | {id, name, enabled}'
+curl -fsS http://localhost:8089/api/v1/cameras | jq '.[] | {id, name, enabled}'
 ```
 
 If a camera is stuck on `connecting` for > 2 min, jump to §9 (RTSP
@@ -1029,7 +1029,7 @@ Proves the GStreamer source is producing frames *and* the inference
 pipeline is consuming them.
 
 ```bash
-curl -fsS http://localhost:8089/api/cameras/1/frames/latest \
+curl -fsS http://localhost:8089/api/v1/cameras/1/frames/latest \
   -o /tmp/cam1.jpg
 file /tmp/cam1.jpg
 # Expect: JPEG image data, baseline, precision 8, 1920x1080 ...
@@ -1038,7 +1038,7 @@ file /tmp/cam1.jpg
 ### 7.5 Inference backends are ready
 
 ```bash
-curl -fsS http://localhost:8089/api/backends | jq
+curl -fsS http://localhost:8089/api/v1/backends | jq
 # Expect: every slot in `state: "ready"` with the EP your tier expects:
 #   T10/T24/T36/T36-S → "openvino" (or "npu" on T36-S if NPU stack present)
 #   T64               → "cpu" today; "tensorrt" / "cuda" once M5 lands
@@ -1195,7 +1195,7 @@ yet — that's M2.2 (cold-mirror replication).
 
 | Symptom | Likely cause | Fix |
 | ------- | ------------ | --- |
-| `curl /api/health` returns connection refused | Engine isn't up. | `systemctl status nexus-engine`; check logs (§8.1). |
+| `curl /api/v1/health` returns connection refused | Engine isn't up. | `systemctl status nexus-engine`; check logs (§8.1). |
 | Engine refuses to start with `auth.mode = "none" is only allowed when server.api_bind is on loopback` | Since M-Install Checkpoint 2 the engine refuses to bind unauthenticated APIs onto a LAN. | Either change `[server].api_bind` to `127.0.0.1:8089` (LAN-only deployments), or set `[auth].mode = "local"`. The one-time admin password is at `/var/lib/nexus/state/bootstrap-password.txt` (mode 0600). |
 | Engine logs `auth: bootstrap admin created` / `one_time_password=<value>` at boot | First boot under `mode = "local"`. | Copy the OTP from `/var/lib/nexus/state/bootstrap-password.txt`, log in once at `http://<host>/login`, finish the wizard. |
 | UI loads but `/` returns 404 | `ui_root` mismatch — engine pointing at a path that doesn't exist. | `ls /opt/nexus/current/share/ui/index.html` should exist; `[server].ui_root` in `/etc/nexus/nexus.toml` should be `/opt/nexus/current/share/ui`. |
@@ -1203,7 +1203,7 @@ yet — that's M2.2 (cold-mirror replication).
 | `vainfo` succeeds for your login but engine logs say "no VAAPI device" | `nexus` user not in `render` group. | `sudo usermod -aG render nexus && sudo systemctl restart nexus-engine`. Re-running `install.sh` does this automatically. |
 | `/dev/accel/accel0` missing on T36-S | Kernel < 6.10, NPU disabled in BIOS, or driver trio not installed. | `uname -r` ≥ 6.10 (§3.6); §2 BIOS; §5.3 driver install. |
 | `nvidia-smi` works on the host but engine reports CPU EP only | T64 is post-beta; M5 hasn't landed. | Expected. The engine falls through to CPU until M5. |
-| `/api/backends` shows all slots `state: "ready"` but every camera returns generic / mock-looking detection labels | `ep_priority` lists both `openvino` and `npu`. ORT's `RegisterExecutionProviderLibrary` is one-shot per session — the duplicate trips a "Provider OpenVINOExecutionProvider has already been registered" error and the yolo loader silently falls back to the mock detector. | Set `ep_priority = ["npu", "cpu"]` (T36-S) or `ep_priority = ["openvino", "cpu"]` (T10/T24/T36) — never both. See [config/tiers/t36s.toml](../config/tiers/t36s.toml#L43). |
+| `/api/v1/backends` shows all slots `state: "ready"` but every camera returns generic / mock-looking detection labels | `ep_priority` lists both `openvino` and `npu`. ORT's `RegisterExecutionProviderLibrary` is one-shot per session — the duplicate trips a "Provider OpenVINOExecutionProvider has already been registered" error and the yolo loader silently falls back to the mock detector. | Set `ep_priority = ["npu", "cpu"]` (T36-S) or `ep_priority = ["openvino", "cpu"]` (T10/T24/T36) — never both. See [config/tiers/t36s.toml](../config/tiers/t36s.toml#L43). |
 | Camera reaches `streaming` once then stays at 0 fps after every subsequent reconnect, but VLC against the same URL works fine | IP-camera firmware (e.g. InSight CS-series) enforces one RTSP session per stream path. | Power-cycle the camera, confirm no other VMS / external probe is hitting the same `url`, and verify the engine is on `recorder = "gstreamer"` (§6.4). |
 | Recorder writes 0-byte mp4 files | `recorder = "stub"` (the runtime default when `[runtime.clips]` is missing). | Add `[runtime.clips] recorder = "gstreamer"` to `/etc/nexus/nexus.toml` and restart. |
 | Recorder writes ~864-byte mp4 files (`recorder_kind = "gstreamer"`) | mp4mux silently dropping buffers without PTS — should not happen on `main`. | Capture logs with `GST_DEBUG=qtmux:5,h264parse:4` and file an issue (§13). |
@@ -1260,7 +1260,7 @@ sudo cat /var/lib/nexus/state/bootstrap-password.txt
 
 # ---- §6.4 Add a camera (API) -------------------------------------
 curl -fsS -X PUT -H 'Content-Type: application/json' \
-    http://localhost:8089/api/cameras/1 \
+    http://localhost:8089/api/v1/cameras/1 \
     -d '{
       "id": 1,
       "name": "Front Door",
@@ -1271,12 +1271,12 @@ curl -fsS -X PUT -H 'Content-Type: application/json' \
     }'
 
 # ---- §7 Smoke test -----------------------------------------------
-curl -fsS http://localhost:8089/api/health
-curl -fsS http://localhost:8089/api/cameras | jq '.[] | {id, name}'
+curl -fsS http://localhost:8089/api/v1/health
+curl -fsS http://localhost:8089/api/v1/cameras | jq '.[] | {id, name}'
 sleep 60
-curl -fsS http://localhost:8089/api/cameras/1/frames/latest -o /tmp/cam1.jpg
+curl -fsS http://localhost:8089/api/v1/cameras/1/frames/latest -o /tmp/cam1.jpg
 file /tmp/cam1.jpg
-curl -fsS http://localhost:8089/api/backends | jq
+curl -fsS http://localhost:8089/api/v1/backends | jq
 curl -fsS http://localhost:8089/api/v1/storage/local | jq
 echo "Walk in front of camera 1 now..."
 sleep 15
@@ -1343,7 +1343,7 @@ jq '.recommended_tier, .accelerators' /var/lib/nexus/device-manifest.json
 
 # ---- §6.4 Add a camera -------------------------------------------
 curl -fsS -X PUT -H 'Content-Type: application/json' \
-    http://localhost:8089/api/cameras/1 \
+    http://localhost:8089/api/v1/cameras/1 \
     -d '{
       "id": 1,
       "name": "Front Door",
@@ -1354,13 +1354,13 @@ curl -fsS -X PUT -H 'Content-Type: application/json' \
     }'
 
 # ---- §7 Smoke test -----------------------------------------------
-curl -fsS http://localhost/api/health        # UI alias on port 80
-curl -fsS http://localhost:8089/api/health   # control-plane on 8089
-curl -fsS http://localhost:8089/api/backends | jq
+curl -fsS http://localhost/api/v1/health        # UI alias on port 80
+curl -fsS http://localhost:8089/api/v1/health   # control-plane on 8089
+curl -fsS http://localhost:8089/api/v1/backends | jq
 # Expect at least one backend with provider "openvino" and device
 # "NPU" listed before the GPU/CPU fallbacks in ep_priority.
 sleep 60
-curl -fsS http://localhost:8089/api/cameras/1/frames/latest -o /tmp/cam1.jpg
+curl -fsS http://localhost:8089/api/v1/cameras/1/frames/latest -o /tmp/cam1.jpg
 file /tmp/cam1.jpg
 echo "Walk in front of camera 1 now..."
 sleep 15

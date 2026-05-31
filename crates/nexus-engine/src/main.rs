@@ -556,14 +556,14 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
     // instantiated per-camera — a shared `Arc<dyn Tracker>` would
     // merge every camera's detections into one global track table,
     // surfacing camera A's bboxes (and track ids) in camera B's
-    // L7-cache entry / `/api/cameras/:id/frames/latest.json`. The
+    // L7-cache entry / `/api/v1/cameras/:id/frames/latest.json`. The
     // reconciler now owns construction; the boot loop below builds
     // its own per spawn from the same `cfg.tracker` snapshot.
     let cache = Arc::new(LatestFrameCache::new());
     // M-Admin Phase 0 closeout: per-camera frame-stats registry.
     // Shared between every supervisor task (writer) and the API
     // layer (reader: `GET /v1/cameras/:id/stats` and the merged
-    // health column on `GET /api/cameras`).
+    // health column on `GET /api/v1/cameras`).
     let frame_stats = Arc::new(FrameStatsRegistry::new());
 
     // Recorder is a per-process singleton: the watermark sampler
@@ -633,7 +633,7 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
     // because the reconciler may add/remove entries at any time.
     let running: reconciler::HandleMap =
         Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
-    // Shared bus that lets `DELETE /api/cameras/{id}/static-anchors`
+    // Shared bus that lets `DELETE /api/v1/cameras/{id}/static-anchors`
     // signal the per-camera supervisor to wipe its in-memory
     // anchor state + on-disk registry. See `static_clear.rs` in
     // nexus-pipeline for the polled-counter rationale.
@@ -1008,7 +1008,7 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
     // Camera hot-reload reconciler — subscribes to
     // `topic::CONFIG_CHANGED` and converges the live camera set
     // (DB) with the in-process supervisor / ingester set. Without
-    // this, cameras added via the discovery UI (or `PUT /api/cameras/{id}`)
+    // this, cameras added via the discovery UI (or `PUT /api/v1/cameras/{id}`)
     // persist to disk but never get a pipeline until the next
     // engine restart.
     let reconciler_handle = reconciler::spawn(reconciler::ReconcilerArgs {
@@ -1243,7 +1243,7 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
         // `runtime.state_dir` is a restart-required setting.
         state_dir: cfg.runtime.state_dir.clone(),
         // Operator-initiated static-anchor wipe signal. Shared with
-        // every supervisor; the `DELETE /api/cameras/{id}/static-anchors`
+        // every supervisor; the `DELETE /api/v1/cameras/{id}/static-anchors`
         // handler bumps the per-camera counter and the supervisor
         // notices on its next frame.
         static_clear: static_clear.clone(),
@@ -1262,7 +1262,7 @@ async fn run(cfg: Config, cli: Cli) -> Result<()> {
         // the WSS tunnel without an engine restart.
         cloud_enrollment_changed: cloud_enrollment_changed.clone(),
         // Shared with the tunnel supervisor so the unauthenticated
-        // `GET /api/cloud/status` handler can report whether the
+        // `GET /api/v1/cloud/status` handler can report whether the
         // WSS session is currently up. The supervisor calls
         // `set_handle(Some(...))` on connect and `set_handle(None)`
         // on every disconnect path, so `is_connected()` tracks the
