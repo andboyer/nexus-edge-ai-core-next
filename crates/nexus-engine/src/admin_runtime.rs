@@ -182,6 +182,10 @@ pub async fn get_server_bind(
     State(s): State<ApiState>,
     _admin: AdminContext,
 ) -> Result<Json<ServerBindOut>, ApiError> {
+    Ok(Json(compute_server_bind_out(&s).await))
+}
+
+async fn compute_server_bind_out(s: &ApiState) -> ServerBindOut {
     let persisted = s
         .store
         .read_runtime_setting(KEY_API_BIND)
@@ -200,12 +204,12 @@ pub async fn get_server_bind(
         Ok(Some(None)) => Some(UiBindPending::Clear),
         Ok(None) | Err(_) => None,
     };
-    Ok(Json(ServerBindOut {
+    ServerBindOut {
         current: s.current_bind.clone(),
         pending,
         ui_current: s.current_ui_bind.clone(),
         ui_pending,
-    }))
+    }
 }
 
 pub async fn put_server_bind(
@@ -1131,14 +1135,18 @@ pub async fn get_watermarks(
     State(s): State<ApiState>,
     _admin: AdminContext,
 ) -> Result<Json<WatermarkOut>, ApiError> {
-    let low_persisted = read_persisted_pct(&s, KEY_LOW_WATERMARK_PCT).await;
-    let panic_persisted = read_persisted_pct(&s, KEY_PANIC_WATERMARK_PCT).await;
-    Ok(Json(WatermarkOut {
+    Ok(Json(compute_watermark_out(&s).await))
+}
+
+async fn compute_watermark_out(s: &ApiState) -> WatermarkOut {
+    let low_persisted = read_persisted_pct(s, KEY_LOW_WATERMARK_PCT).await;
+    let panic_persisted = read_persisted_pct(s, KEY_PANIC_WATERMARK_PCT).await;
+    WatermarkOut {
         low_pct: s.low_watermark_pct,
         panic_pct: s.panic_watermark_pct,
         pending_low_pct: low_persisted.filter(|v| *v != s.low_watermark_pct),
         pending_panic_pct: panic_persisted.filter(|v| *v != s.panic_watermark_pct),
-    }))
+    }
 }
 
 pub async fn put_watermarks(
@@ -1384,6 +1392,10 @@ pub async fn get_inference_model(
     State(s): State<ApiState>,
     _admin: AdminContext,
 ) -> Result<Json<InferenceModelOut>, ApiError> {
+    Ok(Json(compute_inference_model_out(&s).await))
+}
+
+async fn compute_inference_model_out(s: &ApiState) -> InferenceModelOut {
     let current = ModelView::from_full(&s.current_inference_model);
     let pending = read_persisted_model(&s.store)
         .await
@@ -1400,11 +1412,11 @@ pub async fn get_inference_model(
                 || (p.score_threshold - current.score_threshold).abs() > f32::EPSILON
                 || p.pack_path != current.pack_path
         });
-    Ok(Json(InferenceModelOut {
+    InferenceModelOut {
         current,
         pending,
         available_kinds: crate::models_catalog::KNOWN_KINDS,
-    }))
+    }
 }
 
 pub async fn put_inference_model(
@@ -1777,8 +1789,13 @@ pub async fn get_server_identity(
     State(s): State<ApiState>,
     _admin: AdminContext,
 ) -> Result<Json<IdentityOut>, ApiError> {
-    let display_name = read_display_name(&s.store).await;
-    Ok(Json(IdentityOut { display_name }))
+    Ok(Json(compute_identity_out(&s).await))
+}
+
+async fn compute_identity_out(s: &ApiState) -> IdentityOut {
+    IdentityOut {
+        display_name: read_display_name(&s.store).await,
+    }
 }
 
 /// Cheap helper shared with `cloud_tunnel::pump_heartbeats` so
@@ -1858,6 +1875,36 @@ pub async fn put_server_identity(
     }))
 }
 
+// Phase C follow-up: single-fetch bundle of every `/admin/server/*`
+// GET endpoint. The cloud console's Core Settings tabs render
+// across one tunnel round-trip instead of four; the local UI can
+// adopt it incrementally.
+#[derive(Debug, Serialize)]
+pub struct ServerAllOut {
+    pub bind: ServerBindOut,
+    pub watermarks: WatermarkOut,
+    pub inference: InferenceModelOut,
+    pub identity: IdentityOut,
+}
+
+pub async fn get_server_all(
+    State(s): State<ApiState>,
+    _admin: AdminContext,
+) -> Result<Json<ServerAllOut>, ApiError> {
+    let (bind, watermarks, inference, identity) = tokio::join!(
+        compute_server_bind_out(&s),
+        compute_watermark_out(&s),
+        compute_inference_model_out(&s),
+        compute_identity_out(&s),
+    );
+    Ok(Json(ServerAllOut {
+        bind,
+        watermarks,
+        inference,
+        identity,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1924,5 +1971,44 @@ mod tests {
         assert!(v["pending"].is_null());
         assert!(v["ui_current"].is_null());
         assert!(v["ui_pending"].is_null());
+    }
+
+    #[test]
+    fn server_all_out_serialises_with_nested_sections() {
+        let out = ServerAllOut {
+            bind: ServerBindOut {
+                current: "0.0.0.0:8089".into(),
+                pending: None,
+                ui_current: None,
+                ui_pending: None,
+            },
+            watermarks: WatermarkOut {
+                low_pct: 80,
+                panic_pct: 95,
+                pending_low_pct: None,
+                pending_panic_pct: None,
+            },
+            inference: InferenceModelOut {
+                current: ModelView {
+                    kind: "yolov8".into(),
+                    preset: "n".into(),
+                    input_width: 640,
+                    input_height: 384,
+                    score_threshold: 0.30,
+                    pack_path: None,
+                },
+                pending: None,
+                available_kinds: crate::models_catalog::KNOWN_KINDS,
+            },
+            identity: IdentityOut { display_name: None },
+        };
+        let v = serde_json::to_value(&out).unwrap();
+        // Each top-level key is present and addresses the
+        // corresponding section.
+        assert_eq!(v["bind"]["current"], "0.0.0.0:8089");
+        assert_eq!(v["watermarks"]["low_pct"], 80);
+        assert_eq!(v["watermarks"]["panic_pct"], 95);
+        assert_eq!(v["inference"]["current"]["kind"], "yolov8");
+        assert!(v["identity"]["display_name"].is_null());
     }
 }

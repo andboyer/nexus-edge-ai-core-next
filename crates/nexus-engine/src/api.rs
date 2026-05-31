@@ -529,6 +529,15 @@ pub fn router(state: ApiState) -> Router {
             get(crate::admin_runtime::get_server_identity)
                 .put(crate::admin_runtime::put_server_identity),
         )
+        // Phase C follow-up — single-fetch bundle of every
+        // `/admin/server/*` GET endpoint. Used by the cloud
+        // console Core Settings tabs to render in one tunnel
+        // round-trip instead of four. Read-only; mutations
+        // still go to the per-endpoint PUTs above.
+        .route(
+            "/v1/admin/server/all",
+            get(crate::admin_runtime::get_server_all),
+        )
         // M-Admin Phase 0 follow-up — graceful self-restart.
         // Returns 202 immediately, then `execv()`s a fresh
         // copy of the same binary (preserving PID + argv) so
